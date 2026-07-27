@@ -1,0 +1,15 @@
+.{
+    .name = .pico,
+    .version = "0.0.1",
+    .fingerprint = 0x9ea0cb82e3228db8, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "CONTEXT.md",
+        "docs",
+        "README.md",
+    },
+}
