@@ -59,6 +59,7 @@ zig build test
 
 - [`CONTEXT.md`](CONTEXT.md) — 领域语言
 - [`docs/adr/`](docs/adr/) — 架构决策
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 目标架构、数据归属与验证契约
 
 ## 模块边界
 

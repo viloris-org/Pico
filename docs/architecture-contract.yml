@@ -1,0 +1,94 @@
+version: 1
+status: proposed
+
+# This contract describes the intended target layout. Checks become blocking
+# once the corresponding modules exist and CI has a boundary-check command.
+modules:
+  net:
+    paths: ["src/net/**"]
+    owner: pico-core
+    may_depend_on: [sql, util]
+    owns_data: [connection_state]
+    risk: protocol
+  sql:
+    paths: ["src/sql/**"]
+    owner: pico-core
+    may_depend_on: [txn, catalog, util]
+    owns_data: [parsed_statements]
+    risk: protocol
+  txn:
+    paths: ["src/txn/**"]
+    owner: pico-core
+    may_depend_on: [catalog, storage, util]
+    owns_data: [snapshots, write_sets]
+    risk: critical
+  commit:
+    paths: ["src/commit/**"]
+    owner: pico-core
+    may_depend_on: [txn, catalog, storage, util]
+    owns_data: [commit_order, commit_queue]
+    risk: critical
+  catalog:
+    paths: ["src/catalog/**"]
+    owner: pico-core
+    may_depend_on: [storage, util]
+    owns_data: [catalog_metadata]
+    risk: critical
+  storage:
+    paths: ["src/storage/**"]
+    owner: pico-core
+    may_depend_on: [util]
+    owns_data: [wal, lsm_files, manifests, checkpoints]
+    risk: critical
+  util:
+    paths: ["src/util/**"]
+    owner: pico-core
+    may_depend_on: []
+    owns_data: []
+    risk: standard
+
+data_writers:
+  catalog_metadata: commit
+  committed_logical_changes: commit
+  lsm_manifest_publication: commit
+  wal: commit
+  connection_state: net
+
+gates:
+  dependency_cycles: 0
+  forbidden_dependencies: 0
+  multiple_data_writers: 0
+  unknown_wal_format_replayed: 0
+  complete_corrupt_wal_frames_replayed: 0
+  unversioned_internal_format_breaks: 0
+  real_client_protocol_suites: [psql, mainstream_postgresql_driver]
+
+change_classes:
+  routine:
+    max_modules: 2
+    requires_adr: false
+  architectural:
+    requires_adr: true
+    examples:
+      - wal_or_manifest_format_change
+      - durability_guarantee_change
+      - commit_ordering_change
+      - sql_support_matrix_expansion
+
+validation:
+  local:
+    - zig build test
+  required_before_durable_commit_claim:
+    - crash_matrix_recovery_test
+    - wal_format_and_checksum_test
+    - psql_integration_test
+    - mainstream_postgresql_driver_integration_test
+  required_before_lsm_release:
+    - checkpoint_recovery_test
+    - manifest_atomic_publication_test
+    - compaction_snapshot_visibility_test
+
+budgets:
+  # Calibrate against CI history before making these blocking.
+  local_test_p95_seconds: 120
+  required_ci_p95_seconds: 900

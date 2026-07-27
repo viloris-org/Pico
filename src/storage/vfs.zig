@@ -17,6 +17,9 @@ pub const Vfs = struct {
         create: bool = false,
         truncate: bool = false,
         exclusive: bool = false,
+        /// Advisory lock acquired while opening the file.
+        lock: Io.File.Lock = .none,
+        lock_nonblocking: bool = false,
     };
 
     pub fn open(io: Io, data_dir: []const u8) !Vfs {
@@ -48,9 +51,13 @@ pub const Vfs = struct {
                 .read = options.read,
                 .truncate = options.truncate,
                 .exclusive = options.exclusive,
+                .lock = options.lock,
+                .lock_nonblocking = options.lock_nonblocking,
             }) catch |err| switch (err) {
                 error.PathAlreadyExists => if (options.exclusive) return err else try self.dir.openFile(self.io, name, .{
                     .mode = if (options.write) .read_write else .read_only,
+                    .lock = options.lock,
+                    .lock_nonblocking = options.lock_nonblocking,
                 }),
                 else => |open_err| return open_err,
             };
@@ -61,7 +68,37 @@ pub const Vfs = struct {
             .io = self.io,
             .handle = try self.dir.openFile(self.io, name, .{
                 .mode = if (options.write) .read_write else .read_only,
+                .lock = options.lock,
+                .lock_nonblocking = options.lock_nonblocking,
             }),
+        };
+    }
+
+    /// Check whether a logical storage file exists. This is advisory only;
+    /// callers must still handle a concurrent open or delete failure.
+    pub fn exists(self: *const Vfs, name: []const u8) !bool {
+        try validateName(name);
+        self.dir.access(self.io, name, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => |access_err| return access_err,
+        };
+        return true;
+    }
+
+    /// Remove a storage file and persist the directory entry removal.
+    pub fn deleteFile(self: *Vfs, name: []const u8) !void {
+        try validateName(name);
+        try self.dir.deleteFile(self.io, name);
+        try syncDir(self.dir, self.io);
+    }
+
+    /// Create an unnamed temporary file that can atomically replace `name`.
+    /// The caller must write and sync the returned file before calling commit.
+    pub fn createAtomicFile(self: *Vfs, name: []const u8) !AtomicFile {
+        try validateName(name);
+        return .{
+            .io = self.io,
+            .atomic = try self.dir.createFileAtomic(self.io, name, .{ .replace = true }),
         };
     }
 };
@@ -96,6 +133,38 @@ pub const File = struct {
     }
 };
 
+/// A file staged off-name and atomically published with a directory sync.
+/// This is the publication primitive for manifests and immutable SSTables.
+pub const AtomicFile = struct {
+    io: Io,
+    atomic: Io.File.Atomic,
+
+    pub fn deinit(self: *AtomicFile) void {
+        self.atomic.deinit(self.io);
+        self.* = undefined;
+    }
+
+    pub fn writeAtAll(self: *AtomicFile, data: []const u8, offset: u64) !void {
+        try self.atomic.file.writePositionalAll(self.io, data, offset);
+    }
+
+    pub fn sync(self: *AtomicFile) !void {
+        try self.atomic.file.sync(self.io);
+    }
+
+    /// Atomically replace the destination and persist the new directory entry.
+    pub fn commit(self: *AtomicFile) !void {
+        try self.atomic.replace(self.io);
+        try syncDir(self.atomic.dir, self.io);
+    }
+};
+
+fn syncDir(dir: Io.Dir, io: Io) !void {
+    var handle = try dir.openFile(io, ".", .{ .mode = .read_only });
+    defer handle.close(io);
+    try handle.sync(io);
+}
+
 fn validateName(name: []const u8) !void {
     if (name.len == 0 or std.fs.path.isAbsolute(name)) return error.InvalidStoragePath;
     if (std.mem.indexOfScalar(u8, name, '/') != null or std.mem.indexOfScalar(u8, name, '\\') != null) {
@@ -122,4 +191,39 @@ test "vfs confines storage files to its data directory" {
     try std.testing.expectEqual(@as(u64, 4), try file.size());
     try file.truncate(2);
     try std.testing.expectEqual(@as(u64, 2), try file.size());
+}
+
+test "vfs atomically publishes and durably removes storage files" {
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-vfs-publish";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var vfs = try Vfs.open(io, dir_name);
+    defer vfs.close();
+
+    {
+        var original = try vfs.openFile("manifest", .{ .create = true });
+        defer original.close();
+        try original.writeAtAll("old", 0);
+        try original.sync();
+    }
+    try std.testing.expect(try vfs.exists("manifest"));
+
+    var replacement = try vfs.createAtomicFile("manifest");
+    defer replacement.deinit();
+    try replacement.writeAtAll("new", 0);
+    try replacement.sync();
+    try replacement.commit();
+
+    {
+        var published = try vfs.openFile("manifest", .{ .write = false });
+        defer published.close();
+        var content: [3]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 3), try published.readAt(&content, 0));
+        try std.testing.expectEqualStrings("new", &content);
+    }
+
+    try vfs.deleteFile("manifest");
+    try std.testing.expect(!(try vfs.exists("manifest")));
 }
