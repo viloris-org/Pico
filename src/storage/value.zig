@@ -1,11 +1,37 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Column scalar type tags for Phase 0 SQL subset.
+/// Column scalar type tags for the SQL subset.
+/// PG aliases (BIGINT, VARCHAR, TIMESTAMPTZ, JSONB, DECIMAL, …) map into these.
 pub const TypeTag = enum(u8) {
     int = 1,
     text = 2,
     bool = 3,
+};
+
+/// DEFAULT expression stored on a column definition.
+pub const DefaultExpr = union(enum) {
+    none,
+    /// Evaluate to current UTC timestamp text at INSERT time.
+    now,
+    /// Owned literal applied when the column is omitted or NULL-defaulted.
+    literal: Value,
+
+    pub fn deinit(self: *DefaultExpr, gpa: Allocator) void {
+        switch (self.*) {
+            .literal => |*v| v.deinit(gpa),
+            else => {},
+        }
+        self.* = .none;
+    }
+
+    pub fn clone(self: DefaultExpr, gpa: Allocator) Allocator.Error!DefaultExpr {
+        return switch (self) {
+            .none => .none,
+            .now => .now,
+            .literal => |v| .{ .literal = try v.clone(gpa) },
+        };
+    }
 };
 
 /// Runtime value. Text owns its bytes when non-null.
@@ -68,10 +94,27 @@ pub const Value = union(enum) {
 pub const Column = struct {
     name: []u8,
     type_tag: TypeTag,
-    primary_key: bool,
+    primary_key: bool = false,
+    not_null: bool = false,
+    unique: bool = false,
+    serial: bool = false,
+    default_expr: DefaultExpr = .none,
 
     pub fn deinit(self: *Column, gpa: Allocator) void {
         gpa.free(self.name);
+        self.default_expr.deinit(gpa);
+    }
+
+    pub fn clone(self: Column, gpa: Allocator) Allocator.Error!Column {
+        return .{
+            .name = try gpa.dupe(u8, self.name),
+            .type_tag = self.type_tag,
+            .primary_key = self.primary_key,
+            .not_null = self.not_null,
+            .unique = self.unique,
+            .serial = self.serial,
+            .default_expr = try self.default_expr.clone(gpa),
+        };
     }
 };
 

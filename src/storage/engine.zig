@@ -3,6 +3,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const value = @import("value.zig");
 const wal_mod = @import("wal.zig");
+const token = @import("../sql/token.zig");
 
 pub const EngineError = error{
     TableExists,
@@ -14,6 +15,8 @@ pub const EngineError = error{
     PrimaryKeyImmutable,
     TypeMismatch,
     InvalidIdentifier,
+    NotNullViolation,
+    UniqueViolation,
 };
 
 pub const Row = struct {
@@ -42,10 +45,15 @@ pub const Row = struct {
 pub const Table = struct {
     name: []u8,
     columns: []value.Column,
-    pk_index: usize,
-    /// Primary key (int) -> row index in `rows`. Phase 0: INT PK only.
-    by_pk: std.AutoHashMap(i64, usize),
+    /// null = heap table without single-column PK (e.g. composite PRIMARY KEY).
+    pk_index: ?usize,
+    /// INT primary key → row index.
+    by_pk_int: std.AutoHashMap(i64, usize),
+    /// TEXT primary key → row index (keys owned by row storage).
+    by_pk_text: std.StringHashMap(usize),
     rows: std.ArrayList(Row),
+    /// Next value for SERIAL/BIGSERIAL columns.
+    next_serial: i64,
 
     pub fn deinit(self: *Table, gpa: Allocator) void {
         gpa.free(self.name);
@@ -53,7 +61,13 @@ pub const Table = struct {
         gpa.free(self.columns);
         for (self.rows.items) |*r| r.deinit(gpa);
         self.rows.deinit(gpa);
-        self.by_pk.deinit();
+        self.by_pk_int.deinit();
+        self.by_pk_text.deinit();
+    }
+
+    pub fn pkIsText(self: *const Table) bool {
+        const pki = self.pk_index orelse return false;
+        return self.columns[pki].type_tag == .text;
     }
 };
 
@@ -99,10 +113,28 @@ pub const Engine = struct {
                 try self.insertMem(ins.table, ins.values);
             },
             .update => |upd| {
-                try self.updateMem(upd.table, upd.pk, upd.values);
+                const table = self.tables.getPtr(upd.table) orelse return error.TableNotFound;
+                if (table.pk_index != null) {
+                    try self.updateMem(upd.table, upd.pk, upd.values);
+                } else {
+                    const idx: usize = switch (upd.pk) {
+                        .int => |i| @intCast(i),
+                        else => return error.PrimaryKeyNotFound,
+                    };
+                    try self.updateMemAt(upd.table, idx, upd.values);
+                }
             },
             .delete => |del| {
-                try self.deleteMem(del.table, del.pk);
+                const table = self.tables.getPtr(del.table) orelse return error.TableNotFound;
+                if (table.pk_index != null) {
+                    try self.deleteMem(del.table, del.pk);
+                } else {
+                    const idx: usize = switch (del.pk) {
+                        .int => |i| @intCast(i),
+                        else => return error.PrimaryKeyNotFound,
+                    };
+                    try self.deleteMemAt(del.table, idx);
+                }
             },
         }
     }
@@ -124,15 +156,18 @@ pub const Engine = struct {
                 .name = try self.gpa.dupe(u8, c.name),
                 .type_tag = c.type_tag,
                 .primary_key = c.primary_key,
+                .not_null = c.not_null,
+                .unique = c.unique,
+                .serial = c.serial,
+                .default_expr = try c.default_expr.clone(self.gpa),
             };
             allocated = i + 1;
             if (c.primary_key) {
-                if (pk_index != null) return error.MissingPrimaryKey; // multiple PKs not supported
-                if (c.type_tag != .int) return error.TypeMismatch;
+                if (pk_index != null) return error.MissingPrimaryKey; // multiple column-level PKs not supported
+                if (c.type_tag != .int and c.type_tag != .text) return error.TypeMismatch;
                 pk_index = i;
             }
         }
-        const pk = pk_index orelse return error.MissingPrimaryKey;
 
         const tname = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(tname);
@@ -140,35 +175,84 @@ pub const Engine = struct {
         var table: Table = .{
             .name = tname,
             .columns = columns,
-            .pk_index = pk,
-            .by_pk = std.AutoHashMap(i64, usize).init(self.gpa),
+            .pk_index = pk_index,
+            .by_pk_int = std.AutoHashMap(i64, usize).init(self.gpa),
+            .by_pk_text = std.StringHashMap(usize).init(self.gpa),
             .rows = .empty,
+            .next_serial = 1,
         };
         errdefer table.deinit(self.gpa);
 
         try self.tables.put(tname, table);
     }
 
-    fn insertMem(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
-        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+    fn checkTypes(table: *const Table, values: []const value.Value) !void {
         if (values.len != table.columns.len) return error.ColumnCountMismatch;
-
-        // Type check
         for (values, table.columns) |v, col| {
             switch (v) {
-                .null => {},
+                .null => {
+                    if (col.not_null and !col.serial) return error.NotNullViolation;
+                },
                 .int => if (col.type_tag != .int) return error.TypeMismatch,
                 .text => if (col.type_tag != .text) return error.TypeMismatch,
                 .bool => if (col.type_tag != .bool) return error.TypeMismatch,
             }
         }
+    }
 
-        const pk_val = values[table.pk_index];
-        const pk = switch (pk_val) {
-            .int => |i| i,
-            else => return error.MissingPrimaryKey,
+    fn pkLookup(table: *const Table, pk: value.Value) ?usize {
+        return switch (pk) {
+            .int => |i| table.by_pk_int.get(i),
+            .text => |t| table.by_pk_text.get(t),
+            else => null,
         };
-        if (table.by_pk.contains(pk)) return error.DuplicatePrimaryKey;
+    }
+
+    fn pkContains(table: *const Table, pk: value.Value) bool {
+        return pkLookup(table, pk) != null;
+    }
+
+    fn pkPut(table: *Table, pk: value.Value, idx: usize) !void {
+        switch (pk) {
+            .int => |i| try table.by_pk_int.put(i, idx),
+            .text => |t| try table.by_pk_text.put(t, idx),
+            else => return error.MissingPrimaryKey,
+        }
+    }
+
+    fn pkRemove(table: *Table, pk: value.Value) void {
+        switch (pk) {
+            .int => |i| _ = table.by_pk_int.remove(i),
+            .text => |t| _ = table.by_pk_text.remove(t),
+            else => {},
+        }
+    }
+
+    fn checkUnique(table: *const Table, values: []const value.Value, skip_idx: ?usize) !void {
+        for (table.columns, 0..) |col, ci| {
+            if (!col.unique and !col.primary_key) continue;
+            const v = values[ci];
+            if (v == .null) continue;
+            for (table.rows.items, 0..) |row, ri| {
+                if (skip_idx) |s| if (s == ri) continue;
+                if (value.Value.eql(row.values[ci], v)) return error.UniqueViolation;
+            }
+        }
+    }
+
+    fn insertMem(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        try checkTypes(table, values);
+
+        if (table.pk_index) |pki| {
+            const pk_val = values[pki];
+            switch (pk_val) {
+                .int, .text => {},
+                else => return error.MissingPrimaryKey,
+            }
+            if (pkContains(table, pk_val)) return error.DuplicatePrimaryKey;
+        }
+        try checkUnique(table, values, null);
 
         const owned_vals = try self.gpa.alloc(value.Value, values.len);
         errdefer self.gpa.free(owned_vals);
@@ -187,33 +271,63 @@ pub const Engine = struct {
             var row = table.rows.pop().?;
             row.deinit(self.gpa);
         }
-        try table.by_pk.put(pk, idx);
-    }
-
-    fn checkTypes(table: *const Table, values: []const value.Value) !void {
-        if (values.len != table.columns.len) return error.ColumnCountMismatch;
-        for (values, table.columns) |v, col| {
-            switch (v) {
-                .null => {},
-                .int => if (col.type_tag != .int) return error.TypeMismatch,
-                .text => if (col.type_tag != .text) return error.TypeMismatch,
-                .bool => if (col.type_tag != .bool) return error.TypeMismatch,
+        if (table.pk_index) |pki| {
+            const stored_pk = table.rows.items[idx].values[pki];
+            try pkPut(table, stored_pk, idx);
+            if (stored_pk == .int) {
+                if (stored_pk.int >= table.next_serial) table.next_serial = stored_pk.int + 1;
+            }
+        }
+        for (table.columns, 0..) |col, ci| {
+            if (col.serial and values[ci] == .int) {
+                if (values[ci].int >= table.next_serial) table.next_serial = values[ci].int + 1;
             }
         }
     }
 
-    fn updateMem(self: *Engine, table_name: []const u8, pk: i64, values: []const value.Value) !void {
+    fn updateMem(self: *Engine, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         try checkTypes(table, values);
 
-        // Primary key value in the row must match the addressed pk (immutable PK).
-        const row_pk = switch (values[table.pk_index]) {
-            .int => |i| i,
-            else => return error.MissingPrimaryKey,
-        };
-        if (row_pk != pk) return error.PrimaryKeyImmutable;
+        const pki = table.pk_index orelse return error.MissingPrimaryKey;
+        const row_pk = values[pki];
+        if (!value.Value.eql(row_pk, pk)) return error.PrimaryKeyImmutable;
 
-        const idx = table.by_pk.get(pk) orelse return error.PrimaryKeyNotFound;
+        const idx = pkLookup(table, pk) orelse return error.PrimaryKeyNotFound;
+        try checkUnique(table, values, idx);
+
+        const owned_vals = try self.gpa.alloc(value.Value, values.len);
+        errdefer self.gpa.free(owned_vals);
+        var n: usize = 0;
+        errdefer {
+            var j: usize = 0;
+            while (j < n) : (j += 1) owned_vals[j].deinit(self.gpa);
+        }
+        while (n < values.len) : (n += 1) {
+            owned_vals[n] = try values[n].clone(self.gpa);
+        }
+
+        pkRemove(table, pk);
+
+        var old = table.rows.items[idx];
+        old.deinit(self.gpa);
+        table.rows.items[idx] = .{ .values = owned_vals };
+        try pkPut(table, table.rows.items[idx].values[pki], idx);
+    }
+
+    /// Replace row at stable index (for tables without single-column PK, or by-index updates).
+    fn updateMemAt(self: *Engine, table_name: []const u8, idx: usize, values: []const value.Value) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
+        try checkTypes(table, values);
+        try checkUnique(table, values, idx);
+
+        if (table.pk_index) |pki| {
+            const old_pk = table.rows.items[idx].values[pki];
+            const new_pk = values[pki];
+            if (!value.Value.eql(old_pk, new_pk)) return error.PrimaryKeyImmutable;
+            pkRemove(table, old_pk);
+        }
 
         const owned_vals = try self.gpa.alloc(value.Value, values.len);
         errdefer self.gpa.free(owned_vals);
@@ -229,44 +343,62 @@ pub const Engine = struct {
         var old = table.rows.items[idx];
         old.deinit(self.gpa);
         table.rows.items[idx] = .{ .values = owned_vals };
+        if (table.pk_index) |pki| {
+            try pkPut(table, table.rows.items[idx].values[pki], idx);
+        }
     }
 
-    fn deleteMem(self: *Engine, table_name: []const u8, pk: i64) !void {
+    fn deleteMem(self: *Engine, table_name: []const u8, pk: value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        const idx = table.by_pk.get(pk) orelse return error.PrimaryKeyNotFound;
+        const idx = pkLookup(table, pk) orelse return error.PrimaryKeyNotFound;
+        try self.deleteMemAt(table_name, idx);
+    }
 
-        _ = table.by_pk.remove(pk);
+    fn deleteMemAt(self: *Engine, table_name: []const u8, idx: usize) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
+
+        if (table.pk_index) |pki| {
+            pkRemove(table, table.rows.items[idx].values[pki]);
+        }
 
         const last = table.rows.items.len - 1;
         var removed = table.rows.items[idx];
         if (idx != last) {
             const moved = table.rows.items[last];
             table.rows.items[idx] = moved;
-            // Fix PK index for the swapped-in row.
-            const moved_pk = switch (moved.values[table.pk_index]) {
-                .int => |i| i,
-                else => return error.MissingPrimaryKey,
-            };
-            try table.by_pk.put(moved_pk, idx);
+            if (table.pk_index) |pki| {
+                try pkPut(table, moved.values[pki], idx);
+            }
         }
         _ = table.rows.pop();
         removed.deinit(self.gpa);
     }
 
     pub fn createTable(self: *Engine, name: []const u8, columns: []const value.Column) !void {
-        // Convert to ParsedColumn view for mem path + WAL
         var parsed: std.ArrayList(wal_mod.RecordView.ParsedColumn) = .empty;
-        defer parsed.deinit(self.gpa);
+        defer {
+            for (parsed.items) |*c| c.default_expr.deinit(self.gpa);
+            parsed.deinit(self.gpa);
+        }
         for (columns) |c| {
             try parsed.append(self.gpa, .{
                 .name = c.name,
                 .type_tag = c.type_tag,
                 .primary_key = c.primary_key,
+                .not_null = c.not_null,
+                .unique = c.unique,
+                .serial = c.serial,
+                .default_expr = try c.default_expr.clone(self.gpa),
             });
         }
-        // Persist first, then mem (crash between is ok — replay creates table)
         try self.wal.appendCreateTable(.{ .name = name, .columns = columns });
         try self.createTableMem(name, parsed.items);
+    }
+
+    pub fn createTableIfNotExists(self: *Engine, name: []const u8, columns: []const value.Column) !void {
+        if (self.tables.contains(name)) return;
+        try self.createTable(name, columns);
     }
 
     pub fn insert(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
@@ -274,42 +406,63 @@ pub const Engine = struct {
         try self.insertMem(table_name, values);
     }
 
-    /// Replace a full row addressed by primary key. `values` must include the PK column
-    /// with the same key (PK changes are not supported).
-    pub fn update(self: *Engine, table_name: []const u8, pk: i64, values: []const value.Value) !void {
-        // Validate before durable write so recovery never sees a doomed record.
+    pub fn update(self: *Engine, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         try checkTypes(table, values);
-        const row_pk = switch (values[table.pk_index]) {
-            .int => |i| i,
-            else => return error.MissingPrimaryKey,
-        };
-        if (row_pk != pk) return error.PrimaryKeyImmutable;
-        if (!table.by_pk.contains(pk)) return error.PrimaryKeyNotFound;
+        const pki = table.pk_index orelse return error.MissingPrimaryKey;
+        if (!value.Value.eql(values[pki], pk)) return error.PrimaryKeyImmutable;
+        if (!pkContains(table, pk)) return error.PrimaryKeyNotFound;
 
         try self.wal.appendUpdate(.{ .table = table_name, .pk = pk, .values = values });
         try self.updateMem(table_name, pk, values);
     }
 
-    pub fn delete(self: *Engine, table_name: []const u8, pk: i64) !void {
+    /// Update by current row index; WAL records full row with PK when present, else uses int index as pseudo-pk for replay.
+    pub fn updateAt(self: *Engine, table_name: []const u8, idx: usize, values: []const value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        if (!table.by_pk.contains(pk)) return error.PrimaryKeyNotFound;
+        if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
+        try checkTypes(table, values);
+        if (table.pk_index) |pki| {
+            const pk = table.rows.items[idx].values[pki];
+            try self.wal.appendUpdate(.{ .table = table_name, .pk = pk, .values = values });
+            try self.updateMem(table_name, pk, values);
+        } else {
+            // No single-column PK: persist with synthetic int key = row index at write time.
+            // Recovery applies as insert-like replace via updateMemAt path encoded as update with int pk=idx.
+            try self.wal.appendUpdate(.{ .table = table_name, .pk = .{ .int = @intCast(idx) }, .values = values });
+            try self.updateMemAt(table_name, idx, values);
+        }
+    }
+
+    pub fn delete(self: *Engine, table_name: []const u8, pk: value.Value) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (!pkContains(table, pk)) return error.PrimaryKeyNotFound;
 
         try self.wal.appendDelete(.{ .table = table_name, .pk = pk });
         try self.deleteMem(table_name, pk);
     }
 
+    pub fn deleteAt(self: *Engine, table_name: []const u8, idx: usize) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
+        if (table.pk_index) |pki| {
+            const pk = table.rows.items[idx].values[pki];
+            try self.wal.appendDelete(.{ .table = table_name, .pk = pk });
+            try self.deleteMem(table_name, pk);
+        } else {
+            try self.wal.appendDelete(.{ .table = table_name, .pk = .{ .int = @intCast(idx) } });
+            try self.deleteMemAt(table_name, idx);
+        }
+    }
+
     pub const SelectResult = struct {
         columns: []const value.Column,
-        /// Borrowed row pointers into table storage — valid until next mutate.
         rows: []const Row,
-        /// If non-null, caller owns and must free this slice (filtered copy of pointers... actually we use owned list of indices).
         owned_rows: ?[]Row,
         gpa: Allocator,
 
         pub fn deinit(self: *SelectResult) void {
             if (self.owned_rows) |rows| {
-                // These are clones
                 for (rows) |*r| r.deinit(self.gpa);
                 self.gpa.free(rows);
             }
@@ -326,9 +479,9 @@ pub const Engine = struct {
         };
     }
 
-    pub fn selectByPk(self: *Engine, table_name: []const u8, pk: i64) !SelectResult {
+    pub fn selectByPk(self: *Engine, table_name: []const u8, pk: value.Value) !SelectResult {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        if (table.by_pk.get(pk)) |idx| {
+        if (pkLookup(table, pk)) |idx| {
             const one = try self.gpa.alloc(Row, 1);
             errdefer self.gpa.free(one);
             one[0] = try table.rows.items[idx].clone(self.gpa);
@@ -348,17 +501,86 @@ pub const Engine = struct {
         };
     }
 
+    /// Collect row indices matching all predicates (AND). Caller owns the slice.
+    pub fn matchIndices(self: *Engine, table: *Table, preds: []const Pred) ![]usize {
+        var out: std.ArrayList(usize) = .empty;
+        errdefer out.deinit(self.gpa);
+
+        // Fast path: single PK equality
+        if (preds.len == 1 and preds[0] == .eq) {
+            if (table.pk_index) |pki| {
+                const p = preds[0].eq;
+                if (p.col_index == pki and p.value == .int and !table.pkIsText()) {
+                    if (table.by_pk_int.get(p.value.int)) |idx| {
+                        try out.append(self.gpa, idx);
+                    }
+                    return try out.toOwnedSlice(self.gpa);
+                }
+                if (p.col_index == pki and p.value == .text and table.pkIsText()) {
+                    if (table.by_pk_text.get(p.value.text)) |idx| {
+                        try out.append(self.gpa, idx);
+                    }
+                    return try out.toOwnedSlice(self.gpa);
+                }
+            }
+        }
+
+        for (table.rows.items, 0..) |row, idx| {
+            if (rowMatches(row, preds)) {
+                try out.append(self.gpa, idx);
+            }
+        }
+        return try out.toOwnedSlice(self.gpa);
+    }
+
     pub fn getTable(self: *Engine, name: []const u8) ?*Table {
         return self.tables.getPtr(name);
     }
+
+    pub fn allocSerial(self: *Engine, table_name: []const u8) !i64 {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        const id = table.next_serial;
+        table.next_serial += 1;
+        return id;
+    }
 };
+
+/// Execution-layer predicate bound to column indices.
+pub const Pred = union(enum) {
+    eq: struct {
+        col_index: usize,
+        value: value.Value, // borrowed during match
+    },
+    is_null: struct {
+        col_index: usize,
+        negated: bool,
+    },
+};
+
+fn rowMatches(row: Row, preds: []const Pred) bool {
+    for (preds) |p| {
+        switch (p) {
+            .eq => |e| {
+                if (!value.Value.eql(row.values[e.col_index], e.value)) return false;
+            },
+            .is_null => |n| {
+                const is_null = row.values[n.col_index] == .null;
+                if (n.negated) {
+                    if (is_null) return false;
+                } else {
+                    if (!is_null) return false;
+                }
+            },
+        }
+    }
+    return true;
+}
 
 test "engine create insert select roundtrip with wal" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
     const dir_name = "zig-cache/pico-test-engine";
-    // Clean slate
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
     {
@@ -369,9 +591,6 @@ test "engine create insert select roundtrip with wal" {
             .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
             .{ .name = try gpa.dupe(u8, "name"), .type_tag = .text, .primary_key = false },
         };
-        // createTable clones via WAL path — but columns are borrowed for WAL write then createTableMem clones.
-        // Our createTable uses columns for WAL (names as slices) and createTableMem clones.
-        // After createTable, original cols names are still ours.
         defer {
             for (&cols) |*c| c.deinit(gpa);
         }
@@ -382,13 +601,12 @@ test "engine create insert select roundtrip with wal" {
         const vals = [_]value.Value{ .{ .int = 1 }, name_val };
         try eng.insert("users", &vals);
 
-        var res = try eng.selectByPk("users", 1);
+        var res = try eng.selectByPk("users", .{ .int = 1 });
         defer res.deinit();
         try std.testing.expectEqual(@as(usize, 1), res.rows.len);
         try std.testing.expectEqualStrings("alice", res.rows[0].values[1].text);
     }
 
-    // Reopen — recovery
     {
         var eng = try Engine.open(gpa, io, dir_name, false);
         defer eng.deinit();
@@ -430,10 +648,10 @@ test "engine update delete with wal recovery" {
 
         var bob2: value.Value = .{ .text = try gpa.dupe(u8, "bobby") };
         defer bob2.deinit(gpa);
-        try eng.update("users", 2, &[_]value.Value{ .{ .int = 2 }, bob2 });
-        try eng.delete("users", 1);
+        try eng.update("users", .{ .int = 2 }, &[_]value.Value{ .{ .int = 2 }, bob2 });
+        try eng.delete("users", .{ .int = 1 });
 
-        var res = try eng.selectByPk("users", 2);
+        var res = try eng.selectByPk("users", .{ .int = 2 });
         defer res.deinit();
         try std.testing.expectEqual(@as(usize, 1), res.rows.len);
         try std.testing.expectEqualStrings("bobby", res.rows[0].values[1].text);
@@ -450,14 +668,19 @@ test "engine update delete with wal recovery" {
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 2), all.rows.len);
 
-        var r2 = try eng.selectByPk("users", 2);
+        var r2 = try eng.selectByPk("users", .{ .int = 2 });
         defer r2.deinit();
         try std.testing.expectEqualStrings("bobby", r2.rows[0].values[1].text);
 
-        var r1 = try eng.selectByPk("users", 1);
+        var r1 = try eng.selectByPk("users", .{ .int = 1 });
         defer r1.deinit();
         try std.testing.expectEqual(@as(usize, 0), r1.rows.len);
     }
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+}
+
+// silence unused import if token only needed for eql in future
+comptime {
+    _ = token;
 }

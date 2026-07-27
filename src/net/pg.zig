@@ -112,32 +112,34 @@ pub fn handleConnection(
 }
 
 fn handleQuery(gpa: Allocator, eng: *engine_mod.Engine, w: *Io.Writer, sql: []const u8) !void {
-    // psql may send multiple statements; Phase 0: execute first non-empty only, or split by ;
-    // Actually simple: run whole string — our parser takes one statement.
-    // Empty query
     const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
     if (trimmed.len == 0) {
         try sendCommandComplete(w, "EMPTY");
         return;
     }
 
-    var result = exec.execute(gpa, eng, sql) catch |err| {
+    const results = exec.executeScript(gpa, eng, sql) catch |err| {
         try sendError(w, "42000", execErrorMessage(err));
         return;
     };
-    defer result.deinit();
+    defer {
+        for (results) |*r| r.deinit();
+        gpa.free(results);
+    }
 
-    switch (result) {
-        .empty => |tag| try sendCommandComplete(w, tag),
-        .rows => |rows| {
-            try sendRowDescription(w, rows.col_names);
-            for (rows.cells) |row| {
-                try sendDataRow(w, row);
-            }
-            var tag_buf: [64]u8 = undefined;
-            const tag = try std.fmt.bufPrint(&tag_buf, "SELECT {d}", .{rows.cells.len});
-            try sendCommandComplete(w, tag);
-        },
+    for (results) |result| {
+        switch (result) {
+            .empty => |tag| try sendCommandComplete(w, tag),
+            .rows => |rows| {
+                try sendRowDescription(w, rows.col_names);
+                for (rows.cells) |row| {
+                    try sendDataRow(w, row);
+                }
+                var tag_buf: [64]u8 = undefined;
+                const tag = try std.fmt.bufPrint(&tag_buf, "SELECT {d}", .{rows.cells.len});
+                try sendCommandComplete(w, tag);
+            },
+        }
     }
 }
 
@@ -152,6 +154,8 @@ fn execErrorMessage(err: anyerror) []const u8 {
         error.ColumnCountMismatch => "column count mismatch",
         error.TypeMismatch => "type mismatch",
         error.ColumnNotFound => "column not found",
+        error.NotNullViolation => "null value in not-null column",
+        error.UniqueViolation => "unique constraint violated",
         error.UnsupportedSyntax => "unsupported SQL syntax (Pico subset)",
         error.UnexpectedToken => "syntax error",
         error.NotImplemented => "feature not implemented",

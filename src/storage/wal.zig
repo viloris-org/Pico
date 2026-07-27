@@ -21,16 +21,16 @@ pub const InsertRecord = struct {
     values: []const value.Value,
 };
 
-/// Full-row replacement for a primary key (Phase 1: no partial WAL encoding).
+/// Full-row replacement addressed by primary key value.
 pub const UpdateRecord = struct {
     table: []const u8,
-    pk: i64,
+    pk: value.Value,
     values: []const value.Value,
 };
 
 pub const DeleteRecord = struct {
     table: []const u8,
-    pk: i64,
+    pk: value.Value,
 };
 
 /// Append-only WAL. Phase 0: one file `wal`, length-prefixed LE records.
@@ -91,7 +91,22 @@ pub const Wal = struct {
         for (rec.columns) |col| {
             try writeStr(&list, self.gpa, col.name);
             try list.append(self.gpa, @intFromEnum(col.type_tag));
-            try list.append(self.gpa, if (col.primary_key) 1 else 0);
+            // flags: bit0 pk, bit1 not_null, bit2 unique, bit3 serial
+            var flags: u8 = 0;
+            if (col.primary_key) flags |= 1;
+            if (col.not_null) flags |= 2;
+            if (col.unique) flags |= 4;
+            if (col.serial) flags |= 8;
+            try list.append(self.gpa, flags);
+            // default: 0 none, 1 now, 2 literal
+            switch (col.default_expr) {
+                .none => try list.append(self.gpa, 0),
+                .now => try list.append(self.gpa, 1),
+                .literal => |v| {
+                    try list.append(self.gpa, 2);
+                    try writeValue(&list, self.gpa, v);
+                },
+            }
         }
         try self.appendPayload(list.items);
     }
@@ -113,7 +128,7 @@ pub const Wal = struct {
         defer list.deinit(self.gpa);
         try list.append(self.gpa, @intFromEnum(RecordType.update));
         try writeStr(&list, self.gpa, rec.table);
-        try writeI64(&list, self.gpa, rec.pk);
+        try writeValue(&list, self.gpa, rec.pk);
         try writeU16(&list, self.gpa, @intCast(rec.values.len));
         for (rec.values) |v| {
             try writeValue(&list, self.gpa, v);
@@ -126,7 +141,7 @@ pub const Wal = struct {
         defer list.deinit(self.gpa);
         try list.append(self.gpa, @intFromEnum(RecordType.delete));
         try writeStr(&list, self.gpa, rec.table);
-        try writeI64(&list, self.gpa, rec.pk);
+        try writeValue(&list, self.gpa, rec.pk);
         try self.appendPayload(list.items);
     }
 
@@ -154,22 +169,26 @@ pub const RecordView = union(RecordType) {
     },
     update: struct {
         table: []const u8,
-        pk: i64,
+        pk: value.Value,
         values: []value.Value,
     },
     delete: struct {
         table: []const u8,
-        pk: i64,
+        pk: value.Value,
     },
 
     pub const ParsedColumn = struct {
         name: []const u8,
         type_tag: value.TypeTag,
         primary_key: bool,
+        not_null: bool = false,
+        unique: bool = false,
+        serial: bool = false,
+        default_expr: value.DefaultExpr = .none,
     };
 
     pub fn parseAlloc(gpa: Allocator, payload: []const u8) !struct { view: RecordView, owned: Owned } {
-        var owned: Owned = .{ .gpa = gpa, .columns = .empty, .values = .empty };
+        var owned: Owned = .{ .gpa = gpa, .columns = .empty, .values = .empty, .pk = .null };
         errdefer owned.deinit();
 
         if (payload.len < 1) return error.InvalidWal;
@@ -187,12 +206,29 @@ pub const RecordView = union(RecordType) {
                     const tt = std.enums.fromInt(value.TypeTag, payload[i]) orelse return error.InvalidWal;
                     i += 1;
                     if (i >= payload.len) return error.InvalidWal;
-                    const pk = payload[i] != 0;
+                    const flags = payload[i];
                     i += 1;
+                    if (i >= payload.len) return error.InvalidWal;
+                    const def_tag = payload[i];
+                    i += 1;
+                    var def: value.DefaultExpr = .none;
+                    switch (def_tag) {
+                        0 => {},
+                        1 => def = .now,
+                        2 => {
+                            const lit = try readValue(gpa, payload, &i);
+                            def = .{ .literal = lit };
+                        },
+                        else => return error.InvalidWal,
+                    }
                     try owned.columns.append(gpa, .{
                         .name = cname,
                         .type_tag = tt,
-                        .primary_key = pk,
+                        .primary_key = flags & 1 != 0,
+                        .not_null = flags & 2 != 0,
+                        .unique = flags & 4 != 0,
+                        .serial = flags & 8 != 0,
+                        .default_expr = def,
                     });
                 }
                 return .{
@@ -222,7 +258,7 @@ pub const RecordView = union(RecordType) {
             },
             .update => {
                 const table = try readStr(payload, &i);
-                const pk = try readI64(payload, &i);
+                owned.pk = try readValue(gpa, payload, &i);
                 const nval = try readU16(payload, &i);
                 try owned.values.ensureTotalCapacity(gpa, nval);
                 var v: u16 = 0;
@@ -233,7 +269,7 @@ pub const RecordView = union(RecordType) {
                 return .{
                     .view = .{ .update = .{
                         .table = table,
-                        .pk = pk,
+                        .pk = owned.pk,
                         .values = owned.values.items,
                     } },
                     .owned = owned,
@@ -241,11 +277,11 @@ pub const RecordView = union(RecordType) {
             },
             .delete => {
                 const table = try readStr(payload, &i);
-                const pk = try readI64(payload, &i);
+                owned.pk = try readValue(gpa, payload, &i);
                 return .{
                     .view = .{ .delete = .{
                         .table = table,
-                        .pk = pk,
+                        .pk = owned.pk,
                     } },
                     .owned = owned,
                 };
@@ -257,11 +293,14 @@ pub const RecordView = union(RecordType) {
         gpa: Allocator,
         columns: std.ArrayList(ParsedColumn),
         values: std.ArrayList(value.Value),
+        pk: value.Value,
 
         pub fn deinit(self: *Owned) void {
             for (self.values.items) |*v| v.deinit(self.gpa);
+            for (self.columns.items) |*c| c.default_expr.deinit(self.gpa);
             self.columns.deinit(self.gpa);
             self.values.deinit(self.gpa);
+            self.pk.deinit(self.gpa);
         }
     };
 };
@@ -305,19 +344,6 @@ fn writeU16(list: *std.ArrayList(u8), gpa: Allocator, v: u16) !void {
     var b: [2]u8 = undefined;
     bytes.writeU16LE(&b, v);
     try list.appendSlice(gpa, &b);
-}
-
-fn writeI64(list: *std.ArrayList(u8), gpa: Allocator, v: i64) !void {
-    var b: [8]u8 = undefined;
-    bytes.writeI64LE(&b, v);
-    try list.appendSlice(gpa, &b);
-}
-
-fn readI64(payload: []const u8, i: *usize) !i64 {
-    if (i.* + 8 > payload.len) return error.InvalidWal;
-    const v = bytes.readI64LE(payload[i.*..][0..8]);
-    i.* += 8;
-    return v;
 }
 
 fn writeStr(list: *std.ArrayList(u8), gpa: Allocator, s: []const u8) !void {

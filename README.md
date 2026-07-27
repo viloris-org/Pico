@@ -6,9 +6,22 @@
 
 **Phase 0（完成）**：TCP 服务 + PG 简单查询协议 + 内存表 + WAL 恢复。
 
-**Phase 1（进行中）**：`UPDATE` / `DELETE`（按主键）+ WAL 记录与恢复。
+**Phase 1（进行中）**：面向 sub2api 类 OLTP 负载扩展 SQL 子集。
 
-验收（Phase 0）：`psql` 连上，`CREATE` / `INSERT` / `SELECT`，杀进程再启动后数据仍在。
+已支持（子集，非完整 PG）：
+
+- DDL：`CREATE TABLE IF NOT EXISTS`、PG 类型别名（`BIGSERIAL`/`VARCHAR`/`DECIMAL`/`TIMESTAMPTZ`/`JSONB`…）、`DEFAULT`/`NOW()`/`NOT NULL`/`UNIQUE`、列级 `REFERENCES`（解析忽略）
+- `CREATE INDEX IF NOT EXISTS`（兼容接受，当前为扫描访问）
+- DML：`INSERT`（缺省列 + SERIAL）、`SELECT`/`UPDATE`/`DELETE` 的 `WHERE`（`=` / `IS [NOT] NULL` / `AND`）、`LIMIT`/`OFFSET`
+- 文本主键、多语句脚本、`BEGIN`/`COMMIT`/`ROLLBACK`（语句级自动提交下的兼容标签）
+
+验收：
+
+- `zig build test`（含 sub2api 风格 DDL/DML 单测）
+- 可执行 `sub2api/backend/migrations/001_init.sql` 全量建表
+- 核心表 `INSERT`/`SELECT`/`UPDATE`/`DELETE`（含 `AND` / `IS NULL` / 非主键 WHERE）
+
+仍不支持（sub2api 完整跑通还需继续）：扩展查询协议（`$1` 参数）、JOIN、JSONB 算子、`ALTER TABLE`、事务隔离、部分唯一索引语义等。
 
 ## 构建与运行
 
@@ -23,11 +36,16 @@ psql -h 127.0.0.1 -p 5433 -U pico -d pico
 ```
 
 ```sql
-CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
-INSERT INTO users (id, name) VALUES (1, 'alice');
-SELECT id, name FROM users;
-SELECT id, name FROM users WHERE id = 1;
-UPDATE users SET name = 'bob' WHERE id = 1;
+CREATE TABLE IF NOT EXISTS users (
+  id BIGSERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  role VARCHAR(20) NOT NULL DEFAULT 'user',
+  balance DECIMAL(20, 8) NOT NULL DEFAULT 0,
+  deleted_at TIMESTAMPTZ
+);
+INSERT INTO users (email) VALUES ('alice@example.com');
+SELECT id, email, role FROM users WHERE email = 'alice@example.com' AND deleted_at IS NULL;
+UPDATE users SET role = 'admin' WHERE email = 'alice@example.com';
 DELETE FROM users WHERE id = 1;
 ```
 
