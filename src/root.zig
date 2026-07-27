@@ -2,6 +2,7 @@
 
 pub const util = @import("util/bytes.zig");
 pub const value = @import("storage/value.zig");
+pub const vfs = @import("storage/vfs.zig");
 pub const wal = @import("storage/wal.zig");
 pub const engine = @import("storage/engine.zig");
 pub const sql = struct {
@@ -15,6 +16,7 @@ pub const server = @import("net/server.zig");
 test {
     _ = util;
     _ = value;
+    _ = vfs;
     _ = wal;
     _ = engine;
     _ = sql.token;

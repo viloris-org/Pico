@@ -3,6 +3,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const bytes = @import("../util/bytes.zig");
 const value = @import("value.zig");
+const vfs_mod = @import("vfs.zig");
 
 pub const RecordType = enum(u8) {
     create_table = 1,
@@ -44,14 +45,16 @@ pub const DeleteRecord = struct {
 pub const Wal = struct {
     gpa: Allocator,
     io: Io,
-    dir: Io.Dir,
-    file: Io.File,
+    vfs: vfs_mod.Vfs,
+    file: vfs_mod.File,
     /// Next write offset (end of file).
     offset: u64,
     sync_on_append: bool,
 
     pub const OpenError = Allocator.Error || Io.Dir.OpenError || Io.Dir.CreateDirPathOpenError || Io.File.OpenError || Io.File.StatError || Io.File.LengthError || error{
         InvalidWal,
+        InvalidStoragePath,
+        InstanceInUse,
         UnsupportedWalFormat,
         CorruptWal,
         InputOutput,
@@ -67,34 +70,27 @@ pub const Wal = struct {
     };
 
     pub fn open(gpa: Allocator, io: Io, data_dir: []const u8, sync_on_append: bool) OpenError!Wal {
-        const dir = try Io.Dir.cwd().createDirPathOpen(io, data_dir, .{});
-        errdefer dir.close(io);
+        var vfs = try vfs_mod.Vfs.open(io, data_dir);
+        errdefer vfs.close();
 
-        const file = dir.createFile(io, "wal", .{
-            .read = true,
-            .truncate = false,
-            .exclusive = false,
-        }) catch |err| switch (err) {
-            error.PathAlreadyExists => try dir.openFile(io, "wal", .{ .mode = .read_write }),
-            else => |e| return e,
-        };
-        errdefer file.close(io);
+        var file = try vfs.openFile("wal", .{ .create = true });
+        errdefer file.close();
 
-        var len = try file.length(io);
+        var len = try file.size();
         if (len == 0) {
             var header: [file_header_len]u8 = undefined;
             @memcpy(header[0..file_magic.len], file_magic);
             bytes.writeU32LE(header[file_magic.len..][0..4], format_version);
-            try file.writePositionalAll(io, &header, 0);
-            if (sync_on_append) try file.sync(io);
+            try file.writeAtAll(&header, 0);
+            if (sync_on_append) try file.sync();
             len = file_header_len;
         } else {
-            try validateFileHeader(io, file, len);
+            try validateFileHeader(&file, len);
         }
         return .{
             .gpa = gpa,
             .io = io,
-            .dir = dir,
+            .vfs = vfs,
             .file = file,
             .offset = len,
             .sync_on_append = sync_on_append,
@@ -102,8 +98,8 @@ pub const Wal = struct {
     }
 
     pub fn deinit(self: *Wal) void {
-        self.file.close(self.io);
-        self.dir.close(self.io);
+        self.file.close();
+        self.vfs.close();
         self.* = undefined;
     }
 
@@ -176,21 +172,21 @@ pub const Wal = struct {
         var header: [frame_header_len]u8 = undefined;
         bytes.writeU32LE(header[0..4], @intCast(payload.len));
         bytes.writeU32LE(header[4..8], std.hash.Crc32.hash(payload));
-        try self.file.writePositionalAll(self.io, &header, self.offset);
+        try self.file.writeAtAll(&header, self.offset);
         self.offset += frame_header_len;
-        try self.file.writePositionalAll(self.io, payload, self.offset);
+        try self.file.writeAtAll(payload, self.offset);
         self.offset += payload.len;
         if (self.sync_on_append) {
-            try self.file.sync(self.io);
+            try self.file.sync();
         }
     }
 };
 
-fn validateFileHeader(io: Io, file: Io.File, len: u64) !void {
+fn validateFileHeader(file: *vfs_mod.File, len: u64) !void {
     if (len < file_header_len) return error.InvalidWal;
 
     var header: [file_header_len]u8 = undefined;
-    const read_len = try file.readPositionalAll(io, &header, 0);
+    const read_len = try file.readAt(&header, 0);
     if (read_len < file_header_len) return error.InvalidWal;
     if (!std.mem.eql(u8, header[0..file_magic.len], file_magic)) return error.UnsupportedWalFormat;
     if (bytes.readU32LE(header[file_magic.len..][0..4]) != format_version) {
@@ -347,31 +343,31 @@ pub const RecordView = union(RecordType) {
 
 /// Replay complete, checksummed frames; truncate only a torn tail.
 pub fn replayWal(self: *Wal, ctx: anytype, comptime apply: fn (@TypeOf(ctx), RecordView) anyerror!void) !void {
-    try validateFileHeader(self.io, self.file, self.offset);
+    try validateFileHeader(&self.file, self.offset);
     var off: u64 = file_header_len;
     while (off < self.offset) {
         if (self.offset - off < frame_header_len) {
-            try self.file.setLength(self.io, off);
+            try self.file.truncate(off);
             self.offset = off;
             return;
         }
 
         var header: [frame_header_len]u8 = undefined;
-        const header_len = try self.file.readPositionalAll(self.io, &header, off);
+        const header_len = try self.file.readAt(&header, off);
         if (header_len < frame_header_len) return error.InvalidWal;
         const payload_len = bytes.readU32LE(header[0..4]);
         const payload_crc = bytes.readU32LE(header[4..8]);
         if (payload_len == 0 or payload_len > frame_payload_len_max) return error.InvalidWal;
         const frame_len: u64 = frame_header_len + payload_len;
         if (frame_len > self.offset - off) {
-            try self.file.setLength(self.io, off);
+            try self.file.truncate(off);
             self.offset = off;
             return;
         }
         off += frame_header_len;
         const buf = try self.gpa.alloc(u8, payload_len);
         defer self.gpa.free(buf);
-        const payload_read_len = try self.file.readPositionalAll(self.io, buf, off);
+        const payload_read_len = try self.file.readAt(buf, off);
         if (payload_read_len < payload_len) return error.InvalidWal;
         if (std.hash.Crc32.hash(buf) != payload_crc) return error.CorruptWal;
         off += payload_len;
@@ -381,7 +377,7 @@ pub fn replayWal(self: *Wal, ctx: anytype, comptime apply: fn (@TypeOf(ctx), Rec
         try apply(ctx, parsed.view);
     }
     if (off < self.offset) {
-        try self.file.setLength(self.io, off);
+        try self.file.truncate(off);
         self.offset = off;
     }
 }
@@ -471,7 +467,7 @@ test "wal rejects a complete frame with a bad checksum" {
         try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 1 }} });
 
         var corrupt: [1]u8 = .{0};
-        try wal.file.writePositionalAll(io, &corrupt, file_header_len + frame_header_len);
+        try wal.file.writeAtAll(&corrupt, file_header_len + frame_header_len);
     }
 
     {
