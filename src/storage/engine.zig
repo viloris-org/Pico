@@ -750,6 +750,75 @@ test "engine rejects invalid writes before they enter the wal" {
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 }
 
+// Crash matrix slice: durable prefix of WAL frames survives; a torn final frame
+// is dropped. Matches ARCHITECTURE.md recovery invariant for memtable+WAL phase.
+test "engine recovers only the committed prefix after a torn wal tail" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-engine-torn";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var sealed_end: u64 = 0;
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+            .{ .name = try gpa.dupe(u8, "name"), .type_tag = .text, .primary_key = false },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+
+        try eng.createTable("users", &cols);
+        var a: value.Value = .{ .text = try gpa.dupe(u8, "alice") };
+        defer a.deinit(gpa);
+        var b: value.Value = .{ .text = try gpa.dupe(u8, "bob") };
+        defer b.deinit(gpa);
+        var c: value.Value = .{ .text = try gpa.dupe(u8, "carol") };
+        defer c.deinit(gpa);
+        try eng.insert("users", &.{ .{ .int = 1 }, a });
+        try eng.insert("users", &.{ .{ .int = 2 }, b });
+        sealed_end = eng.wal.offset;
+        try eng.insert("users", &.{ .{ .int = 3 }, c });
+
+        const full = eng.wal.offset;
+        const torn = sealed_end + (full - sealed_end) / 2;
+        try eng.wal.file.truncate(torn);
+        eng.wal.offset = torn;
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("users");
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 2), all.rows.len);
+        try std.testing.expectEqual(sealed_end, eng.wal.offset);
+
+        var ghost = try eng.selectByPk("users", .{ .int = 3 });
+        defer ghost.deinit();
+        try std.testing.expectEqual(@as(usize, 0), ghost.rows.len);
+
+        var d: value.Value = .{ .text = try gpa.dupe(u8, "dave") };
+        defer d.deinit(gpa);
+        try eng.insert("users", &.{ .{ .int = 4 }, d });
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("users");
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 3), all.rows.len);
+        var dave = try eng.selectByPk("users", .{ .int = 4 });
+        defer dave.deinit();
+        try std.testing.expectEqualStrings("dave", dave.rows[0].values[1].text);
+    }
+
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+}
+
 // silence unused import if token only needed for eql in future
 comptime {
     _ = token;

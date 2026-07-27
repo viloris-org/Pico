@@ -13,6 +13,12 @@ pub const RecordType = enum(u8) {
 };
 
 /// WAL files are self-identifying so a changed frame layout never reinterprets old bytes.
+///
+/// Frame layout (little-endian):
+///   [payload_len: u32][crc32: u32][payload: payload_len bytes]
+/// where crc32 covers `payload_len` (as raw LE bytes) concatenated with `payload`.
+/// Covering the length prevents a flipped length field from being accepted as a
+/// different complete frame; only an incomplete tail may be truncated.
 const file_magic = "PICO_WAL";
 const format_version: u32 = 1;
 const file_header_len = file_magic.len + @sizeOf(u32);
@@ -167,20 +173,43 @@ pub const Wal = struct {
     }
 
     fn appendPayload(self: *Wal, payload: []const u8) !void {
-        if (payload.len > frame_payload_len_max) return error.InvalidWal;
+        if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
 
-        var header: [frame_header_len]u8 = undefined;
-        bytes.writeU32LE(header[0..4], @intCast(payload.len));
-        bytes.writeU32LE(header[4..8], std.hash.Crc32.hash(payload));
-        try self.file.writeAtAll(&header, self.offset);
-        self.offset += frame_header_len;
-        try self.file.writeAtAll(payload, self.offset);
-        self.offset += payload.len;
+        // One positional write for the whole frame so a crash yields either a
+        // complete frame or a single torn tail — never a header without body
+        // from two separate writes.
+        const frame_len = frame_header_len + payload.len;
+        const frame = try self.gpa.alloc(u8, frame_len);
+        defer self.gpa.free(frame);
+
+        const payload_len: u32 = @intCast(payload.len);
+        bytes.writeU32LE(frame[0..4], payload_len);
+        bytes.writeU32LE(frame[4..8], frameChecksum(payload_len, payload));
+        @memcpy(frame[frame_header_len..], payload);
+
+        try self.file.writeAtAll(frame, self.offset);
+        self.offset += frame_len;
         if (self.sync_on_append) {
             try self.file.sync();
         }
     }
+
+    /// Persist a recovered logical EOF. Required after torn-tail truncation so a
+    /// later append cannot leave garbage past the new end if size metadata was
+    /// not durable.
+    fn persistEnd(self: *Wal) !void {
+        try self.file.sync();
+    }
 };
+
+fn frameChecksum(payload_len: u32, payload: []const u8) u32 {
+    var len_bytes: [4]u8 = undefined;
+    bytes.writeU32LE(&len_bytes, payload_len);
+    var c = std.hash.Crc32.init();
+    c.update(&len_bytes);
+    c.update(payload);
+    return c.final();
+}
 
 fn validateFileHeader(file: *vfs_mod.File, len: u64) !void {
     if (len < file_header_len) return error.InvalidWal;
@@ -342,14 +371,23 @@ pub const RecordView = union(RecordType) {
 };
 
 /// Replay complete, checksummed frames; truncate only a torn tail.
+///
+/// Invariants (see docs/ARCHITECTURE.md):
+/// - Only complete, supported, checksum-valid frames are applied.
+/// - An incomplete final frame (short header, or declared body past EOF) is
+///   truncated and the new EOF is synced — never guessed or repaired mid-file.
+/// - A complete frame with a bad checksum, zero/oversized length, or undecodable
+///   payload fails recovery; the file is left untouched for forensics.
 pub fn replayWal(self: *Wal, ctx: anytype, comptime apply: fn (@TypeOf(ctx), RecordView) anyerror!void) !void {
     try validateFileHeader(&self.file, self.offset);
     var off: u64 = file_header_len;
+    var truncated = false;
     while (off < self.offset) {
         if (self.offset - off < frame_header_len) {
             try self.file.truncate(off);
             self.offset = off;
-            return;
+            truncated = true;
+            break;
         }
 
         var header: [frame_header_len]u8 = undefined;
@@ -357,28 +395,31 @@ pub fn replayWal(self: *Wal, ctx: anytype, comptime apply: fn (@TypeOf(ctx), Rec
         if (header_len < frame_header_len) return error.InvalidWal;
         const payload_len = bytes.readU32LE(header[0..4]);
         const payload_crc = bytes.readU32LE(header[4..8]);
-        if (payload_len == 0 or payload_len > frame_payload_len_max) return error.InvalidWal;
+        // Zero or absurd lengths on a fully present header are corruption, not a
+        // torn tail: a real append never writes a zero-length payload.
+        if (payload_len == 0 or payload_len > frame_payload_len_max) return error.CorruptWal;
         const frame_len: u64 = frame_header_len + payload_len;
         if (frame_len > self.offset - off) {
             try self.file.truncate(off);
             self.offset = off;
-            return;
+            truncated = true;
+            break;
         }
-        off += frame_header_len;
+
         const buf = try self.gpa.alloc(u8, payload_len);
         defer self.gpa.free(buf);
-        const payload_read_len = try self.file.readAt(buf, off);
+        const payload_off = off + frame_header_len;
+        const payload_read_len = try self.file.readAt(buf, payload_off);
         if (payload_read_len < payload_len) return error.InvalidWal;
-        if (std.hash.Crc32.hash(buf) != payload_crc) return error.CorruptWal;
-        off += payload_len;
+        if (frameChecksum(payload_len, buf) != payload_crc) return error.CorruptWal;
 
         var parsed = try RecordView.parseAlloc(self.gpa, buf);
         defer parsed.owned.deinit();
         try apply(ctx, parsed.view);
+        off += frame_len;
     }
-    if (off < self.offset) {
-        try self.file.truncate(off);
-        self.offset = off;
+    if (truncated) {
+        try self.persistEnd();
     }
 }
 
@@ -455,11 +496,34 @@ fn readValue(gpa: Allocator, payload: []const u8, i: *usize) !value.Value {
     }
 }
 
+const TestSink = struct {
+    inserts: u32 = 0,
+
+    fn apply(self: *TestSink, view: RecordView) !void {
+        switch (view) {
+            .insert => self.inserts += 1,
+            else => {},
+        }
+    }
+};
+
+fn noopApply(_: void, _: RecordView) !void {}
+
+fn openCleanDir(comptime name: []const u8) ![]const u8 {
+    const io = std.testing.io;
+    Io.Dir.cwd().deleteTree(io, name) catch {};
+    return name;
+}
+
+fn removeDir(name: []const u8) void {
+    Io.Dir.cwd().deleteTree(std.testing.io, name) catch {};
+}
+
 test "wal rejects a complete frame with a bad checksum" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-wal-checksum";
-    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-checksum");
+    defer removeDir(dir_name);
 
     {
         var wal = try Wal.open(gpa, io, dir_name, false);
@@ -475,8 +539,135 @@ test "wal rejects a complete frame with a bad checksum" {
         defer wal.deinit();
         try std.testing.expectError(error.CorruptWal, replayWal(&wal, {}, noopApply));
     }
-
-    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 }
 
-fn noopApply(_: void, _: RecordView) !void {}
+test "wal truncates a torn tail and keeps the committed prefix" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-torn");
+    defer removeDir(dir_name);
+
+    var prefix_end: u64 = 0;
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 1 }} });
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 2 }} });
+        prefix_end = wal.offset;
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 3 }} });
+
+        // Simulate crash after a partial frame write: keep only half of the last frame.
+        const torn_len = prefix_end + (wal.offset - prefix_end) / 2;
+        try std.testing.expect(torn_len > prefix_end);
+        try std.testing.expect(torn_len < wal.offset);
+        try wal.file.truncate(torn_len);
+        wal.offset = torn_len;
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: TestSink = .{};
+        try replayWal(&wal, &sink, TestSink.apply);
+        try std.testing.expectEqual(@as(u32, 2), sink.inserts);
+        try std.testing.expectEqual(prefix_end, wal.offset);
+        try std.testing.expectEqual(prefix_end, try wal.file.size());
+    }
+
+    // After sealing the torn tail, new appends must recover cleanly with no garbage tail.
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: TestSink = .{};
+        try replayWal(&wal, &sink, TestSink.apply);
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 4 }} });
+    }
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: TestSink = .{};
+        try replayWal(&wal, &sink, TestSink.apply);
+        try std.testing.expectEqual(@as(u32, 3), sink.inserts);
+    }
+}
+
+test "wal truncates a partial frame header at EOF" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-partial-header");
+    defer removeDir(dir_name);
+
+    var prefix_end: u64 = 0;
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 1 }} });
+        prefix_end = wal.offset;
+        var junk: [3]u8 = .{ 0x01, 0x02, 0x03 };
+        try wal.file.writeAtAll(&junk, wal.offset);
+        wal.offset += junk.len;
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: TestSink = .{};
+        try replayWal(&wal, &sink, TestSink.apply);
+        try std.testing.expectEqual(@as(u32, 1), sink.inserts);
+        try std.testing.expectEqual(prefix_end, wal.offset);
+    }
+}
+
+test "wal rejects a flipped length on an otherwise complete frame" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-bad-len");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 1 }} });
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 2 }} });
+
+        // Flip the low bit of the first frame's payload_len. The frame remains
+        // fully inside the file, so this must be CorruptWal — not a torn tail.
+        var len_byte: [1]u8 = undefined;
+        _ = try wal.file.readAt(&len_byte, file_header_len);
+        len_byte[0] ^= 1;
+        try wal.file.writeAtAll(&len_byte, file_header_len);
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try std.testing.expectError(error.CorruptWal, replayWal(&wal, {}, noopApply));
+        // Forensics: refuse without truncating away evidence past the bad frame.
+        try std.testing.expect((try wal.file.size()) > file_header_len);
+    }
+}
+
+test "wal rejects unknown magic and format version" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-format");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var bad_magic: [4]u8 = "XXXX".*;
+        try wal.file.writeAtAll(&bad_magic, 0);
+    }
+    try std.testing.expectError(error.UnsupportedWalFormat, Wal.open(gpa, io, dir_name, false));
+
+    removeDir(dir_name);
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var ver: [4]u8 = undefined;
+        bytes.writeU32LE(&ver, format_version + 1);
+        try wal.file.writeAtAll(&ver, file_magic.len);
+    }
+    try std.testing.expectError(error.UnsupportedWalFormat, Wal.open(gpa, io, dir_name, false));
+}
