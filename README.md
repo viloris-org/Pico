@@ -1,6 +1,8 @@
 # Pico
 
-单机、轻量、可网络访问的 OLTP 数据库（Zig）。对外兼容 **PostgreSQL 线协议** + **OLTP SQL 子集**；对内是自研存储（LSM 路线，见 ADR）。
+轻量、高性能、通用数据库（Zig）。Pico 面向简单部署和高效的服务端数据访问：当前以单机单实例形态提供网络访问，通过 **PostgreSQL 线协议** 接入，并聚焦 **OLTP SQL 子集**。存储路径为自研 LSM 路线，见 [架构决策](docs/adr/)。
+
+“通用”描述 Pico 的产品定位，不表示完整 PostgreSQL SQL 兼容、OLAP 引擎或集群能力；不在 SQL 子集内的语句会明确报错。
 
 ## 状态
 
@@ -60,13 +62,23 @@ zig build test
 - [`CONTEXT.md`](CONTEXT.md) — 领域语言
 - [`docs/adr/`](docs/adr/) — 架构决策
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 目标架构、数据归属与验证契约
+- [`docs/architecture/concurrency-control.md`](docs/architecture/concurrency-control.md) — 并发控制的目标语义与不变量
+- [`docs/architecture/vfs.md`](docs/architecture/vfs.md) — 数据目录 VFS
+- [`docs/architecture/pager-and-static-cache.md`](docs/architecture/pager-and-static-cache.md) — 页管理器与静态页缓存
+- [`docs/architecture/vdbe.md`](docs/architecture/vdbe.md) — VDBE 风格执行引擎（目标）
+- [`docs/architecture/runtime-and-concurrency.md`](docs/architecture/runtime-and-concurrency.md) — 运行时与连接
+- [`docs/architecture/io-scheduling.md`](docs/architecture/io-scheduling.md) — I/O 调度契约
 
 ## 模块边界
 
 | 目录 | 职责 |
 |------|------|
 | `net/` | TCP 接受、PostgreSQL 线协议 |
-| `sql/` | SQL 子集词法/解析/执行 |
-| `storage/` | WAL、内存表、引擎与恢复 |
+| `sql/` | SQL 子集词法/解析/执行（目标为可步进执行程序） |
+| `storage/` | VFS、Pager、WAL、内存表、引擎与恢复 |
 | `txn/` | 事务边界（Phase 0 为自动提交） |
 | `util/` | 编解码等通用工具 |
+
+## 许可证
+
+[MIT](LICENSE)

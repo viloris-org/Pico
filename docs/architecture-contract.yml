@@ -7,14 +7,20 @@ modules:
   net:
     paths: ["src/net/**"]
     owner: pico-core
-    may_depend_on: [sql, util]
+    may_depend_on: [runtime, sql, util]
     owns_data: [connection_state]
     risk: protocol
+  runtime:
+    paths: ["src/runtime/**"]
+    owner: pico-core
+    may_depend_on: [util]
+    owns_data: [io_scheduler_state, completion_queues]
+    risk: critical
   sql:
     paths: ["src/sql/**"]
     owner: pico-core
     may_depend_on: [txn, catalog, util]
-    owns_data: [parsed_statements]
+    owns_data: [parsed_statements, execution_programs]
     risk: protocol
   txn:
     paths: ["src/txn/**"]
@@ -38,8 +44,13 @@ modules:
     paths: ["src/storage/**"]
     owner: pico-core
     may_depend_on: [util]
-    owns_data: [wal, lsm_files, manifests, checkpoints]
+    owns_data: [wal, lsm_files, manifests, checkpoints, vfs_handles, pager_cache]
     risk: critical
+  # Logical sub-areas inside storage (documentation / review seams; not yet
+  # separate CI packages). Callers outside storage still depend on `storage`.
+  # - vfs: data-directory fence, instance lock, positional I/O, atomic publish
+  # - pager: fixed page frames, pin/unpin, dirty writeback (not user commit)
+  # - wal / lsm / compaction: as in ARCHITECTURE.md
   util:
     paths: ["src/util/**"]
     owner: pico-core
@@ -53,6 +64,7 @@ data_writers:
   lsm_manifest_publication: commit
   wal: commit
   connection_state: net
+  io_scheduler_state: runtime
 
 gates:
   dependency_cycles: 0
@@ -87,6 +99,15 @@ validation:
     - checkpoint_recovery_test
     - manifest_atomic_publication_test
     - compaction_snapshot_visibility_test
+  required_for_vfs_and_pager:
+    - vfs_path_fence_test
+    - vfs_atomic_publish_test
+    - pager_page_aligned_io_test
+    - pager_static_cache_full_and_pin_test
+  required_before_vdbe_program_execution:
+    - exec_golden_parity_with_ast_interpreter
+    - stepwise_select_backpressure_test
+    - cancel_at_opcode_boundary_test
 
 budgets:
   # Calibrate against CI history before making these blocking.

@@ -8,6 +8,14 @@ Pico 是一个单机、轻量、可网络访问的 OLTP 数据库。一个实例
 
 本文件记录目标边界，而不是声称 Phase 1 已全部实现。当前状态以 [README](../README.md) 为准：内存表与版本化、CRC32 校验的 WAL 已可用；持久 LSM、MVCC、事务隔离、group commit 和扩展查询协议仍在演进。
 
+连接状态机、I/O 背压、提交调度与 MVCC 快照的具体运行时边界见
+[运行时、连接与并发控制](architecture/runtime-and-concurrency.md)。
+版本可见性、隔离级别、写写争用与回收的不变量见
+[并发控制契约](architecture/concurrency-control.md)。
+数据目录文件抽象见 [VFS](architecture/vfs.md)；定长页与静态缓存见
+[Pager 与静态页缓存](architecture/pager-and-static-cache.md)；SQL 执行程序目标形态见
+[执行引擎（VDBE 风格）](architecture/vdbe.md)。
+
 ## 依据、取舍与非目标
 
 已接受的 ADR-0001 至 ADR-0007 是本架构的约束来源。决定架构的优先级依次为：
@@ -18,7 +26,7 @@ Pico 是一个单机、轻量、可网络访问的 OLTP 数据库。一个实例
 4. 以清晰模块边界和故障注入维持 Zig 存储代码的可演进性。
 5. 保持单实例部署、资源占用与启动路径简单。
 
-SQLite 的 pager 不变量提供了重要的方法：将每一条崩溃安全假设写成可验证的不变量，而不是将其藏在文件操作中。其 B-Tree 页更新和多进程锁模型不适用于 Pico 的 LSM 与单写者路径。TigerBeetle 说明了 WAL、检查点、不可变 LSM 文件和故障注入如何组成可验证的持久化设计；其复制、共识、跨副本修复和单线程运行时均不属于 Pico v1。
+SQLite 的 VFS、pager 不变量、静态 `PAGECACHE` 池和 VDBE 执行循环提供了方法参考：把平台 I/O、页缓存上限、崩溃安全假设和语句执行拆成可验证的层。其 B-Tree 页更新、多进程锁/SHM、可插拔多 VFS 注册和 rollback journal 主路径不适用于 Pico 的 LSM 与单写者模型。TigerBeetle 说明了 WAL、检查点、不可变 LSM 文件和故障注入如何组成可验证的持久化设计；其复制、共识、跨副本修复和单线程运行时均不属于 Pico v1。
 
 明确非目标：多实例复制、分片、故障转移、完整 PostgreSQL SQL、原地 B-Tree 写路径、检查点作为备份或 PITR。
 
@@ -44,24 +52,29 @@ flowchart TB
   writer --> catalog["catalog\n数据库、表、列、索引元数据"]
   writer --> wal["storage/wal\n追加、校验、持久化、恢复"]
   writer --> lsm["storage/lsm\n表与索引的有序集合"]
+  lsm --> pager["storage/pager\n静态页缓存（可选页文件）"]
   lsm --> vfs["storage/vfs\n数据目录内受限文件 I/O"]
   wal --> vfs
+  pager --> vfs
   lsm --> compaction["storage/compaction\n刷盘、合并、回收"]
+  sql --> vdbe["sql 执行程序\nVDBE 风格（目标）"]
+  vdbe --> txn
 ```
 
 | 模块 | 唯一职责 | 拥有的状态 | 可依赖 |
 | --- | --- | --- | --- |
 | `net` | 一个连接上的协议编解码、认证入口、错误映射 | 连接与会话状态 | `sql`、`util` |
-| `sql` | SQL 子集的词法、解析、绑定与执行调度 | 已解析语句和短生命周期执行状态 | `txn`、`catalog`、`util` |
+| `sql` | SQL 子集的词法、解析、绑定与执行调度（目标为可步进执行程序） | 已解析语句、执行程序与短生命周期执行状态 | `txn`、`catalog`、`util` |
 | `catalog` | 数据库、表、列和索引定义 | 目录元数据 | `storage`、`util` |
 | `txn` | 快照、写集、冲突判断、提交请求 | 活跃事务与 MVCC 时间戳 | `catalog`、`storage`、`util` |
 | `commit` | 唯一提交顺序、group commit 与写入应用 | 有界提交队列和下一个提交序号 | `txn`、`catalog`、`storage`、`util` |
 | `storage/wal` | WAL 格式、追加、校验、恢复扫描 | WAL 文件和耐久边界 | `storage/vfs`、`util` |
-| `storage/lsm` | 表/索引有序集合的读写、manifest | 内存表、不可变表与 manifest | `storage/vfs`、`util` |
+| `storage/lsm` | 表/索引有序集合的读写、manifest | 内存表、不可变表与 manifest | `storage/vfs`、`storage/pager`（若页文件）、`util` |
 | `storage/compaction` | LSM 刷盘、合并与文件回收 | 受限任务队列和候选集 | `storage/lsm`、`storage/vfs`、`util` |
-| `storage/vfs` | 数据目录的文件名验证、句柄生命周期与位置 I/O | 已打开目录和文件句柄 | `util` |
+| `storage/vfs` | 数据目录的文件名验证、句柄生命周期与位置 I/O | 已打开目录、实例锁和文件句柄 | `util` |
+| `storage/pager` | 定长页的静态缓存、pin、脏写回 | 编译期固定页框与所拥有文件 | `storage/vfs`、`util` |
 
-`net` 不得导入 `storage`；`sql` 不得读写 WAL 或 LSM 文件；`storage` 不得了解 SQL 文本或 PostgreSQL 报文。`commit` 是修改目录、WAL 与 LSM 可见状态的唯一写入方。后台压缩可以并行准备新文件，但只能通过 `commit`/manifest 发布路径让其对新读者可见。
+`net` 不得导入 `storage`；`sql` 不得读写 WAL 或 LSM 文件；`storage` 不得了解 SQL 文本或 PostgreSQL 报文。`commit` 是修改目录、WAL 与 LSM 可见状态的唯一写入方。后台压缩可以并行准备新文件，但只能通过 `commit`/manifest 发布路径让其对新读者可见。`storage/pager` 的 `flush`/`sync` 不是用户提交；用户表主路径不得退化为无 WAL 保护的页覆盖写。
 
 ## 数据归属与不变量
 
@@ -140,6 +153,12 @@ sequenceDiagram
 ## 参考材料
 
 - [ADR 0001--0007](adr/)：Pico 已接受的产品、协议、SQL、存储、并发、耐久与语言决策。
-- [SQLite pager invariants](../../sqlite/doc/pager-invariants.txt)：将崩溃一致性写成检查式不变量的参考。
-- [SQLite WAL locking](../../sqlite/doc/wal-lock.md)：恢复与检查点并发边界的反例参考；Pico 采用单实例单写者，而非其锁模型。
-- [TigerBeetle architecture](../../tigerbeetle/docs/ARCHITECTURE.md) 与 [data file](../../tigerbeetle/docs/internals/data_file.md)：WAL、检查点和 LSM 持久化关系的参考；复制与修复不在 Pico v1 范围。
+- [VFS](architecture/vfs.md)：数据目录围栏、实例锁、位置 I/O 与原子发布；对照 SQLite `sqlite3_vfs` 而收窄为单实例存储边界。
+- [Pager 与静态页缓存](architecture/pager-and-static-cache.md)：定长页 pin/驱逐与编译期缓存硬顶；对照 SQLite Pager/PCache/`PAGECACHE`，不继承 rollback journal 主路径。
+- [执行引擎（VDBE 风格）](architecture/vdbe.md)：SQL 子集到可步进执行程序的目标分层；对照 SQLite VDBE，游标与写集落在 MVCC+LSM+单写者上。
+- [SQLite pager invariants](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/doc/pager-invariants.txt)：将崩溃一致性写成检查式不变量的参考。
+- [SQLite WAL locking](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/doc/wal-lock.md)：恢复与检查点并发边界的反例参考；Pico 采用单实例单写者，而非其锁模型。
+- SQLite 源码锚点（与上列不变量同一提交）：[`os.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/os.h)、[`pager.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/pager.h)、[`pcache1.c`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/pcache1.c)、[`vdbe.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbe.h)。
+- [TigerBeetle architecture](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/docs/ARCHITECTURE.md) 与 [data file](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/docs/internals/data_file.md)：WAL、检查点和 LSM 持久化关系的参考；复制与修复不在 Pico v1 范围。
+- [运行时、连接与并发控制](architecture/runtime-and-concurrency.md)：以 DuckDB 的连接生命周期边界、TigerBeetle 的完成事件调度和 PostgreSQL 的快照一致性要求细化 Pico 运行时；只采纳与单实例、单写者约束相容的部分。
+- [I/O 调度契约](architecture/io-scheduling.md)：定义完成事件与回调分离、关键 I/O 容量保留、连接级公平、背压与故障处理；平台后端可替换，提交与耐久语义不可改变。
