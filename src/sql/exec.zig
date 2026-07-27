@@ -13,6 +13,8 @@ pub const ExecError = parse.ParseError || error{
     ColumnCountMismatch,
     DuplicatePrimaryKey,
     MissingPrimaryKey,
+    PrimaryKeyNotFound,
+    PrimaryKeyImmutable,
     TypeMismatch,
 };
 
@@ -67,6 +69,14 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, sql: []const u8) !QueryR
         .select => |sel| {
             return .{ .rows = try execSelect(gpa, eng, sel) };
         },
+        .update => |upd| {
+            try execUpdate(gpa, eng, upd);
+            return .{ .empty = "UPDATE 1" };
+        },
+        .delete => |del| {
+            try execDelete(eng, del);
+            return .{ .empty = "DELETE 1" };
+        },
     };
 }
 
@@ -101,6 +111,52 @@ fn findColumn(table: *engine_mod.Table, name: []const u8) ?usize {
         if (token.eqlIgnoreCase(c.name, name)) return i;
     }
     return null;
+}
+
+fn requirePkWhere(table: *engine_mod.Table, where_col: []const u8) !void {
+    const widx = findColumn(table, where_col) orelse return error.ColumnNotFound;
+    if (widx != table.pk_index) return error.NotImplemented;
+}
+
+fn execUpdate(gpa: Allocator, eng: *engine_mod.Engine, upd: parse.Update) !void {
+    const table = eng.getTable(upd.table) orelse return error.TableNotFound;
+    try requirePkWhere(table, upd.where_col);
+
+    // Start from current row, apply SET clauses, then full-row update.
+    const idx = table.by_pk.get(upd.where_pk) orelse return error.PrimaryKeyNotFound;
+    const current = table.rows.items[idx];
+
+    const ordered = try gpa.alloc(value.Value, table.columns.len);
+    defer {
+        for (ordered) |*v| v.deinit(gpa);
+        gpa.free(ordered);
+    }
+    for (current.values, 0..) |v, i| {
+        ordered[i] = try v.clone(gpa);
+    }
+
+    for (upd.sets) |set| {
+        const cidx = findColumn(table, set.column) orelse return error.ColumnNotFound;
+        if (cidx == table.pk_index) {
+            // Allow `SET id = <same pk>` only.
+            const new_pk = switch (set.value) {
+                .int => |n| n,
+                else => return error.PrimaryKeyImmutable,
+            };
+            if (new_pk != upd.where_pk) return error.PrimaryKeyImmutable;
+            continue;
+        }
+        ordered[cidx].deinit(gpa);
+        ordered[cidx] = try set.value.clone(gpa);
+    }
+
+    try eng.update(upd.table, upd.where_pk, ordered);
+}
+
+fn execDelete(eng: *engine_mod.Engine, del: parse.Delete) !void {
+    const table = eng.getTable(del.table) orelse return error.TableNotFound;
+    try requirePkWhere(table, del.where_col);
+    try eng.delete(del.table, del.where_pk);
 }
 
 fn valueToText(gpa: Allocator, arena_data: *std.ArrayList([]u8), v: value.Value) !?[]const u8 {
@@ -203,6 +259,21 @@ test "exec create insert select" {
     try std.testing.expect(r3 == .rows);
     try std.testing.expectEqual(@as(usize, 1), r3.rows.cells.len);
     try std.testing.expectEqualStrings("bob", r3.rows.cells[0][0].?);
+
+    var r4 = try execute(gpa, &eng, "UPDATE t SET name = 'bobby' WHERE id = 1");
+    defer r4.deinit();
+    try std.testing.expect(r4 == .empty);
+
+    var r5 = try execute(gpa, &eng, "SELECT name FROM t WHERE id = 1");
+    defer r5.deinit();
+    try std.testing.expectEqualStrings("bobby", r5.rows.cells[0][0].?);
+
+    var r6 = try execute(gpa, &eng, "DELETE FROM t WHERE id = 1");
+    defer r6.deinit();
+
+    var r7 = try execute(gpa, &eng, "SELECT name FROM t WHERE id = 1");
+    defer r7.deinit();
+    try std.testing.expectEqual(@as(usize, 0), r7.rows.cells.len);
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 }

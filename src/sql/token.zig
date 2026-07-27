@@ -14,6 +14,9 @@ pub const TokenKind = enum {
     kw_select,
     kw_from,
     kw_where,
+    kw_update,
+    kw_set,
+    kw_delete,
     kw_primary,
     kw_key,
     kw_int,
@@ -125,6 +128,9 @@ fn keywordOrIdent(text: []const u8) TokenKind {
     if (eqlIgnoreCase(text, "SELECT")) return .kw_select;
     if (eqlIgnoreCase(text, "FROM")) return .kw_from;
     if (eqlIgnoreCase(text, "WHERE")) return .kw_where;
+    if (eqlIgnoreCase(text, "UPDATE")) return .kw_update;
+    if (eqlIgnoreCase(text, "SET")) return .kw_set;
+    if (eqlIgnoreCase(text, "DELETE")) return .kw_delete;
     if (eqlIgnoreCase(text, "PRIMARY")) return .kw_primary;
     if (eqlIgnoreCase(text, "KEY")) return .kw_key;
     if (eqlIgnoreCase(text, "INT")) return .kw_int;

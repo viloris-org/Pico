@@ -4,9 +4,11 @@
 
 ## 状态
 
-**Phase 0（进行中）**：TCP 服务 + PG 简单查询协议 + 内存表 + WAL 恢复。
+**Phase 0（完成）**：TCP 服务 + PG 简单查询协议 + 内存表 + WAL 恢复。
 
-验收目标：`psql` 连上，`CREATE` / `INSERT` / `SELECT`，杀进程再启动后数据仍在。
+**Phase 1（进行中）**：`UPDATE` / `DELETE`（按主键）+ WAL 记录与恢复。
+
+验收（Phase 0）：`psql` 连上，`CREATE` / `INSERT` / `SELECT`，杀进程再启动后数据仍在。
 
 ## 构建与运行
 
@@ -25,6 +27,8 @@ CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
 INSERT INTO users (id, name) VALUES (1, 'alice');
 SELECT id, name FROM users;
 SELECT id, name FROM users WHERE id = 1;
+UPDATE users SET name = 'bob' WHERE id = 1;
+DELETE FROM users WHERE id = 1;
 ```
 
 ```bash

@@ -7,6 +7,8 @@ const value = @import("value.zig");
 pub const RecordType = enum(u8) {
     create_table = 1,
     insert = 2,
+    update = 3,
+    delete = 4,
 };
 
 pub const CreateTableRecord = struct {
@@ -17,6 +19,18 @@ pub const CreateTableRecord = struct {
 pub const InsertRecord = struct {
     table: []const u8,
     values: []const value.Value,
+};
+
+/// Full-row replacement for a primary key (Phase 1: no partial WAL encoding).
+pub const UpdateRecord = struct {
+    table: []const u8,
+    pk: i64,
+    values: []const value.Value,
+};
+
+pub const DeleteRecord = struct {
+    table: []const u8,
+    pk: i64,
 };
 
 /// Append-only WAL. Phase 0: one file `wal`, length-prefixed LE records.
@@ -94,6 +108,28 @@ pub const Wal = struct {
         try self.appendPayload(list.items);
     }
 
+    pub fn appendUpdate(self: *Wal, rec: UpdateRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try list.append(self.gpa, @intFromEnum(RecordType.update));
+        try writeStr(&list, self.gpa, rec.table);
+        try writeI64(&list, self.gpa, rec.pk);
+        try writeU16(&list, self.gpa, @intCast(rec.values.len));
+        for (rec.values) |v| {
+            try writeValue(&list, self.gpa, v);
+        }
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendDelete(self: *Wal, rec: DeleteRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try list.append(self.gpa, @intFromEnum(RecordType.delete));
+        try writeStr(&list, self.gpa, rec.table);
+        try writeI64(&list, self.gpa, rec.pk);
+        try self.appendPayload(list.items);
+    }
+
     fn appendPayload(self: *Wal, payload: []const u8) !void {
         var hdr: [4]u8 = undefined;
         bytes.writeU32LE(&hdr, @intCast(payload.len));
@@ -115,6 +151,15 @@ pub const RecordView = union(RecordType) {
     insert: struct {
         table: []const u8,
         values: []value.Value,
+    },
+    update: struct {
+        table: []const u8,
+        pk: i64,
+        values: []value.Value,
+    },
+    delete: struct {
+        table: []const u8,
+        pk: i64,
     },
 
     pub const ParsedColumn = struct {
@@ -175,6 +220,36 @@ pub const RecordView = union(RecordType) {
                     .owned = owned,
                 };
             },
+            .update => {
+                const table = try readStr(payload, &i);
+                const pk = try readI64(payload, &i);
+                const nval = try readU16(payload, &i);
+                try owned.values.ensureTotalCapacity(gpa, nval);
+                var v: u16 = 0;
+                while (v < nval) : (v += 1) {
+                    const val = try readValue(gpa, payload, &i);
+                    try owned.values.append(gpa, val);
+                }
+                return .{
+                    .view = .{ .update = .{
+                        .table = table,
+                        .pk = pk,
+                        .values = owned.values.items,
+                    } },
+                    .owned = owned,
+                };
+            },
+            .delete => {
+                const table = try readStr(payload, &i);
+                const pk = try readI64(payload, &i);
+                return .{
+                    .view = .{ .delete = .{
+                        .table = table,
+                        .pk = pk,
+                    } },
+                    .owned = owned,
+                };
+            },
         }
     }
 
@@ -230,6 +305,19 @@ fn writeU16(list: *std.ArrayList(u8), gpa: Allocator, v: u16) !void {
     var b: [2]u8 = undefined;
     bytes.writeU16LE(&b, v);
     try list.appendSlice(gpa, &b);
+}
+
+fn writeI64(list: *std.ArrayList(u8), gpa: Allocator, v: i64) !void {
+    var b: [8]u8 = undefined;
+    bytes.writeI64LE(&b, v);
+    try list.appendSlice(gpa, &b);
+}
+
+fn readI64(payload: []const u8, i: *usize) !i64 {
+    if (i.* + 8 > payload.len) return error.InvalidWal;
+    const v = bytes.readI64LE(payload[i.*..][0..8]);
+    i.* += 8;
+    return v;
 }
 
 fn writeStr(list: *std.ArrayList(u8), gpa: Allocator, s: []const u8) !void {

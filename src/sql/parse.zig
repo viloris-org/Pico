@@ -7,6 +7,8 @@ pub const Stmt = union(enum) {
     create_table: CreateTable,
     insert: Insert,
     select: Select,
+    update: Update,
+    delete: Delete,
     empty,
 };
 
@@ -28,6 +30,24 @@ pub const Select = struct {
     /// optional WHERE <pk_col> = <int>
     where_pk: ?i64,
     where_col: ?[]const u8,
+};
+
+pub const SetClause = struct {
+    column: []const u8, // borrowed from SQL text
+    value: value.Value, // owned
+};
+
+pub const Update = struct {
+    table: []const u8,
+    sets: []SetClause, // owned slice; values owned
+    where_pk: i64,
+    where_col: []const u8,
+};
+
+pub const Delete = struct {
+    table: []const u8,
+    where_pk: i64,
+    where_col: []const u8,
 };
 
 pub const ParseError = error{
@@ -62,6 +82,8 @@ pub const Parser = struct {
             .kw_create => self.parseCreateTable(),
             .kw_insert => self.parseInsert(),
             .kw_select => self.parseSelect(),
+            .kw_update => self.parseUpdate(),
+            .kw_delete => self.parseDelete(),
             else => error.UnsupportedSyntax,
         };
     }
@@ -262,6 +284,64 @@ pub const Parser = struct {
             .where_col = where_col,
         } };
     }
+
+    fn parseUpdate(self: *Parser) ParseError!Stmt {
+        _ = try self.expect(.kw_update);
+        const table = try self.expect(.ident);
+        _ = try self.expect(.kw_set);
+
+        var sets: std.ArrayList(SetClause) = .empty;
+        errdefer {
+            for (sets.items) |*s| s.value.deinit(self.gpa);
+            sets.deinit(self.gpa);
+        }
+        while (true) {
+            const col = try self.expect(.ident);
+            _ = try self.expect(.eq);
+            const val = try self.parseValue();
+            try sets.append(self.gpa, .{ .column = col.text, .value = val });
+            if (self.cur.kind == .comma) {
+                try self.advance();
+                continue;
+            }
+            break;
+        }
+
+        // WHERE <pk_col> = <int> required for Phase 1 (no full-table UPDATE).
+        _ = try self.expect(.kw_where);
+        const where_col = try self.expect(.ident);
+        _ = try self.expect(.eq);
+        const num = try self.expect(.number);
+        const where_pk = std.fmt.parseInt(i64, num.text, 10) catch return error.BadNumber;
+        if (self.cur.kind == .semicolon) try self.advance();
+
+        return .{ .update = .{
+            .table = table.text,
+            .sets = try sets.toOwnedSlice(self.gpa),
+            .where_pk = where_pk,
+            .where_col = where_col.text,
+        } };
+    }
+
+    fn parseDelete(self: *Parser) ParseError!Stmt {
+        _ = try self.expect(.kw_delete);
+        _ = try self.expect(.kw_from);
+        const table = try self.expect(.ident);
+
+        // WHERE <pk_col> = <int> required (no full-table DELETE yet).
+        _ = try self.expect(.kw_where);
+        const where_col = try self.expect(.ident);
+        _ = try self.expect(.eq);
+        const num = try self.expect(.number);
+        const where_pk = std.fmt.parseInt(i64, num.text, 10) catch return error.BadNumber;
+        if (self.cur.kind == .semicolon) try self.advance();
+
+        return .{ .delete = .{
+            .table = table.text,
+            .where_pk = where_pk,
+            .where_col = where_col.text,
+        } };
+    }
 };
 
 pub fn freeStmt(gpa: Allocator, stmt: *Stmt) void {
@@ -278,6 +358,11 @@ pub fn freeStmt(gpa: Allocator, stmt: *Stmt) void {
         .select => |*sel| {
             if (sel.columns) |c| gpa.free(c);
         },
+        .update => |*upd| {
+            for (upd.sets) |*s| s.value.deinit(gpa);
+            gpa.free(upd.sets);
+        },
+        .delete => {},
         .empty => {},
     }
     stmt.* = .empty;
@@ -304,5 +389,20 @@ test "parse create insert select" {
         defer freeStmt(gpa, &stmt);
         try std.testing.expect(stmt == .select);
         try std.testing.expectEqual(@as(i64, 1), stmt.select.where_pk.?);
+    }
+    {
+        var p = try Parser.init(gpa, "UPDATE users SET name = 'bob' WHERE id = 1");
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt == .update);
+        try std.testing.expectEqual(@as(i64, 1), stmt.update.where_pk);
+        try std.testing.expectEqual(@as(usize, 1), stmt.update.sets.len);
+    }
+    {
+        var p = try Parser.init(gpa, "DELETE FROM users WHERE id = 1");
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt == .delete);
+        try std.testing.expectEqual(@as(i64, 1), stmt.delete.where_pk);
     }
 }
