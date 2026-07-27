@@ -74,6 +74,19 @@ flowchart TB
 | `storage/vfs` | 数据目录的文件名验证、句柄生命周期与位置 I/O | 已打开目录、实例锁和文件句柄 | `util` |
 | `storage/pager` | 定长页的静态缓存、pin、脏写回 | 编译期固定页框与所拥有文件 | `storage/vfs`、`util` |
 
+### 当前实现映射（Phase 0：内存表 + WAL）
+
+目标图中的 `catalog` / `commit` / `lsm` 尚未独立成模块。现阶段由下列文件承担过渡职责，避免把约束、行存储与耐久编排继续堆在同一文件：
+
+| 模块 | 对应目标 | 唯一职责 | 可依赖 |
+| --- | --- | --- | --- |
+| `storage/table` | `catalog` 列定义 + `lsm` 内存表子集 | 单表的行、主键索引、约束校验、谓词匹配 | `storage/value`、`util` |
+| `storage/engine` | `commit` 的单写者门面 | 表名登记、校验→WAL 追加→应用到 `table`、启动恢复 | `storage/table`、`storage/wal`、`util` |
+
+- `sql` / `net` 只依赖 `storage/engine` 的公开门面（`Engine` 再导出 `Table` / `Pred` 等类型）。
+- `storage/table` **不**知道 WAL；耐久顺序与恢复重放只在 `engine`。
+- 引入独立 `catalog` / `lsm` / `commit` 时，应把登记与持久有序集合从 `engine`/`table` 迁出，而不是再把逻辑打回单文件。
+
 `net` 不得导入 `storage`；`sql` 不得读写 WAL 或 LSM 文件；`storage` 不得了解 SQL 文本或 PostgreSQL 报文。`commit` 是修改目录、WAL 与 LSM 可见状态的唯一写入方。后台压缩可以并行准备新文件，但只能通过 `commit`/manifest 发布路径让其对新读者可见。`storage/pager` 的 `flush`/`sync` 不是用户提交；用户表主路径不得退化为无 WAL 保护的页覆盖写。
 
 ## 数据归属与不变量

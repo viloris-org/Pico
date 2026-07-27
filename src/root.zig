@@ -5,6 +5,7 @@ pub const value = @import("storage/value.zig");
 pub const vfs = @import("storage/vfs.zig");
 pub const pager = @import("storage/pager.zig");
 pub const wal = @import("storage/wal.zig");
+pub const table = @import("storage/table.zig");
 pub const engine = @import("storage/engine.zig");
 pub const sql = struct {
     pub const token = @import("sql/token.zig");
@@ -20,6 +21,7 @@ test {
     _ = vfs;
     _ = pager;
     _ = wal;
+    _ = table;
     _ = engine;
     _ = sql.token;
     _ = sql.parse;
