@@ -11,6 +11,13 @@ pub const RecordType = enum(u8) {
     delete = 4,
 };
 
+/// WAL files are self-identifying so a changed frame layout never reinterprets old bytes.
+const file_magic = "PICO_WAL";
+const format_version: u32 = 1;
+const file_header_len = file_magic.len + @sizeOf(u32);
+const frame_header_len = @sizeOf(u32) + @sizeOf(u32);
+const frame_payload_len_max = 8 * 1024 * 1024;
+
 pub const CreateTableRecord = struct {
     name: []const u8,
     columns: []const value.Column,
@@ -33,7 +40,7 @@ pub const DeleteRecord = struct {
     pk: value.Value,
 };
 
-/// Append-only WAL. Phase 0: one file `wal`, length-prefixed LE records.
+/// Append-only WAL with a versioned file header and checksummed LE frames.
 pub const Wal = struct {
     gpa: Allocator,
     io: Io,
@@ -45,6 +52,14 @@ pub const Wal = struct {
 
     pub const OpenError = Allocator.Error || Io.Dir.OpenError || Io.Dir.CreateDirPathOpenError || Io.File.OpenError || Io.File.StatError || Io.File.LengthError || error{
         InvalidWal,
+        UnsupportedWalFormat,
+        CorruptWal,
+        InputOutput,
+        LockViolation,
+        BrokenPipe,
+        NotOpenForWriting,
+        NotOpenForReading,
+        Unseekable,
         EndOfStream,
         ReadFailed,
         WriteFailed,
@@ -65,7 +80,17 @@ pub const Wal = struct {
         };
         errdefer file.close(io);
 
-        const len = try file.length(io);
+        var len = try file.length(io);
+        if (len == 0) {
+            var header: [file_header_len]u8 = undefined;
+            @memcpy(header[0..file_magic.len], file_magic);
+            bytes.writeU32LE(header[file_magic.len..][0..4], format_version);
+            try file.writePositionalAll(io, &header, 0);
+            if (sync_on_append) try file.sync(io);
+            len = file_header_len;
+        } else {
+            try validateFileHeader(io, file, len);
+        }
         return .{
             .gpa = gpa,
             .io = io,
@@ -146,10 +171,13 @@ pub const Wal = struct {
     }
 
     fn appendPayload(self: *Wal, payload: []const u8) !void {
-        var hdr: [4]u8 = undefined;
-        bytes.writeU32LE(&hdr, @intCast(payload.len));
-        try self.file.writePositionalAll(self.io, &hdr, self.offset);
-        self.offset += 4;
+        if (payload.len > frame_payload_len_max) return error.InvalidWal;
+
+        var header: [frame_header_len]u8 = undefined;
+        bytes.writeU32LE(header[0..4], @intCast(payload.len));
+        bytes.writeU32LE(header[4..8], std.hash.Crc32.hash(payload));
+        try self.file.writePositionalAll(self.io, &header, self.offset);
+        self.offset += frame_header_len;
         try self.file.writePositionalAll(self.io, payload, self.offset);
         self.offset += payload.len;
         if (self.sync_on_append) {
@@ -157,6 +185,18 @@ pub const Wal = struct {
         }
     }
 };
+
+fn validateFileHeader(io: Io, file: Io.File, len: u64) !void {
+    if (len < file_header_len) return error.InvalidWal;
+
+    var header: [file_header_len]u8 = undefined;
+    const read_len = try file.readPositionalAll(io, &header, 0);
+    if (read_len < file_header_len) return error.InvalidWal;
+    if (!std.mem.eql(u8, header[0..file_magic.len], file_magic)) return error.UnsupportedWalFormat;
+    if (bytes.readU32LE(header[file_magic.len..][0..4]) != format_version) {
+        return error.UnsupportedWalFormat;
+    }
+}
 
 pub const RecordView = union(RecordType) {
     create_table: struct {
@@ -305,30 +345,36 @@ pub const RecordView = union(RecordType) {
     };
 };
 
-/// Replay all complete records; truncate torn tail.
+/// Replay complete, checksummed frames; truncate only a torn tail.
 pub fn replayWal(self: *Wal, ctx: anytype, comptime apply: fn (@TypeOf(ctx), RecordView) anyerror!void) !void {
-    var off: u64 = 0;
-    while (off + 4 <= self.offset) {
-        var hdr: [4]u8 = undefined;
-        const n = try self.file.readPositionalAll(self.io, &hdr, off);
-        if (n < 4) break;
-        const plen = bytes.readU32LE(&hdr);
-        if (plen == 0) {
+    try validateFileHeader(self.io, self.file, self.offset);
+    var off: u64 = file_header_len;
+    while (off < self.offset) {
+        if (self.offset - off < frame_header_len) {
             try self.file.setLength(self.io, off);
             self.offset = off;
             return;
         }
-        if (off + 4 + plen > self.offset) {
+
+        var header: [frame_header_len]u8 = undefined;
+        const header_len = try self.file.readPositionalAll(self.io, &header, off);
+        if (header_len < frame_header_len) return error.InvalidWal;
+        const payload_len = bytes.readU32LE(header[0..4]);
+        const payload_crc = bytes.readU32LE(header[4..8]);
+        if (payload_len == 0 or payload_len > frame_payload_len_max) return error.InvalidWal;
+        const frame_len: u64 = frame_header_len + payload_len;
+        if (frame_len > self.offset - off) {
             try self.file.setLength(self.io, off);
             self.offset = off;
             return;
         }
-        off += 4;
-        const buf = try self.gpa.alloc(u8, plen);
+        off += frame_header_len;
+        const buf = try self.gpa.alloc(u8, payload_len);
         defer self.gpa.free(buf);
-        const rn = try self.file.readPositionalAll(self.io, buf, off);
-        if (rn < plen) return error.InvalidWal;
-        off += plen;
+        const payload_read_len = try self.file.readPositionalAll(self.io, buf, off);
+        if (payload_read_len < payload_len) return error.InvalidWal;
+        if (std.hash.Crc32.hash(buf) != payload_crc) return error.CorruptWal;
+        off += payload_len;
 
         var parsed = try RecordView.parseAlloc(self.gpa, buf);
         defer parsed.owned.deinit();
@@ -412,3 +458,29 @@ fn readValue(gpa: Allocator, payload: []const u8, i: *usize) !value.Value {
         else => return error.InvalidWal,
     }
 }
+
+test "wal rejects a complete frame with a bad checksum" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-wal-checksum";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 1 }} });
+
+        var corrupt: [1]u8 = .{0};
+        try wal.file.writePositionalAll(io, &corrupt, file_header_len + frame_header_len);
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try std.testing.expectError(error.CorruptWal, replayWal(&wal, {}, noopApply));
+    }
+
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+}
+
+fn noopApply(_: void, _: RecordView) !void {}

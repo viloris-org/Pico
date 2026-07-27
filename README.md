@@ -8,6 +8,8 @@
 
 **Phase 1（进行中）**：面向 sub2api 类 OLTP 负载扩展 SQL 子集。
 
+持久化格式仍在 Phase 1 演进中。WAL 帧带格式版本与 CRC32 校验；遇到未知格式或完整帧校验失败时，实例会拒绝恢复，而不会猜测性重放数据。
+
 已支持（子集，非完整 PG）：
 
 - DDL：`CREATE TABLE IF NOT EXISTS`、PG 类型别名（`BIGSERIAL`/`VARCHAR`/`DECIMAL`/`TIMESTAMPTZ`/`JSONB`…）、`DEFAULT`/`NOW()`/`NOT NULL`/`UNIQUE`、列级 `REFERENCES`（解析忽略）

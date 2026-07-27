@@ -140,8 +140,7 @@ pub const Engine = struct {
     }
 
     fn createTableMem(self: *Engine, name: []const u8, cols: []const wal_mod.RecordView.ParsedColumn) !void {
-        if (self.tables.contains(name)) return error.TableExists;
-        if (cols.len == 0) return error.MissingPrimaryKey;
+        try self.validateCreateTable(name, cols);
 
         var pk_index: ?usize = null;
         const columns = try self.gpa.alloc(value.Column, cols.len);
@@ -184,6 +183,23 @@ pub const Engine = struct {
         errdefer table.deinit(self.gpa);
 
         try self.tables.put(tname, table);
+    }
+
+    fn validateCreateTable(
+        self: *const Engine,
+        name: []const u8,
+        cols: []const wal_mod.RecordView.ParsedColumn,
+    ) !void {
+        if (self.tables.contains(name)) return error.TableExists;
+        if (cols.len == 0) return error.MissingPrimaryKey;
+
+        var primary_key_count: usize = 0;
+        for (cols) |col| {
+            if (!col.primary_key) continue;
+            primary_key_count += 1;
+            if (col.type_tag != .int and col.type_tag != .text) return error.TypeMismatch;
+        }
+        if (primary_key_count > 1) return error.MissingPrimaryKey;
     }
 
     fn checkTypes(table: *const Table, values: []const value.Value) !void {
@@ -240,19 +256,30 @@ pub const Engine = struct {
         }
     }
 
-    fn insertMem(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
-        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+    fn validateInsert(table: *const Table, values: []const value.Value) !void {
         try checkTypes(table, values);
-
-        if (table.pk_index) |pki| {
-            const pk_val = values[pki];
-            switch (pk_val) {
+        if (table.pk_index) |pk_index| {
+            const pk = values[pk_index];
+            switch (pk) {
                 .int, .text => {},
                 else => return error.MissingPrimaryKey,
             }
-            if (pkContains(table, pk_val)) return error.DuplicatePrimaryKey;
+            if (pkContains(table, pk)) return error.DuplicatePrimaryKey;
         }
         try checkUnique(table, values, null);
+    }
+
+    fn validateUpdate(table: *const Table, pk: value.Value, values: []const value.Value) !void {
+        try checkTypes(table, values);
+        const pk_index = table.pk_index orelse return error.MissingPrimaryKey;
+        if (!value.Value.eql(values[pk_index], pk)) return error.PrimaryKeyImmutable;
+        const idx = pkLookup(table, pk) orelse return error.PrimaryKeyNotFound;
+        try checkUnique(table, values, idx);
+    }
+
+    fn insertMem(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        try validateInsert(table, values);
 
         const owned_vals = try self.gpa.alloc(value.Value, values.len);
         errdefer self.gpa.free(owned_vals);
@@ -287,14 +314,9 @@ pub const Engine = struct {
 
     fn updateMem(self: *Engine, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        try checkTypes(table, values);
-
-        const pki = table.pk_index orelse return error.MissingPrimaryKey;
-        const row_pk = values[pki];
-        if (!value.Value.eql(row_pk, pk)) return error.PrimaryKeyImmutable;
-
-        const idx = pkLookup(table, pk) orelse return error.PrimaryKeyNotFound;
-        try checkUnique(table, values, idx);
+        try validateUpdate(table, pk, values);
+        const pki = table.pk_index.?;
+        const idx = pkLookup(table, pk).?;
 
         const owned_vals = try self.gpa.alloc(value.Value, values.len);
         errdefer self.gpa.free(owned_vals);
@@ -392,6 +414,7 @@ pub const Engine = struct {
                 .default_expr = try c.default_expr.clone(self.gpa),
             });
         }
+        try self.validateCreateTable(name, parsed.items);
         try self.wal.appendCreateTable(.{ .name = name, .columns = columns });
         try self.createTableMem(name, parsed.items);
     }
@@ -402,16 +425,15 @@ pub const Engine = struct {
     }
 
     pub fn insert(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        try validateInsert(table, values);
         try self.wal.appendInsert(.{ .table = table_name, .values = values });
         try self.insertMem(table_name, values);
     }
 
     pub fn update(self: *Engine, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        try checkTypes(table, values);
-        const pki = table.pk_index orelse return error.MissingPrimaryKey;
-        if (!value.Value.eql(values[pki], pk)) return error.PrimaryKeyImmutable;
-        if (!pkContains(table, pk)) return error.PrimaryKeyNotFound;
+        try validateUpdate(table, pk, values);
 
         try self.wal.appendUpdate(.{ .table = table_name, .pk = pk, .values = values });
         try self.updateMem(table_name, pk, values);
@@ -424,9 +446,11 @@ pub const Engine = struct {
         try checkTypes(table, values);
         if (table.pk_index) |pki| {
             const pk = table.rows.items[idx].values[pki];
+            try validateUpdate(table, pk, values);
             try self.wal.appendUpdate(.{ .table = table_name, .pk = pk, .values = values });
             try self.updateMem(table_name, pk, values);
         } else {
+            try checkUnique(table, values, idx);
             // No single-column PK: persist with synthetic int key = row index at write time.
             // Recovery applies as insert-like replace via updateMemAt path encoded as update with int pk=idx.
             try self.wal.appendUpdate(.{ .table = table_name, .pk = .{ .int = @intCast(idx) }, .values = values });
@@ -675,6 +699,52 @@ test "engine update delete with wal recovery" {
         var r1 = try eng.selectByPk("users", .{ .int = 1 });
         defer r1.deinit();
         try std.testing.expectEqual(@as(usize, 0), r1.rows.len);
+    }
+
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+}
+
+test "engine rejects invalid writes before they enter the wal" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-engine-preflight";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, false);
+        defer eng.deinit();
+
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+            .{ .name = try gpa.dupe(u8, "email"), .type_tag = .text, .unique = true },
+        };
+        defer for (&cols) |*col| col.deinit(gpa);
+
+        try eng.createTable("users", &cols);
+        try std.testing.expectError(error.TableExists, eng.createTable("users", &cols));
+        var alice: value.Value = .{ .text = try gpa.dupe(u8, "alice@example.com") };
+        defer alice.deinit(gpa);
+        var bob: value.Value = .{ .text = try gpa.dupe(u8, "bob@example.com") };
+        defer bob.deinit(gpa);
+        try eng.insert("users", &.{ .{ .int = 1 }, alice });
+        try eng.insert("users", &.{ .{ .int = 2 }, bob });
+        try std.testing.expectError(
+            error.DuplicatePrimaryKey,
+            eng.insert("users", &.{ .{ .int = 1 }, bob }),
+        );
+        try std.testing.expectError(
+            error.UniqueViolation,
+            eng.update("users", .{ .int = 2 }, &.{ .{ .int = 2 }, alice }),
+        );
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, false);
+        defer eng.deinit();
+        var rows = try eng.selectAll("users");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqualStrings("alice@example.com", rows.rows[0].values[1].text);
     }
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
