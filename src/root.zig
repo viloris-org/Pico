@@ -12,6 +12,7 @@ pub const txn = struct {
 };
 pub const sql = struct {
     pub const token = @import("sql/token.zig");
+    pub const ast = @import("sql/ast.zig");
     pub const parse = @import("sql/parse.zig");
     pub const exec = @import("sql/exec.zig");
 };
@@ -28,6 +29,7 @@ test {
     _ = engine;
     _ = txn.session;
     _ = sql.token;
+    _ = sql.ast;
     _ = sql.parse;
     _ = sql.exec;
     _ = pg;
