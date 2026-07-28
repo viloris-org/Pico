@@ -70,6 +70,7 @@ pub const TokenKind = enum {
     kw_cascade,
     kw_restrict,
     kw_drop,
+    kw_check,
     // symbols
     lparen,
     rparen,
@@ -307,6 +308,7 @@ fn keywordOrIdent(text: []const u8) TokenKind {
     if (eqlIgnoreCase(text, "CASCADE")) return .kw_cascade;
     if (eqlIgnoreCase(text, "RESTRICT")) return .kw_restrict;
     if (eqlIgnoreCase(text, "DROP")) return .kw_drop;
+    if (eqlIgnoreCase(text, "CHECK")) return .kw_check;
     return .ident;
 }
 

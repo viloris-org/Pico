@@ -457,6 +457,23 @@ pub const Pred = union(enum) {
         col_index: usize,
         negated: bool,
     },
+    cmp: struct {
+        col_index: usize,
+        op: CmpOp,
+        value: value.Value, // borrowed during match
+    },
+    /// OR of AND-groups: true if any group fully matches
+    or_group: struct {
+        groups: [][]Pred, // owned; each inner slice AND-combined
+    },
+
+    pub const CmpOp = enum(u8) {
+        neq,
+        lt,
+        gt,
+        lte,
+        gte,
+    };
 };
 
 fn rowMatches(row: Row, preds: []const Pred) bool {
@@ -472,6 +489,27 @@ fn rowMatches(row: Row, preds: []const Pred) bool {
                 } else {
                     if (!is_null) return false;
                 }
+            },
+            .cmp => |c| {
+                const ord = value.Value.order(row.values[c.col_index], c.value) orelse return false;
+                const pass = switch (c.op) {
+                    .neq => ord != .eq,
+                    .lt => ord == .lt,
+                    .gt => ord == .gt,
+                    .lte => ord != .gt,
+                    .gte => ord != .lt,
+                };
+                if (!pass) return false;
+            },
+            .or_group => |o| {
+                var any_match = false;
+                for (o.groups) |group| {
+                    if (rowMatches(row, group)) {
+                        any_match = true;
+                        break;
+                    }
+                }
+                if (!any_match) return false;
             },
         }
     }

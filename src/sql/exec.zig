@@ -212,9 +212,39 @@ fn bindPreds(gpa: Allocator, table: *engine_mod.Table, preds: []const parse.Pred
                 const idx = findColumn(table, n.column) orelse return error.ColumnNotFound;
                 break :blk .{ .is_null = .{ .col_index = idx, .negated = n.negated } };
             },
+            .cmp => |c| blk: {
+                const idx = findColumn(table, c.column) orelse return error.ColumnNotFound;
+                break :blk .{ .cmp = .{ .col_index = idx, .op = switch (c.op) {
+                    .neq => .neq,
+                    .lt => .lt,
+                    .gt => .gt,
+                    .lte => .lte,
+                    .gte => .gte,
+                }, .value = c.value } };
+            },
+            .or_group => |o| blk: {
+                const groups = try gpa.alloc([]engine_mod.Pred, o.groups.len);
+                errdefer gpa.free(groups);
+                for (o.groups, 0..) |group, gi| {
+                    groups[gi] = try bindPreds(gpa, table, group);
+                }
+                break :blk .{ .or_group = .{ .groups = groups } };
+            },
         };
     }
     return out;
+}
+
+/// Free engine Pred allocations. Leaf variants borrow values; only .or_group owns
+/// nested group slices that need explicit deallocation.
+fn deinitEnginePreds(gpa: Allocator, preds: []engine_mod.Pred) void {
+    for (preds) |p| {
+        if (p == .or_group) {
+            for (p.or_group.groups) |group| gpa.free(group);
+            gpa.free(p.or_group.groups);
+        }
+    }
+    gpa.free(preds);
 }
 
 fn coerceForColumn(col: value.Column, v: value.Value, gpa: Allocator) !value.Value {
@@ -340,6 +370,27 @@ fn rowMatchesPreds(row_values: []const value.Value, preds: []const engine_mod.Pr
                     if (!is_null) return false;
                 }
             },
+            .cmp => |c| {
+                const ord = value.Value.order(row_values[c.col_index], c.value) orelse return false;
+                const pass = switch (c.op) {
+                    .neq => ord != .eq,
+                    .lt => ord == .lt,
+                    .gt => ord == .gt,
+                    .lte => ord != .gt,
+                    .gte => ord != .lt,
+                };
+                if (!pass) return false;
+            },
+            .or_group => |o| {
+                var any_match = false;
+                for (o.groups) |group| {
+                    if (rowMatchesPreds(row_values, group)) {
+                        any_match = true;
+                        break;
+                    }
+                }
+                if (!any_match) return false;
+            },
         }
     }
     return true;
@@ -348,7 +399,7 @@ fn rowMatchesPreds(row_values: []const value.Value, preds: []const engine_mod.Pr
 fn execUpdate(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, upd: parse.Update) !usize {
     const table = eng.getTable(upd.table) orelse return error.TableNotFound;
     const preds = try bindPreds(gpa, table, upd.where_preds);
-    defer gpa.free(preds);
+    defer deinitEnginePreds(gpa, preds);
 
     if (session.state == .active) {
         const pki = table.pk_index orelse return error.TxnRequiresPrimaryKey;
@@ -457,7 +508,7 @@ fn execUpdate(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, upd: p
 fn execDelete(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, del: parse.Delete) !usize {
     const table = eng.getTable(del.table) orelse return error.TableNotFound;
     const preds = try bindPreds(gpa, table, del.where_preds);
-    defer gpa.free(preds);
+    defer deinitEnginePreds(gpa, preds);
 
     if (session.state == .active) {
         const pki = table.pk_index orelse return error.TxnRequiresPrimaryKey;
@@ -579,7 +630,7 @@ fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, sel: p
     }
 
     const preds = try bindPreds(gpa, table, sel.where_preds);
-    defer gpa.free(preds);
+    defer deinitEnginePreds(gpa, preds);
 
     const order_column = if (sel.order_by) |order|
         findColumn(table, order.column) orelse return error.ColumnNotFound
@@ -799,6 +850,109 @@ test "exec multi-row insert survives WAL recovery as one batch" {
     }
 }
 
+test "exec comparison operators filter results correctly" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-cmp";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
+
+    var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, score INT, name TEXT)");
+    defer create.deinit();
+    var insert = try execute(gpa, &eng, &session, "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')");
+    defer insert.deinit();
+
+    // !=
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE id != 2 ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 3), res.rows.cells.len);
+      try std.testing.expectEqualStrings("1", res.rows.cells[0][0].?);
+      try std.testing.expectEqualStrings("3", res.rows.cells[1][0].?);
+      try std.testing.expectEqualStrings("4", res.rows.cells[2][0].?);
+    }
+    // <
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE score < 30 ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+    }
+    // >
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE score > 20 ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+      try std.testing.expectEqualStrings("3", res.rows.cells[0][0].?);
+    }
+    // <=
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE score <= 20 ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+    }
+    // >=
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE score >= 30 ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+      try std.testing.expectEqualStrings("3", res.rows.cells[0][0].?);
+    }
+    // text comparison
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE name > 'b' ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+      try std.testing.expectEqualStrings("3", res.rows.cells[0][0].?);
+    }
+    // <> operator (SQL-standard not-equal)
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE id <> 2 ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 3), res.rows.cells.len);
+      try std.testing.expectEqualStrings("1", res.rows.cells[0][0].?);
+    }
+}
+
+test "exec or_group in where clause" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-or";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
+
+    var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, score INT, name TEXT)");
+    defer create.deinit();
+    var insert = try execute(gpa, &eng, &session, "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')");
+    defer insert.deinit();
+
+    // OR: match either condition
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE (id = 1 OR id = 3) ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+      try std.testing.expectEqualStrings("1", res.rows.cells[0][0].?);
+      try std.testing.expectEqualStrings("3", res.rows.cells[1][0].?);
+    }
+    // OR group AND another predicate
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE (id = 2 OR id = 3) AND score >= 20 ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+    }
+    // OR with AND groups
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE (id = 1 AND name = 'a' OR id = 4) ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+      try std.testing.expectEqualStrings("1", res.rows.cells[0][0].?);
+    }
+    // OR returns empty when no match
+    { var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE (id = 99 OR id = 100) ORDER BY id");
+      defer res.deinit();
+      try std.testing.expectEqual(@as(usize, 0), res.rows.cells.len);
+    }
+}
+
 test "exec sub2api-shaped settings and users" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -893,6 +1047,10 @@ test "exec rejects syntax whose semantics are not implemented" {
     defer create.deinit();
     try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "INSERT INTO t VALUES (1, 'alice') RETURNING id"));
     try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "SELECT * FROM t ORDER BY id, name"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "CREATE TABLE t2 (id INT PRIMARY KEY CHECK (id > 0))"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "CREATE TABLE t3 (id INT PRIMARY KEY, name TEXT, CHECK (id > 0))"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET name = 'x'"));
 }
 
 test "alter table changes survive WAL recovery" {

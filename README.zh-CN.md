@@ -21,7 +21,7 @@ Pico Server 仍在积极开发中。目前已提供：
 - 带本地数据目录的单机单实例运行模式
 - `CREATE TABLE`、`ALTER TABLE`、`INSERT`、`SELECT`、`UPDATE` 和 `DELETE`
 - 单列主键、列级唯一约束、默认值和当前 SQL 类型别名
-- 支持 `=`、`AND` 和 `IS [NOT] NULL` 的 `WHERE` 条件，以及 `LIMIT` 和 `OFFSET`
+- 支持 `=`、`!=`/`<>`、`<`、`>`、`<=`、`>=`、`AND`、括号 `OR` 分组和 `IS [NOT] NULL` 的 `WHERE` 条件，以及 `LIMIT` 和 `OFFSET`
 - 自动提交以及显式 `BEGIN` / `COMMIT` / `ROLLBACK` 事务
 - 基于 WAL 的持久化与崩溃恢复
 - WAL 帧版本控制与 CRC32 校验
@@ -31,8 +31,8 @@ Pico Server 仍在积极开发中。目前已提供：
 group commit 和扩展查询协议属于目标架构，并不代表当前都已经实现。
 
 以下能力当前会被明确拒绝：`CREATE INDEX`、外键、表级唯一约束、复合主键、
-`CHECK`、`RETURNING`、多行 `INSERT`、`ON CONFLICT`、`ORDER BY`、`OR`、`NOT`、
-除 `=` 以外的比较运算、`IN`、`LIKE`、聚合、分组，以及扩展查询消息
+`CHECK`、`RETURNING`、多行 `INSERT`、`ON CONFLICT`、`ORDER BY`、`OR`（需括号分组）、`NOT`、
+`IN`、`LIKE`、聚合、分组，以及扩展查询消息
 `Parse`、`Bind`、`Describe` 和 `Execute`。
 
 Pico SQL 的完整边界请参阅 [SQL 子集支持矩阵](docs/sql-subset.md)。目标协议和

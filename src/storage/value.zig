@@ -76,6 +76,26 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Compare two non-null values of the same type tag.
+    /// Returns null if types differ or either value is null.
+    pub fn order(a: Value, b: Value) ?std.math.Order {
+        return switch (a) {
+            .null => null,
+            .int => |ai| switch (b) {
+                .int => |bi| std.math.order(ai, bi),
+                else => null,
+            },
+            .bool => |ab| switch (b) {
+                .bool => |bb| std.math.order(@intFromBool(ab), @intFromBool(bb)),
+                else => null,
+            },
+            .text => |at| switch (b) {
+                .text => |bt| std.mem.order(u8, at, bt),
+                else => null,
+            },
+        };
+    }
+
     /// Format for DataRow text protocol.
     pub fn formatText(self: Value, buf: []u8) error{NoSpaceLeft}![]const u8 {
         return switch (self) {

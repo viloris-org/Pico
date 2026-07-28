@@ -66,6 +66,25 @@ pub const Predicate = union(enum) {
         column_owned: bool = false,
         negated: bool,
     },
+    /// col <op> value where op != =
+    cmp: struct {
+        column: []const u8,
+        column_owned: bool = false,
+        op: CmpOp,
+        value: value.Value, // owned
+    },
+    /// expr1 OR expr2 — each group is AND-combined
+    or_group: struct {
+        groups: [][]Predicate, // owned; each inner slice is AND-combined
+    },
+
+    pub const CmpOp = enum(u8) {
+        neq,
+        lt,
+        gt,
+        lte,
+        gte,
+    };
 
     pub fn deinit(self: *Predicate, gpa: Allocator) void {
         switch (self.*) {
@@ -75,6 +94,17 @@ pub const Predicate = union(enum) {
             },
             .is_null => |*n| {
                 if (n.column_owned) gpa.free(n.column);
+            },
+            .cmp => |*c| {
+                if (c.column_owned) gpa.free(c.column);
+                c.value.deinit(gpa);
+            },
+            .or_group => |*o| {
+                for (o.groups) |group| {
+                    for (group) |*p| p.deinit(gpa);
+                    gpa.free(group);
+                }
+                gpa.free(o.groups);
             },
         }
     }
@@ -272,7 +302,7 @@ pub const Parser = struct {
             }
             // Table constraints other than PRIMARY KEY do not yet have storage
             // semantics. Reject them rather than accepting a no-op definition.
-            if (self.cur.kind == .kw_unique or self.cur.kind == .kw_references or
+            if (self.cur.kind == .kw_unique or self.cur.kind == .kw_references or self.cur.kind == .kw_check or
                 (self.cur.kind == .ident and token.eqlIgnoreCase(self.cur.text, "FOREIGN")) or
                 (self.cur.kind == .ident and token.eqlIgnoreCase(self.cur.text, "CONSTRAINT")))
             {
@@ -466,6 +496,9 @@ pub const Parser = struct {
                 .kw_references => {
                     return error.UnsupportedSyntax;
                 },
+                .kw_check => {
+                    return error.UnsupportedSyntax;
+                },
                 else => break,
             }
         }
@@ -635,6 +668,7 @@ pub const Parser = struct {
         _ = try self.expect(.kw_values);
         var rows: std.ArrayList([]value.Value) = .empty;
         errdefer {
+            if (col_names) |cn| self.gpa.free(cn);
             for (rows.items) |row| {
                 for (row) |*v| v.deinit(self.gpa);
                 self.gpa.free(row);
@@ -679,6 +713,12 @@ pub const Parser = struct {
         // RETURNING needs the rows produced by the write path; accepting it
         // before that exists would report a successful statement with lost data.
         if (self.cur.kind == .ident and token.eqlIgnoreCase(self.cur.text, "RETURNING")) {
+            return error.UnsupportedSyntax;
+        }
+        // ON CONFLICT must be rejected before the Insert is returned. Accepting
+        // it here lets the INSERT execute (autocommit path), then the leftover
+        // tokens error on the next parseStatement() — a data-integrity leak.
+        if (self.cur.kind == .kw_on) {
             return error.UnsupportedSyntax;
         }
         if (self.cur.kind == .semicolon) try self.advance();
@@ -760,19 +800,108 @@ pub const Parser = struct {
             preds.deinit(self.gpa);
         }
         while (true) {
-            try preds.append(self.gpa, try self.parsePredicate());
+            if (self.cur.kind == .lparen) {
+                try preds.append(self.gpa, try self.parseOrGroup());
+            } else {
+                try preds.append(self.gpa, try self.parsePredicate());
+            }
             if (self.cur.kind == .kw_and) {
                 try self.advance();
                 continue;
             }
-            // OR not supported yet
+            // OR outside parentheses is not supported yet (requires full precedence handling)
             if (self.cur.kind == .kw_or) return error.UnsupportedSyntax;
             break;
         }
         return try preds.toOwnedSlice(self.gpa);
     }
 
+    /// Parse a parenthesized OR group: (pred1 AND ... OR pred2 AND ...)
+    fn parseOrGroup(self: *Parser) ParseError!Predicate {
+        _ = try self.expect(.lparen);
+        var groups: std.ArrayList([]Predicate) = .empty;
+        errdefer {
+            for (groups.items) |g| {
+                for (g) |*p| p.deinit(self.gpa);
+                self.gpa.free(g);
+            }
+            groups.deinit(self.gpa);
+        }
+        while (true) {
+            var group: std.ArrayList(Predicate) = .empty;
+            errdefer {
+                for (group.items) |*p| p.deinit(self.gpa);
+                group.deinit(self.gpa);
+            }
+            while (true) {
+                try group.append(self.gpa, try self.parsePredicate());
+                if (self.cur.kind == .kw_and) {
+                    try self.advance();
+                    continue;
+                }
+                break;
+            }
+            try groups.append(self.gpa, try group.toOwnedSlice(self.gpa));
+            if (self.cur.kind == .kw_or) {
+                try self.advance();
+                continue;
+            }
+            break;
+        }
+        _ = try self.expect(.rparen);
+        return .{ .or_group = .{ .groups = try groups.toOwnedSlice(self.gpa) } };
+    }
+
     fn parsePredicate(self: *Parser) ParseError!Predicate {
+        // NOT prefix: parse inner predicate and invert it
+        if (self.cur.kind == .kw_not) {
+            try self.advance();
+            const inner = try self.parsePredicate();
+            return switch (inner) {
+                .eq => |e| Predicate{
+                    .cmp = .{
+                        .column = e.column,
+                        .column_owned = e.column_owned,
+                        .op = .neq,
+                        .value = e.value,
+                    },
+                },
+                .cmp => |c| blk: {
+                    if (c.op == .neq) {
+                        break :blk Predicate{
+                            .eq = .{
+                                .column = c.column,
+                                .column_owned = c.column_owned,
+                                .value = c.value,
+                            },
+                        };
+                    }
+                    const inverted: Predicate.CmpOp = switch (c.op) {
+                        .lt => .gte,
+                        .gt => .lte,
+                        .lte => .gt,
+                        .gte => .lt,
+                        else => unreachable,
+                    };
+                    break :blk Predicate{
+                        .cmp = .{
+                            .column = c.column,
+                            .column_owned = c.column_owned,
+                            .op = inverted,
+                            .value = c.value,
+                        },
+                    };
+                },
+                .is_null => |n| Predicate{
+                    .is_null = .{
+                        .column = n.column,
+                        .column_owned = n.column_owned,
+                        .negated = !n.negated,
+                    },
+                },
+                .or_group => error.UnsupportedSyntax,
+            };
+        }
         const col = try self.parseIdent();
         if (self.cur.kind == .kw_is) {
             try self.advance();
@@ -790,14 +919,28 @@ pub const Parser = struct {
             return error.UnexpectedToken;
         }
         try self.advance();
-        // Phase: only equality fully supported in engine; parse neq too
-        if (op != .eq) return error.UnsupportedSyntax;
+        if (op == .eq) {
+            const val = try self.parseValue();
+            if (self.cur.kind == .double_colon) {
+                try self.advance();
+                if (isTypeKeyword(self.cur.kind) or self.cur.kind == .ident) try self.advance();
+            }
+            return .{ .eq = .{ .column = col, .value = val } };
+        }
         const val = try self.parseValue();
         if (self.cur.kind == .double_colon) {
             try self.advance();
             if (isTypeKeyword(self.cur.kind) or self.cur.kind == .ident) try self.advance();
         }
-        return .{ .eq = .{ .column = col, .value = val } };
+        const cmp_op: Predicate.CmpOp = switch (op) {
+            .neq => .neq,
+            .lt => .lt,
+            .gt => .gt,
+            .lte => .lte,
+            .gte => .gte,
+            else => unreachable,
+        };
+        return .{ .cmp = .{ .column = col, .op = cmp_op, .value = val } };
     }
 
     fn parseSelect(self: *Parser) ParseError!Stmt {
@@ -955,7 +1098,7 @@ fn isIdentLike(k: token.TokenKind) bool {
     return switch (k) {
         .ident => true,
         // Keywords usable as identifiers in identifier position.
-        .kw_create, .kw_table, .kw_insert, .kw_into, .kw_values, .kw_select, .kw_from, .kw_where, .kw_update, .kw_set, .kw_delete, .kw_primary, .kw_key, .kw_int, .kw_integer, .kw_bigint, .kw_smallint, .kw_serial, .kw_bigserial, .kw_text, .kw_varchar, .kw_char, .kw_bool, .kw_boolean, .kw_decimal, .kw_numeric, .kw_timestamp, .kw_timestamptz, .kw_date, .kw_json, .kw_jsonb, .kw_if, .kw_not, .kw_exists, .kw_null, .kw_default, .kw_unique, .kw_index, .kw_on, .kw_and, .kw_or, .kw_is, .kw_references, .kw_limit, .kw_offset, .kw_order, .kw_by, .kw_asc, .kw_desc, .kw_alter, .kw_add, .kw_column, .kw_begin, .kw_commit, .kw_rollback, .kw_now, .kw_true, .kw_false, .kw_as, .kw_cascade, .kw_restrict, .kw_drop => true,
+        .kw_create, .kw_table, .kw_insert, .kw_into, .kw_values, .kw_select, .kw_from, .kw_where, .kw_update, .kw_set, .kw_delete, .kw_primary, .kw_key, .kw_int, .kw_integer, .kw_bigint, .kw_smallint, .kw_serial, .kw_bigserial, .kw_text, .kw_varchar, .kw_char, .kw_bool, .kw_boolean, .kw_decimal, .kw_numeric, .kw_timestamp, .kw_timestamptz, .kw_date, .kw_json, .kw_jsonb, .kw_if, .kw_not, .kw_exists, .kw_null, .kw_default, .kw_unique, .kw_index, .kw_on, .kw_and, .kw_or, .kw_is, .kw_references, .kw_limit, .kw_offset, .kw_order, .kw_by, .kw_asc, .kw_desc, .kw_alter, .kw_add, .kw_column, .kw_begin, .kw_commit, .kw_rollback, .kw_now, .kw_true, .kw_false, .kw_as, .kw_cascade, .kw_restrict, .kw_drop, .kw_check => true,
         else => false,
     };
 }
@@ -1137,4 +1280,111 @@ test "parse select single-column order by" {
     try std.testing.expect(stmt.select.order_by != null);
     try std.testing.expectEqualStrings("name", stmt.select.order_by.?.column);
     try std.testing.expect(stmt.select.order_by.?.descending);
+}
+
+test "parse rejects column-level check constraint" {
+    const gpa = std.testing.allocator;
+    var p = try Parser.init(gpa, "CREATE TABLE t (id INT PRIMARY KEY CHECK (id > 0))");
+    defer p.deinit();
+    try std.testing.expectError(error.UnsupportedSyntax, p.parseStatement());
+}
+
+test "parse rejects table-level check constraint" {
+    const gpa = std.testing.allocator;
+    var p = try Parser.init(gpa, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, CHECK (id > 0))");
+    defer p.deinit();
+    try std.testing.expectError(error.UnsupportedSyntax, p.parseStatement());
+}
+
+test "parse rejects on conflict" {
+    const gpa = std.testing.allocator;
+    var p = try Parser.init(gpa, "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING");
+    defer p.deinit();
+    try std.testing.expectError(error.UnsupportedSyntax, p.parseStatement());
+}
+
+test "parse rejects on conflict with conflict target" {
+    const gpa = std.testing.allocator;
+    var p = try Parser.init(gpa, "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET name = 'x'");
+    defer p.deinit();
+    try std.testing.expectError(error.UnsupportedSyntax, p.parseStatement());
+}
+
+test "parse comparison predicates" {
+    const gpa = std.testing.allocator;
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE id != 0");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds.len == 1);
+        try std.testing.expect(stmt.select.where_preds[0] == .cmp);
+        try std.testing.expect(stmt.select.where_preds[0].cmp.op == .neq);
+    }
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE id < 10");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds[0] == .cmp);
+        try std.testing.expect(stmt.select.where_preds[0].cmp.op == .lt);
+    }
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE id > 10");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds[0] == .cmp);
+        try std.testing.expect(stmt.select.where_preds[0].cmp.op == .gt);
+    }
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE id <= 10");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds[0] == .cmp);
+        try std.testing.expect(stmt.select.where_preds[0].cmp.op == .lte);
+    }
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE id >= 10");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds[0] == .cmp);
+        try std.testing.expect(stmt.select.where_preds[0].cmp.op == .gte);
+    }
+}
+
+test "parse or group in where clause" {
+    const gpa = std.testing.allocator;
+    {
+        // Single OR group
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE (id = 1 OR id = 2)");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expectEqual(@as(usize, 1), stmt.select.where_preds.len);
+        try std.testing.expect(stmt.select.where_preds[0] == .or_group);
+        try std.testing.expectEqual(@as(usize, 2), stmt.select.where_preds[0].or_group.groups.len);
+    }
+    {
+        // OR with AND inside each branch
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE (id = 1 AND name = 'a' OR id = 2)");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds[0] == .or_group);
+        try std.testing.expectEqual(@as(usize, 2), stmt.select.where_preds[0].or_group.groups.len);
+        try std.testing.expectEqual(@as(usize, 2), stmt.select.where_preds[0].or_group.groups[0].len);
+    }
+    {
+        // OR group AND simple predicate
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE (id = 1 OR id = 2) AND active = true");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expectEqual(@as(usize, 2), stmt.select.where_preds.len);
+        try std.testing.expect(stmt.select.where_preds[0] == .or_group);
+        try std.testing.expect(stmt.select.where_preds[1] == .eq);
+    }
 }

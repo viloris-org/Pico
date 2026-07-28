@@ -26,7 +26,7 @@ Pico Server is under active development. The current implementation provides:
 - `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
 - Single-column primary keys, column-level unique constraints, defaults, and
   current SQL type aliases
-- `WHERE` predicates using `=`, `AND`, and `IS [NOT] NULL`; single-column
+- `WHERE` predicates using `=`, `!=`/`<>`, `<`, `>`, `<=`, `>=`, `AND`, parenthesized `OR` groups, and `IS [NOT] NULL`; single-column
   `ORDER BY [ASC|DESC]`; `LIMIT` and `OFFSET`
 - Autocommit and explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
 - WAL-backed persistence and crash recovery
@@ -40,8 +40,8 @@ capabilities.
 
 The following are currently rejected explicitly: `CREATE INDEX`, foreign keys,
 table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`,
-`ON CONFLICT`, multi-column `ORDER BY`, `OR`, `NOT`, comparisons other than
-`=`, `IN`, `LIKE`, aggregation, grouping, and the extended query messages
+`ON CONFLICT`, multi-column `ORDER BY`, `OR` (outside parentheses), `NOT`,
+`IN`, `LIKE`, aggregation, grouping, and the extended query messages
 `Parse`, `Bind`, `Describe`, and `Execute`.
 
 See the [SQL subset support matrix](docs/sql-subset.md) for the authoritative
