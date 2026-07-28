@@ -15,8 +15,10 @@
 pub const proto = @import("clint_proto");
 pub const codec = @import("codec.zig");
 pub const connection = @import("connection.zig");
+pub const quic_connection = @import("quic_connection.zig");
 
 pub const Connection = connection.Connection;
+pub const QuicConnection = quic_connection.QuicConnection;
 pub const QueryResult = connection.QueryResult;
 pub const Message = codec.Message;
 pub const ProtocolError = codec.ProtocolError;

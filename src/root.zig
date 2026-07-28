@@ -17,6 +17,7 @@ pub const sql = struct {
     pub const exec = @import("sql/exec.zig");
 };
 pub const pg = @import("net/pg.zig");
+pub const quic = @import("net/quic.zig");
 pub const server = @import("net/server.zig");
 
 test {
@@ -33,5 +34,6 @@ test {
     _ = sql.parse;
     _ = sql.exec;
     _ = pg;
+    _ = quic;
     _ = server;
 }

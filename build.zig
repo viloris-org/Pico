@@ -4,6 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // zquic — vendored pure-Zig QUIC implementation.
+    const zquic_dep = b.dependency("zquic", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zquic_mod = zquic_dep.module("zquic");
+
     // Shared Pico wire protocol definitions (used by both server and client).
     const clint_proto_mod = b.addModule("clint_proto", .{
         .root_source_file = b.path("clint/proto/def.zig"),
@@ -17,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "clint_proto", .module = clint_proto_mod },
+            .{ .name = "zquic", .module = zquic_mod },
         },
     });
 
@@ -27,6 +35,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "clint_proto", .module = clint_proto_mod },
+            .{ .name = "zquic", .module = zquic_mod },
         },
     });
 
@@ -41,6 +50,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "pico", .module = mod },
                 .{ .name = "clint_proto", .module = clint_proto_mod },
+                .{ .name = "zquic", .module = zquic_mod },
             },
         }),
     });
@@ -77,6 +87,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "clint_proto", .module = clint_proto_mod },
                 .{ .name = "clint", .module = clint_mod },
+                .{ .name = "zquic", .module = zquic_mod },
             },
         }),
     });

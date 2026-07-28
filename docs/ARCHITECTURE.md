@@ -19,6 +19,13 @@ Pico Server 是一个单机、轻量、可网络访问的 OLTP 数据库。它�
 [Pager 与静态页缓存](architecture/pager-and-static-cache.md)；SQL 执行程序目标形态见
 [执行引擎（VDBE 风格）](architecture/vdbe.md)。
 
+写入路径与事务提交的两阶段模型见
+[写入路径与 WriteBatch](architecture/write-path.md)。
+WAL 的帧格式、恢复与校验不变量见
+[WAL 与崩溃恢复](architecture/wal-and-recovery.md)。
+LSM 的完整设计（MemTable、SST、Compaction、Manifest）见
+[LSM 存储引擎设计](architecture/lsm-storage.md)。
+
 ## 依据、取舍与非目标
 
 已接受的 ADR-0001、ADR-0004 至 ADR-0009 是本架构的约束来源。决定架构的优先级依次为：
@@ -142,7 +149,10 @@ sequenceDiagram
 
 检查点把已应用的 LSM/目录状态与已覆盖的 WAL 位置一起持久化；随后才允许回收旧 WAL。压缩从既有不可变表生成新文件，验证完整后更新 manifest；旧文件在所有快照越过其可见区间后回收。
 
-实例启动时依次：打开并验证数据目录元数据，选择最新有效检查点，扫描此位置后的 WAL，按提交序号重放完整记录，然后开始接受连接。若 WAL 只在末尾被截断，移除尾部后恢复；若发现完整记录校验错误、未知格式或无法建立一致检查点，则拒绝启动并保留证据，不进行猜测性修复。单实例没有可用于自动修复的副本，因此校验和用于检测与隔离故障，不承诺 TigerBeetle 式跨副本修复。
+实例启动时依次：打开并验证数据目录元数据，选择最新有效检查点，扫描此位置后的 WAL，按提交序号重放完整记录，然后开始接受连接。若 WAL 只在末尾被截断，移除尾部后恢复（见 [WAL 与崩溃恢复](architecture/wal-and-recovery.md)）；若发现完整记录校验错误、未知格式或无法建立一致检查点，则拒绝启动并保留证据，不进行猜测性修复。单实例没有可用于自动修复的副本，因此校验和用于检测与隔离故障，不承诺 TigerBeetle 式跨副本修复。
+
+压缩与 LSM 刷盘的详细设计见 [LSM 存储引擎设计](architecture/lsm-storage.md)。
+写入提交路径与批处理目标见 [写入路径与 WriteBatch](architecture/write-path.md)。
 
 ## 兼容性、可观测性与验证
 
@@ -182,3 +192,6 @@ sequenceDiagram
 - [TigerBeetle architecture](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/docs/ARCHITECTURE.md) 与 [data file](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/docs/internals/data_file.md)：WAL、检查点和 LSM 持久化关系的参考；复制与修复不在 Pico v1 范围。
 - [运行时、连接与并发控制](architecture/runtime-and-concurrency.md)：以 DuckDB 的连接生命周期边界、TigerBeetle 的完成事件调度和 PostgreSQL 的快照一致性要求细化 Pico 运行时；只采纳与单实例、单写者约束相容的部分。
 - [I/O 调度契约](architecture/io-scheduling.md)：定义完成事件与回调分离、关键 I/O 容量保留、连接级公平、背压与故障处理；平台后端可替换，提交与耐久语义不可改变。
+- [WAL 与崩溃恢复](architecture/wal-and-recovery.md)：Pico WAL 的帧格式、记录类型、恢复流程、CRC 校验不变量与故障模型；对照 RocksDB 的 WAL 设计描述了 Pico 的差异与取舍。
+- [写入路径与 WriteBatch](architecture/write-path.md)：自动提交与显式事务的写入 API、txn_batch 原子模型、两阶段暂存与提交、group commit 目标设计、耐久级别与同步策略；对照 RocksDB WriteBatch 的二进制格式设计。
+- [LSM 存储引擎设计](architecture/lsm-storage.md)：MemTable 内部键编码与 arena 分配、SST 文件格式（前缀压缩、布隆过滤器）、Compaction 策略、Manifest 版本管理、快照 GC 与空间回收；以 RocksDB LSM 体系为参考，描述 Pico 的目标设计与演进阶段。
