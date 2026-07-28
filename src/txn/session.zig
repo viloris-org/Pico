@@ -328,9 +328,21 @@ pub const Session = struct {
         skip_pk: ?value.Value,
     ) TxnError!void {
         const pki = table.pk_index;
+        var has_non_pk_unique = false;
+        for (table.columns, 0..) |col, ci| {
+            if (col.unique and (pki == null or ci != pki.?)) {
+                has_non_pk_unique = true;
+                break;
+            }
+        }
+        // Primary-key conflicts are checked by visibleRow before this method.
+        // Avoid materializing the full transaction view when no separate UNIQUE
+        // constraint needs it.
+        if (!has_non_pk_unique) return;
+
         if (pki == null) {
             for (table.columns, 0..) |col, ci| {
-                if (!col.unique and !col.primary_key) continue;
+                if (!col.unique) continue;
                 const v = values[ci];
                 if (v == .null) continue;
                 for (table.rows.items) |row| {
@@ -349,7 +361,7 @@ pub const Session = struct {
         defer freeVisibleRows(self.gpa, rows);
 
         for (table.columns, 0..) |col, ci| {
-            if (!col.unique and !col.primary_key) continue;
+            if (!col.unique or ci == pki.?) continue;
             const v = values[ci];
             if (v == .null) continue;
             for (rows) |row| {

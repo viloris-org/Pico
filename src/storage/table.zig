@@ -186,7 +186,9 @@ pub const Table = struct {
 
     fn checkUnique(self: *const Table, values: []const value.Value, skip_idx: ?usize) Error!void {
         for (self.columns, 0..) |col, ci| {
-            if (!col.unique and !col.primary_key) continue;
+            // A single-column primary key is checked through `by_pk_*` before
+            // this scan. Rechecking it here turns each insert into O(table size).
+            if (!col.unique or (self.pk_index != null and ci == self.pk_index.?)) continue;
             const v = values[ci];
             if (v == .null) continue;
             for (self.rows.items, 0..) |row, ri| {

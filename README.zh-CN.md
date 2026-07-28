@@ -42,6 +42,18 @@ zig build
 zig build test
 ```
 
+## 基准测试
+
+使用优化构建运行 SQL 路径基准测试：
+
+```bash
+zig build bench -Doptimize=ReleaseFast -- --rows 100000
+```
+
+该命令会报告自动提交 `INSERT`、主键 `SELECT`、显式事务中的 `INSERT` 加
+`COMMIT` 的吞吐量。默认使用临时数据目录并关闭 WAL 同步，以便衡量当前 SQL、
+表和 WAL 追加路径的性能。传入 `--sync-wal` 可将 WAL 同步的耐久性开销纳入测量。
+
 ## 运行
 
 使用默认回环地址、端口和数据目录启动服务：

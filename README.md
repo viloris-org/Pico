@@ -50,6 +50,20 @@ zig build
 zig build test
 ```
 
+## Benchmark
+
+Run the SQL-path benchmark in an optimized build:
+
+```bash
+zig build bench -Doptimize=ReleaseFast -- --rows 100000
+```
+
+It reports autocommit `INSERT`, primary-key `SELECT`, and explicit-transaction
+`INSERT` plus `COMMIT` throughput. The default uses a temporary data directory
+and disables WAL synchronization so results emphasize the current SQL, table,
+and WAL append path. Add `--sync-wal` to include durable WAL synchronization in
+the measurement.
+
 ## Run
 
 Start a server with the default loopback address, port, and data directory:
