@@ -14,6 +14,16 @@ pub const RecordType = enum(u8) {
     drop_column = 6,
     set_default = 7,
     set_not_null = 8,
+    /// Atomic multi-op commit: all nested ops share one frame/CRC.
+    /// Recovery applies every nested op or none (torn tail drops the whole batch).
+    txn_batch = 9,
+};
+
+/// One DML op inside an explicit-transaction commit batch.
+pub const TxnOp = union(enum) {
+    insert: InsertRecord,
+    update: UpdateRecord,
+    delete: DeleteRecord,
 };
 
 /// WAL files are self-identifying so a changed frame layout never reinterprets old bytes.
@@ -219,6 +229,27 @@ pub const Wal = struct {
         try self.appendPayload(list.items);
     }
 
+    /// Persist a whole explicit-transaction write set as one checksummed frame.
+    pub fn appendTxnBatch(self: *Wal, ops: []const TxnOp) !void {
+        if (ops.len == 0) return error.InvalidWal;
+        if (ops.len > std.math.maxInt(u16)) return error.InvalidWal;
+
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try list.append(self.gpa, @intFromEnum(RecordType.txn_batch));
+        try writeU16(&list, self.gpa, @intCast(ops.len));
+
+        for (ops) |op| {
+            var sub: std.ArrayList(u8) = .empty;
+            defer sub.deinit(self.gpa);
+            try encodeTxnOp(&sub, self.gpa, op);
+            if (sub.items.len > std.math.maxInt(u32)) return error.InvalidWal;
+            try writeU32(&list, self.gpa, @intCast(sub.items.len));
+            try list.appendSlice(self.gpa, sub.items);
+        }
+        try self.appendPayload(list.items);
+    }
+
     fn appendPayload(self: *Wal, payload: []const u8) !void {
         if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
 
@@ -292,6 +323,9 @@ pub const RecordView = union(RecordType) {
     drop_column: struct { table: []const u8, column: []const u8 },
     set_default: struct { table: []const u8, column: []const u8, default_expr: value.DefaultExpr },
     set_not_null: struct { table: []const u8, column: []const u8, enabled: bool },
+    /// Body is `n_ops:u16` then repeated `op_len:u32` + single-op payload (incl. type byte).
+    /// Borrowed from the frame buffer for the duration of `apply` only.
+    txn_batch: struct { body: []const u8 },
 
     pub const ParsedColumn = struct {
         name: []const u8,
@@ -427,6 +461,27 @@ pub const RecordView = union(RecordType) {
                 const enabled = payload[i] != 0;
                 return .{ .view = .{ .set_not_null = .{ .table = table, .column = column, .enabled = enabled } }, .owned = owned };
             },
+            .txn_batch => {
+                // Validate shape eagerly; engine expands nested ops during apply.
+                var j: usize = i;
+                const n_ops = try readU16(payload, &j);
+                if (n_ops == 0) return error.InvalidWal;
+                var k: u16 = 0;
+                while (k < n_ops) : (k += 1) {
+                    const op_len = try readU32(payload, &j);
+                    if (op_len == 0 or j + op_len > payload.len) return error.InvalidWal;
+                    const sub = payload[j .. j + op_len];
+                    j += op_len;
+                    // Nested batches are forbidden; each sub-op must be a plain record.
+                    if (sub.len < 1) return error.InvalidWal;
+                    const sub_tag = std.enums.fromInt(RecordType, sub[0]) orelse return error.InvalidWal;
+                    if (sub_tag == .txn_batch) return error.InvalidWal;
+                    var sub_parsed = try parseAlloc(gpa, sub);
+                    sub_parsed.owned.deinit();
+                }
+                if (j != payload.len) return error.InvalidWal;
+                return .{ .view = .{ .txn_batch = .{ .body = payload[i..] } }, .owned = owned };
+            },
         }
     }
 
@@ -503,6 +558,64 @@ fn writeU16(list: *std.ArrayList(u8), gpa: Allocator, v: u16) !void {
     var b: [2]u8 = undefined;
     bytes.writeU16LE(&b, v);
     try list.appendSlice(gpa, &b);
+}
+
+fn writeU32(list: *std.ArrayList(u8), gpa: Allocator, v: u32) !void {
+    var b: [4]u8 = undefined;
+    bytes.writeU32LE(&b, v);
+    try list.appendSlice(gpa, &b);
+}
+
+fn encodeTxnOp(list: *std.ArrayList(u8), gpa: Allocator, op: TxnOp) !void {
+    switch (op) {
+        .insert => |rec| {
+            try list.append(gpa, @intFromEnum(RecordType.insert));
+            try writeStr(list, gpa, rec.table);
+            try writeU16(list, gpa, @intCast(rec.values.len));
+            for (rec.values) |v| try writeValue(list, gpa, v);
+        },
+        .update => |rec| {
+            try list.append(gpa, @intFromEnum(RecordType.update));
+            try writeStr(list, gpa, rec.table);
+            try writeValue(list, gpa, rec.pk);
+            try writeU16(list, gpa, @intCast(rec.values.len));
+            for (rec.values) |v| try writeValue(list, gpa, v);
+        },
+        .delete => |rec| {
+            try list.append(gpa, @intFromEnum(RecordType.delete));
+            try writeStr(list, gpa, rec.table);
+            try writeValue(list, gpa, rec.pk);
+        },
+    }
+}
+
+fn readU32(payload: []const u8, i: *usize) !u32 {
+    if (i.* + 4 > payload.len) return error.InvalidWal;
+    const v = bytes.readU32LE(payload[i.*..][0..4]);
+    i.* += 4;
+    return v;
+}
+
+/// Iterate nested ops inside a `txn_batch` body. `body` excludes the type byte.
+pub fn forEachTxnBatchOp(
+    gpa: Allocator,
+    body: []const u8,
+    ctx: anytype,
+    comptime apply: fn (@TypeOf(ctx), RecordView) anyerror!void,
+) !void {
+    var i: usize = 0;
+    const n_ops = try readU16(body, &i);
+    var k: u16 = 0;
+    while (k < n_ops) : (k += 1) {
+        const op_len = try readU32(body, &i);
+        if (op_len == 0 or i + op_len > body.len) return error.InvalidWal;
+        const sub = body[i .. i + op_len];
+        i += op_len;
+        var parsed = try RecordView.parseAlloc(gpa, sub);
+        defer parsed.owned.deinit();
+        try apply(ctx, parsed.view);
+    }
+    if (i != body.len) return error.InvalidWal;
 }
 
 fn writeStr(list: *std.ArrayList(u8), gpa: Allocator, s: []const u8) !void {

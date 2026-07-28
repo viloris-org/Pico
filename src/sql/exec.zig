@@ -4,8 +4,11 @@ const engine_mod = @import("../storage/engine.zig");
 const value = @import("../storage/value.zig");
 const parse = @import("parse.zig");
 const token = @import("token.zig");
+const session_mod = @import("../txn/session.zig");
 
-pub const ExecError = parse.ParseError || error{
+pub const Session = session_mod.Session;
+
+pub const ExecError = parse.ParseError || session_mod.TxnError || error{
     ColumnNotFound,
     NotImplemented,
     TableExists,
@@ -20,6 +23,8 @@ pub const ExecError = parse.ParseError || error{
     UniqueViolation,
     ColumnExists,
     CannotDropPrimaryKey,
+    /// Catalog DDL inside an explicit transaction is not in this slice.
+    DdlInTransaction,
 };
 
 pub const QueryResult = union(enum) {
@@ -52,8 +57,8 @@ pub const QueryResult = union(enum) {
 };
 
 /// Execute a single SQL statement (or the first if multiple). Prefer `executeScript` for multi-stmt.
-pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, sql: []const u8) !QueryResult {
-    var results = try executeScript(gpa, eng, sql);
+pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, sql: []const u8) !QueryResult {
+    var results = try executeScript(gpa, eng, session, sql);
     defer {
         // free all but last if we transfer last
         if (results.len > 1) {
@@ -69,7 +74,7 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, sql: []const u8) !QueryR
 }
 
 /// Execute all statements in a script; returns one result per non-empty statement.
-pub fn executeScript(gpa: Allocator, eng: *engine_mod.Engine, sql: []const u8) ![]QueryResult {
+pub fn executeScript(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, sql: []const u8) ![]QueryResult {
     var parser = try parse.Parser.init(gpa, sql);
     defer parser.deinit();
 
@@ -83,7 +88,7 @@ pub fn executeScript(gpa: Allocator, eng: *engine_mod.Engine, sql: []const u8) !
         var stmt = try parser.parseStatement();
         defer parse.freeStmt(gpa, &stmt);
         if (stmt == .empty) break;
-        try out.append(gpa, try execStmt(gpa, eng, stmt));
+        try out.append(gpa, try execStmt(gpa, eng, session, stmt));
     }
 
     if (out.items.len == 0) {
@@ -92,14 +97,51 @@ pub fn executeScript(gpa: Allocator, eng: *engine_mod.Engine, sql: []const u8) !
     return try out.toOwnedSlice(gpa);
 }
 
-fn execStmt(gpa: Allocator, eng: *engine_mod.Engine, stmt: parse.Stmt) !QueryResult {
+fn execStmt(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, stmt: parse.Stmt) !QueryResult {
+    // ROLLBACK is the only statement allowed in a failed transaction.
+    if (stmt == .rollback_tx) {
+        session.rollback();
+        return .{ .empty = "ROLLBACK" };
+    }
+
+    return execStmtBody(gpa, eng, session, stmt) catch |err| {
+        // Statement errors abort an explicit transaction; autocommit stays idle.
+        session.fail();
+        return err;
+    };
+}
+
+fn execStmtBody(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, stmt: parse.Stmt) !QueryResult {
+    switch (stmt) {
+        .empty => return .{ .empty = "EMPTY" },
+        .begin_tx => {
+            try session.begin();
+            return .{ .empty = "BEGIN" };
+        },
+        .commit_tx => {
+            try session.commit(eng);
+            return .{ .empty = "COMMIT" };
+        },
+        .rollback_tx => {
+            session.rollback();
+            return .{ .empty = "ROLLBACK" };
+        },
+        .create_index => return error.NotImplemented,
+        else => {},
+    }
+
+    try session.ensureExecutable();
+
+    // Catalog DDL is autocommit-only in this slice (no DDL write-set yet).
+    if (session.state == .active) {
+        switch (stmt) {
+            .create_table, .alter_table, .create_index => return error.DdlInTransaction,
+            else => {},
+        }
+    }
+
     return switch (stmt) {
-        .empty => .{ .empty = "EMPTY" },
-        // A successful transaction command must provide a private write set,
-        // failed-transaction state, and atomic WAL publication. Those pieces
-        // are deliberately not emulated by command tags.
-        .begin_tx, .commit_tx, .rollback_tx => error.NotImplemented,
-        .create_index => error.NotImplemented,
+        .empty, .begin_tx, .commit_tx, .rollback_tx, .create_index => unreachable,
         .create_table => |ct| {
             if (ct.if_not_exists) {
                 try eng.createTableIfNotExists(ct.name, ct.columns);
@@ -120,24 +162,18 @@ fn execStmt(gpa: Allocator, eng: *engine_mod.Engine, stmt: parse.Stmt) !QueryRes
             return .{ .empty = "ALTER TABLE" };
         },
         .insert => |ins| {
-            try execInsert(gpa, eng, ins);
-            return .{ .empty = "INSERT 0 1" };
+            const n = try execInsert(gpa, eng, session, ins);
+            return .{ .empty = try formatTag(gpa, "INSERT 0 {d}", .{n}) };
         },
         .select => |sel| {
-            return .{ .rows = try execSelect(gpa, eng, sel) };
+            return .{ .rows = try execSelect(gpa, eng, session, sel) };
         },
         .update => |upd| {
-            const n = try execUpdate(gpa, eng, upd);
-            // Tag buffer lifetime: return static-ish via allocated? PG uses "UPDATE n".
-            // Store in empty as static only works for fixed; use heap tag via... QueryResult.empty is []const u8.
-            // Allocate tag on gpa — but empty deinit doesn't free. Use stack-fixed via fmt into static threadlocal?
-            // For protocol path we need dynamic. Change empty to own optional later.
-            // Workaround: only return common tags; for count use format into a leaked... bad.
-            // Better: encode count in a small static pool — for tests, "UPDATE 1" is enough if n==1.
+            const n = try execUpdate(gpa, eng, session, upd);
             return .{ .empty = try formatTag(gpa, "UPDATE {d}", .{n}) };
         },
         .delete => |del| {
-            const n = try execDelete(gpa, eng, del);
+            const n = try execDelete(gpa, eng, session, del);
             return .{ .empty = try formatTag(gpa, "DELETE {d}", .{n}) };
         },
     };
@@ -221,26 +257,26 @@ fn evalDefault(gpa: Allocator, col: value.Column) !value.Value {
     };
 }
 
-fn execInsert(gpa: Allocator, eng: *engine_mod.Engine, ins: parse.Insert) !void {
+fn buildInsertRow(gpa: Allocator, eng: *engine_mod.Engine, ins: parse.Insert, values: []const value.Value) ![]value.Value {
     const table = eng.getTable(ins.table) orelse return error.TableNotFound;
 
     const ordered = try gpa.alloc(value.Value, table.columns.len);
-    defer {
+    errdefer {
         for (ordered) |*v| v.deinit(gpa);
         gpa.free(ordered);
     }
     for (ordered) |*v| v.* = .null;
 
     if (ins.columns) |colnames| {
-        if (colnames.len != ins.values.len) return error.ColumnCountMismatch;
-        for (colnames, ins.values) |cname, val| {
+        if (colnames.len != values.len) return error.ColumnCountMismatch;
+        for (colnames, values) |cname, val| {
             const idx = findColumn(table, cname) orelse return error.ColumnNotFound;
             ordered[idx].deinit(gpa);
             ordered[idx] = try coerceForColumn(table.columns[idx], val, gpa);
         }
     } else {
-        if (ins.values.len != table.columns.len) return error.ColumnCountMismatch;
-        for (ins.values, 0..) |val, i| {
+        if (values.len != table.columns.len) return error.ColumnCountMismatch;
+        for (values, 0..) |val, i| {
             ordered[i].deinit(gpa);
             ordered[i] = try coerceForColumn(table.columns[i], val, gpa);
         }
@@ -263,14 +299,89 @@ fn execInsert(gpa: Allocator, eng: *engine_mod.Engine, ins: parse.Insert) !void 
         if (col.not_null) return error.NotNullViolation;
         if (col.primary_key) return error.MissingPrimaryKey;
     }
-
-    try eng.insert(ins.table, ordered);
+    return ordered;
 }
 
-fn execUpdate(gpa: Allocator, eng: *engine_mod.Engine, upd: parse.Update) !usize {
+fn execInsert(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, ins: parse.Insert) !usize {
+    // A multi-row INSERT is one statement: stage all rows before publication so
+    // a later constraint failure cannot partially commit earlier groups.
+    var implicit_session: Session = undefined;
+    const target = if (session.state == .active) session else blk: {
+        implicit_session = Session.init(gpa);
+        try implicit_session.begin();
+        break :blk &implicit_session;
+    };
+    defer if (session.state != .active) implicit_session.deinit();
+
+    for (ins.rows) |values| {
+        const ordered = try buildInsertRow(gpa, eng, ins, values);
+        defer {
+            for (ordered) |*v| v.deinit(gpa);
+            gpa.free(ordered);
+        }
+        try target.stageInsert(eng, ins.table, ordered);
+    }
+
+    if (session.state != .active) try implicit_session.commit(eng);
+    return ins.rows.len;
+}
+
+fn rowMatchesPreds(row_values: []const value.Value, preds: []const engine_mod.Pred) bool {
+    for (preds) |p| {
+        switch (p) {
+            .eq => |e| {
+                if (!value.Value.eql(row_values[e.col_index], e.value)) return false;
+            },
+            .is_null => |n| {
+                const is_null = row_values[n.col_index] == .null;
+                if (n.negated) {
+                    if (is_null) return false;
+                } else {
+                    if (!is_null) return false;
+                }
+            },
+        }
+    }
+    return true;
+}
+
+fn execUpdate(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, upd: parse.Update) !usize {
     const table = eng.getTable(upd.table) orelse return error.TableNotFound;
     const preds = try bindPreds(gpa, table, upd.where_preds);
     defer gpa.free(preds);
+
+    if (session.state == .active) {
+        const pki = table.pk_index orelse return error.TxnRequiresPrimaryKey;
+        const rows = try session.collectVisibleRows(gpa, table, upd.table);
+        defer Session.freeVisibleRows(gpa, rows);
+
+        var count: usize = 0;
+        for (rows) |row| {
+            if (!rowMatchesPreds(row.values, preds)) continue;
+            const pk = row.values[pki];
+
+            const ordered = try gpa.alloc(value.Value, table.columns.len);
+            defer {
+                for (ordered) |*v| v.deinit(gpa);
+                gpa.free(ordered);
+            }
+            for (row.values, 0..) |v, i| {
+                ordered[i] = try v.clone(gpa);
+            }
+            for (upd.sets) |set| {
+                const cidx = findColumn(table, set.column) orelse return error.ColumnNotFound;
+                if (cidx == pki) {
+                    if (!value.Value.eql(set.value, pk)) return error.PrimaryKeyImmutable;
+                    continue;
+                }
+                ordered[cidx].deinit(gpa);
+                ordered[cidx] = try coerceForColumn(table.columns[cidx], set.value, gpa);
+            }
+            try session.stageUpdate(eng, upd.table, pk, ordered);
+            count += 1;
+        }
+        return count;
+    }
 
     const indices = try eng.matchIndices(table, preds);
     defer gpa.free(indices);
@@ -343,10 +454,24 @@ fn execUpdate(gpa: Allocator, eng: *engine_mod.Engine, upd: parse.Update) !usize
     return count;
 }
 
-fn execDelete(gpa: Allocator, eng: *engine_mod.Engine, del: parse.Delete) !usize {
+fn execDelete(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, del: parse.Delete) !usize {
     const table = eng.getTable(del.table) orelse return error.TableNotFound;
     const preds = try bindPreds(gpa, table, del.where_preds);
     defer gpa.free(preds);
+
+    if (session.state == .active) {
+        const pki = table.pk_index orelse return error.TxnRequiresPrimaryKey;
+        const rows = try session.collectVisibleRows(gpa, table, del.table);
+        defer Session.freeVisibleRows(gpa, rows);
+
+        var count: usize = 0;
+        for (rows) |row| {
+            if (!rowMatchesPreds(row.values, preds)) continue;
+            try session.stageDelete(eng, del.table, row.values[pki]);
+            count += 1;
+        }
+        return count;
+    }
 
     const indices = try eng.matchIndices(table, preds);
     defer gpa.free(indices);
@@ -394,7 +519,7 @@ fn valueToText(gpa: Allocator, arena_data: *std.ArrayList([]u8), v: value.Value)
     }
 }
 
-fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, sel: parse.Select) !QueryResult.Rows {
+fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, sel: parse.Select) !QueryResult.Rows {
     const table = eng.getTable(sel.table) orelse return error.TableNotFound;
 
     var proj: std.ArrayList(usize) = .empty;
@@ -410,19 +535,6 @@ fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, sel: parse.Select) !Query
 
     const preds = try bindPreds(gpa, table, sel.where_preds);
     defer gpa.free(preds);
-
-    const indices = try eng.matchIndices(table, preds);
-    defer gpa.free(indices);
-
-    // Apply OFFSET / LIMIT
-    var start: usize = @intCast(sel.offset);
-    if (start > indices.len) start = indices.len;
-    var end = indices.len;
-    if (sel.limit) |lim| {
-        const lim_usz: usize = @intCast(lim);
-        if (start + lim_usz < end) end = start + lim_usz;
-    }
-    const slice = indices[start..end];
 
     const col_names = try gpa.alloc([]const u8, proj.items.len);
     errdefer gpa.free(col_names);
@@ -442,14 +554,55 @@ fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, sel: parse.Select) !Query
         cells.deinit(gpa);
     }
 
-    for (slice) |idx| {
-        const row = table.rows.items[idx];
-        const line = try gpa.alloc(?[]const u8, proj.items.len);
-        errdefer gpa.free(line);
-        for (proj.items, 0..) |pi, i| {
-            line[i] = try valueToText(gpa, &arena_data, row.values[pi]);
+    if (session.state == .active) {
+        const rows = try session.collectVisibleRows(gpa, table, sel.table);
+        defer Session.freeVisibleRows(gpa, rows);
+
+        var matched: std.ArrayList(usize) = .empty;
+        defer matched.deinit(gpa);
+        for (rows, 0..) |row, i| {
+            if (rowMatchesPreds(row.values, preds)) try matched.append(gpa, i);
         }
-        try cells.append(gpa, line);
+
+        var start: usize = @intCast(sel.offset);
+        if (start > matched.items.len) start = matched.items.len;
+        var end = matched.items.len;
+        if (sel.limit) |lim| {
+            const lim_usz: usize = @intCast(lim);
+            if (start + lim_usz < end) end = start + lim_usz;
+        }
+
+        for (matched.items[start..end]) |idx| {
+            const row = rows[idx];
+            const line = try gpa.alloc(?[]const u8, proj.items.len);
+            errdefer gpa.free(line);
+            for (proj.items, 0..) |pi, i| {
+                line[i] = try valueToText(gpa, &arena_data, row.values[pi]);
+            }
+            try cells.append(gpa, line);
+        }
+    } else {
+        const indices = try eng.matchIndices(table, preds);
+        defer gpa.free(indices);
+
+        var start: usize = @intCast(sel.offset);
+        if (start > indices.len) start = indices.len;
+        var end = indices.len;
+        if (sel.limit) |lim| {
+            const lim_usz: usize = @intCast(lim);
+            if (start + lim_usz < end) end = start + lim_usz;
+        }
+        const slice = indices[start..end];
+
+        for (slice) |idx| {
+            const row = table.rows.items[idx];
+            const line = try gpa.alloc(?[]const u8, proj.items.len);
+            errdefer gpa.free(line);
+            for (proj.items, 0..) |pi, i| {
+                line[i] = try valueToText(gpa, &arena_data, row.values[pi]);
+            }
+            try cells.append(gpa, line);
+        }
     }
 
     return .{
@@ -468,36 +621,96 @@ test "exec create insert select" {
 
     var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
     defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
 
-    var r1 = try execute(gpa, &eng, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    var r1 = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
     defer r1.deinit();
     try std.testing.expect(r1 == .empty);
 
-    var r2 = try execute(gpa, &eng, "INSERT INTO t (id, name) VALUES (1, 'bob')");
+    var r2 = try execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (1, 'bob')");
     defer r2.deinit();
 
-    var r3 = try execute(gpa, &eng, "SELECT name FROM t WHERE id = 1");
+    var r3 = try execute(gpa, &eng, &session, "SELECT name FROM t WHERE id = 1");
     defer r3.deinit();
     try std.testing.expect(r3 == .rows);
     try std.testing.expectEqual(@as(usize, 1), r3.rows.cells.len);
     try std.testing.expectEqualStrings("bob", r3.rows.cells[0][0].?);
 
-    var r4 = try execute(gpa, &eng, "UPDATE t SET name = 'bobby' WHERE id = 1");
+    var r4 = try execute(gpa, &eng, &session, "UPDATE t SET name = 'bobby' WHERE id = 1");
     defer r4.deinit();
     try std.testing.expect(r4 == .empty);
 
-    var r5 = try execute(gpa, &eng, "SELECT name FROM t WHERE id = 1");
+    var r5 = try execute(gpa, &eng, &session, "SELECT name FROM t WHERE id = 1");
     defer r5.deinit();
     try std.testing.expectEqualStrings("bobby", r5.rows.cells[0][0].?);
 
-    var r6 = try execute(gpa, &eng, "DELETE FROM t WHERE id = 1");
+    var r6 = try execute(gpa, &eng, &session, "DELETE FROM t WHERE id = 1");
     defer r6.deinit();
 
-    var r7 = try execute(gpa, &eng, "SELECT name FROM t WHERE id = 1");
+    var r7 = try execute(gpa, &eng, &session, "SELECT name FROM t WHERE id = 1");
     defer r7.deinit();
     try std.testing.expectEqual(@as(usize, 0), r7.rows.cells.len);
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+}
+
+test "exec multi-row insert is atomic and reports its row count" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-multi-insert";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
+
+    var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT UNIQUE)");
+    defer create.deinit();
+
+    var inserted = try execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (1, 'alice'), (2, 'bob')");
+    defer inserted.deinit();
+    try std.testing.expectEqualStrings("INSERT 0 2", inserted.empty);
+    try std.testing.expectEqual(@as(usize, 2), eng.getTable("t").?.rows.items.len);
+
+    try std.testing.expectError(
+        error.UniqueViolation,
+        execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (3, 'carol'), (4, 'alice')"),
+    );
+    // The valid first group must not have leaked through before the later error.
+    try std.testing.expectEqual(@as(usize, 2), eng.getTable("t").?.rows.items.len);
+}
+
+test "exec multi-row insert survives WAL recovery as one batch" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-multi-insert-recovery";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+        defer eng.deinit();
+        var session = Session.init(gpa);
+        defer session.deinit();
+
+        var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+        defer create.deinit();
+        var inserted = try execute(gpa, &eng, &session, "INSERT INTO t VALUES (1, 'alice'), (2, 'bob')");
+        defer inserted.deinit();
+    }
+
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+        defer eng.deinit();
+        var session = Session.init(gpa);
+        defer session.deinit();
+        var rows = try execute(gpa, &eng, &session, "SELECT id, name FROM t");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.cells.len);
+    }
 }
 
 test "exec sub2api-shaped settings and users" {
@@ -508,6 +721,8 @@ test "exec sub2api-shaped settings and users" {
 
     var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
     defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
 
     const ddl =
         \\CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -532,26 +747,26 @@ test "exec sub2api-shaped settings and users" {
         \\);
     ;
 
-    const results = try executeScript(gpa, &eng, ddl);
+    const results = try executeScript(gpa, &eng, &session, ddl);
     defer {
         for (results) |*r| r.deinit();
         gpa.free(results);
     }
 
-    var r1 = try execute(gpa, &eng, "INSERT INTO schema_migrations (filename, checksum) VALUES ('001_init.sql', 'abc')");
+    var r1 = try execute(gpa, &eng, &session, "INSERT INTO schema_migrations (filename, checksum) VALUES ('001_init.sql', 'abc')");
     defer r1.deinit();
 
-    var r2 = try execute(gpa, &eng, "INSERT INTO settings (key, value) VALUES ('site_name', 'Sub2API')");
+    var r2 = try execute(gpa, &eng, &session, "INSERT INTO settings (key, value) VALUES ('site_name', 'Sub2API')");
     defer r2.deinit();
 
-    var r3 = try execute(gpa, &eng, "SELECT value FROM settings WHERE key = 'site_name'");
+    var r3 = try execute(gpa, &eng, &session, "SELECT value FROM settings WHERE key = 'site_name'");
     defer r3.deinit();
     try std.testing.expectEqualStrings("Sub2API", r3.rows.cells[0][0].?);
 
-    var r4 = try execute(gpa, &eng, "INSERT INTO users (email, password_hash) VALUES ('admin@example.com', 'hash')");
+    var r4 = try execute(gpa, &eng, &session, "INSERT INTO users (email, password_hash) VALUES ('admin@example.com', 'hash')");
     defer r4.deinit();
 
-    var r5 = try execute(gpa, &eng, "SELECT id, email, role, balance FROM users WHERE email = 'admin@example.com' AND deleted_at IS NULL");
+    var r5 = try execute(gpa, &eng, &session, "SELECT id, email, role, balance FROM users WHERE email = 'admin@example.com' AND deleted_at IS NULL");
     defer r5.deinit();
     try std.testing.expectEqual(@as(usize, 1), r5.rows.cells.len);
     try std.testing.expectEqualStrings("1", r5.rows.cells[0][0].?);
@@ -559,15 +774,15 @@ test "exec sub2api-shaped settings and users" {
     try std.testing.expectEqualStrings("user", r5.rows.cells[0][2].?);
     try std.testing.expectEqualStrings("0", r5.rows.cells[0][3].?);
 
-    var r6 = try execute(gpa, &eng, "UPDATE users SET status = 'disabled' WHERE email = 'admin@example.com'");
+    var r6 = try execute(gpa, &eng, &session, "UPDATE users SET status = 'disabled' WHERE email = 'admin@example.com'");
     defer r6.deinit();
 
-    var r7 = try execute(gpa, &eng, "SELECT status FROM users WHERE id = 1");
+    var r7 = try execute(gpa, &eng, &session, "SELECT status FROM users WHERE id = 1");
     defer r7.deinit();
     try std.testing.expectEqualStrings("disabled", r7.rows.cells[0][0].?);
 
     // IF NOT EXISTS second time
-    var r8 = try execute(gpa, &eng, "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)");
+    var r8 = try execute(gpa, &eng, &session, "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)");
     defer r8.deinit();
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -582,15 +797,16 @@ test "exec rejects syntax whose semantics are not implemented" {
 
     var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
     defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
 
-    try std.testing.expectError(error.NotImplemented, execute(gpa, &eng, "BEGIN"));
-    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, "CREATE INDEX idx_t_id ON t(id)"));
-    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, "CREATE TABLE t (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id))"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "CREATE INDEX idx_t_id ON t(id)"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id))"));
 
-    var create = try execute(gpa, &eng, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
     defer create.deinit();
-    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, "INSERT INTO t VALUES (1, 'alice') RETURNING id"));
-    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, "SELECT * FROM t ORDER BY id"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "INSERT INTO t VALUES (1, 'alice') RETURNING id"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "SELECT * FROM t ORDER BY id"));
 }
 
 test "alter table changes survive WAL recovery" {
@@ -603,32 +819,157 @@ test "alter table changes survive WAL recovery" {
     {
         var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
         defer eng.deinit();
-        var create = try execute(gpa, &eng, "CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)");
+        var session = Session.init(gpa);
+        defer session.deinit();
+        var create = try execute(gpa, &eng, &session, "CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)");
         defer create.deinit();
-        var insert = try execute(gpa, &eng, "INSERT INTO accounts VALUES (1, 'alice')");
+        var insert = try execute(gpa, &eng, &session, "INSERT INTO accounts VALUES (1, 'alice')");
         defer insert.deinit();
-        var add = try execute(gpa, &eng, "ALTER TABLE accounts ADD COLUMN active BOOLEAN NOT NULL DEFAULT true");
+        var add = try execute(gpa, &eng, &session, "ALTER TABLE accounts ADD COLUMN active BOOLEAN NOT NULL DEFAULT true");
         defer add.deinit();
-        var set_default = try execute(gpa, &eng, "ALTER TABLE accounts ALTER COLUMN name SET DEFAULT 'anonymous'");
+        var set_default = try execute(gpa, &eng, &session, "ALTER TABLE accounts ALTER COLUMN name SET DEFAULT 'anonymous'");
         defer set_default.deinit();
-        var set_null = try execute(gpa, &eng, "ALTER TABLE accounts ALTER COLUMN name SET NOT NULL");
+        var set_null = try execute(gpa, &eng, &session, "ALTER TABLE accounts ALTER COLUMN name SET NOT NULL");
         defer set_null.deinit();
-        var clear_default = try execute(gpa, &eng, "ALTER TABLE accounts ALTER COLUMN name DROP DEFAULT");
+        var clear_default = try execute(gpa, &eng, &session, "ALTER TABLE accounts ALTER COLUMN name DROP DEFAULT");
         defer clear_default.deinit();
-        var clear_null = try execute(gpa, &eng, "ALTER TABLE accounts ALTER COLUMN name DROP NOT NULL");
+        var clear_null = try execute(gpa, &eng, &session, "ALTER TABLE accounts ALTER COLUMN name DROP NOT NULL");
         defer clear_null.deinit();
-        var drop = try execute(gpa, &eng, "ALTER TABLE accounts DROP COLUMN name");
+        var drop = try execute(gpa, &eng, &session, "ALTER TABLE accounts DROP COLUMN name");
         defer drop.deinit();
     }
     {
         var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
         defer eng.deinit();
-        var result = try execute(gpa, &eng, "SELECT active FROM accounts WHERE id = 1");
+        var session = Session.init(gpa);
+        defer session.deinit();
+        var result = try execute(gpa, &eng, &session, "SELECT active FROM accounts WHERE id = 1");
         defer result.deinit();
         try std.testing.expectEqualStrings("t", result.rows.cells[0][0].?);
         const active = eng.getTable("accounts").?.columns[1];
         try std.testing.expect(active.not_null);
         try std.testing.expect(active.default_expr == .literal);
+    }
+}
+
+test "exec begin commit publishes write set; rollback discards" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-txn";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
+
+    var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    defer create.deinit();
+
+    var begin1 = try execute(gpa, &eng, &session, "BEGIN");
+    defer begin1.deinit();
+    try std.testing.expectEqualStrings("BEGIN", begin1.empty);
+    try std.testing.expect(session.state == .active);
+
+    var ins = try execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (1, 'alice')");
+    defer ins.deinit();
+
+    // Private write set: published table empty, SELECT in txn sees the row.
+    try std.testing.expectEqual(@as(usize, 0), eng.getTable("t").?.rows.items.len);
+    var sel_tx = try execute(gpa, &eng, &session, "SELECT name FROM t WHERE id = 1");
+    defer sel_tx.deinit();
+    try std.testing.expectEqualStrings("alice", sel_tx.rows.cells[0][0].?);
+
+    var commit = try execute(gpa, &eng, &session, "COMMIT");
+    defer commit.deinit();
+    try std.testing.expect(session.state == .idle);
+    try std.testing.expectEqual(@as(usize, 1), eng.getTable("t").?.rows.items.len);
+
+    var begin2 = try execute(gpa, &eng, &session, "BEGIN");
+    defer begin2.deinit();
+    var ins2 = try execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (2, 'bob')");
+    defer ins2.deinit();
+    var rb = try execute(gpa, &eng, &session, "ROLLBACK");
+    defer rb.deinit();
+    try std.testing.expectEqual(@as(usize, 1), eng.getTable("t").?.rows.items.len);
+
+    var sel = try execute(gpa, &eng, &session, "SELECT name FROM t WHERE id = 2");
+    defer sel.deinit();
+    try std.testing.expectEqual(@as(usize, 0), sel.rows.cells.len);
+}
+
+test "exec statement error fails transaction until rollback" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-txn-failed";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
+
+    var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)");
+    defer create.deinit();
+    var begin = try execute(gpa, &eng, &session, "BEGIN");
+    defer begin.deinit();
+    var ins = try execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (1, 'ok')");
+    defer ins.deinit();
+
+    try std.testing.expectError(error.NotNullViolation, execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (2, NULL)"));
+    try std.testing.expect(session.state == .failed);
+    try std.testing.expectError(error.InFailedTransaction, execute(gpa, &eng, &session, "SELECT name FROM t WHERE id = 1"));
+    try std.testing.expectError(error.InFailedTransaction, execute(gpa, &eng, &session, "COMMIT"));
+
+    var rb = try execute(gpa, &eng, &session, "ROLLBACK");
+    defer rb.deinit();
+    try std.testing.expect(session.state == .idle);
+    try std.testing.expectEqual(@as(usize, 0), eng.getTable("t").?.rows.items.len);
+}
+
+test "exec committed transaction survives WAL recovery; rolled back does not" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-txn-recovery";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+        defer eng.deinit();
+        var session = Session.init(gpa);
+        defer session.deinit();
+
+        var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+        defer create.deinit();
+
+        var begin_c = try execute(gpa, &eng, &session, "BEGIN");
+        defer begin_c.deinit();
+        var insert_c = try execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (1, 'committed')");
+        defer insert_c.deinit();
+        var commit_c = try execute(gpa, &eng, &session, "COMMIT");
+        defer commit_c.deinit();
+
+        var begin_r = try execute(gpa, &eng, &session, "BEGIN");
+        defer begin_r.deinit();
+        var insert_r = try execute(gpa, &eng, &session, "INSERT INTO t (id, name) VALUES (2, 'rolled')");
+        defer insert_r.deinit();
+        // Crash-equivalent: drop the engine without COMMIT. Write set never entered WAL.
+    }
+
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+        defer eng.deinit();
+        var session = Session.init(gpa);
+        defer session.deinit();
+        var all = try execute(gpa, &eng, &session, "SELECT name FROM t WHERE id = 1");
+        defer all.deinit();
+        try std.testing.expectEqualStrings("committed", all.rows.cells[0][0].?);
+        var ghost = try execute(gpa, &eng, &session, "SELECT name FROM t WHERE id = 2");
+        defer ghost.deinit();
+        try std.testing.expectEqual(@as(usize, 0), ghost.rows.cells.len);
     }
 }
 

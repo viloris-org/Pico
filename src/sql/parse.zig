@@ -49,7 +49,7 @@ pub const Insert = struct {
     table_owned: bool = false,
     columns: ?[][]const u8, // optional column list (may own entries)
     columns_owned: bool = false,
-    values: []value.Value, // owned
+    rows: [][]value.Value, // owned value groups
 };
 
 /// Single WHERE predicate (AND-combined in a list).
@@ -625,36 +625,49 @@ pub const Parser = struct {
         }
 
         _ = try self.expect(.kw_values);
-        _ = try self.expect(.lparen);
-
-        var vals: std.ArrayList(value.Value) = .empty;
+        var rows: std.ArrayList([]value.Value) = .empty;
         errdefer {
-            for (vals.items) |*v| v.deinit(self.gpa);
-            vals.deinit(self.gpa);
+            for (rows.items) |row| {
+                for (row) |*v| v.deinit(self.gpa);
+                self.gpa.free(row);
+            }
+            rows.deinit(self.gpa);
         }
         while (true) {
-            try vals.append(self.gpa, try self.parseValue());
-            // optional ::cast
-            if (self.cur.kind == .double_colon) {
-                try self.advance();
-                if (isTypeKeyword(self.cur.kind) or self.cur.kind == .ident) try self.advance();
-                if (self.cur.kind == .lparen) {
+            _ = try self.expect(.lparen);
+            var vals: std.ArrayList(value.Value) = .empty;
+            errdefer {
+                for (vals.items) |*v| v.deinit(self.gpa);
+                vals.deinit(self.gpa);
+            }
+            while (true) {
+                try vals.append(self.gpa, try self.parseValue());
+                // optional ::cast
+                if (self.cur.kind == .double_colon) {
                     try self.advance();
-                    if (self.cur.kind == .number or self.cur.kind == .float) try self.advance();
-                    if (self.cur.kind == .comma) {
+                    if (isTypeKeyword(self.cur.kind) or self.cur.kind == .ident) try self.advance();
+                    if (self.cur.kind == .lparen) {
                         try self.advance();
                         if (self.cur.kind == .number or self.cur.kind == .float) try self.advance();
+                        if (self.cur.kind == .comma) {
+                            try self.advance();
+                            if (self.cur.kind == .number or self.cur.kind == .float) try self.advance();
+                        }
+                        _ = try self.expect(.rparen);
                     }
-                    _ = try self.expect(.rparen);
                 }
+                if (self.cur.kind == .comma) {
+                    try self.advance();
+                    continue;
+                }
+                break;
             }
-            if (self.cur.kind == .comma) {
-                try self.advance();
-                continue;
-            }
-            break;
+            _ = try self.expect(.rparen);
+            try rows.append(self.gpa, try vals.toOwnedSlice(self.gpa));
+            if (self.cur.kind != .comma) break;
+            try self.advance();
+            if (self.cur.kind != .lparen) return error.UnexpectedToken;
         }
-        _ = try self.expect(.rparen);
         // RETURNING needs the rows produced by the write path; accepting it
         // before that exists would report a successful statement with lost data.
         if (self.cur.kind == .ident and token.eqlIgnoreCase(self.cur.text, "RETURNING")) {
@@ -665,7 +678,7 @@ pub const Parser = struct {
         return .{ .insert = .{
             .table = table,
             .columns = col_names,
-            .values = try vals.toOwnedSlice(self.gpa),
+            .rows = try rows.toOwnedSlice(self.gpa),
         } };
     }
 
@@ -972,8 +985,11 @@ pub fn freeStmt(gpa: Allocator, stmt: *Stmt) void {
                 }
                 gpa.free(c);
             }
-            for (ins.values) |*v| v.deinit(gpa);
-            gpa.free(ins.values);
+            for (ins.rows) |row| {
+                for (row) |*v| v.deinit(gpa);
+                gpa.free(row);
+            }
+            gpa.free(ins.rows);
         },
         .select => |*sel| {
             if (sel.table_owned) gpa.free(sel.table);
@@ -1022,6 +1038,15 @@ test "parse create insert select" {
         var stmt = try p.parseStatement();
         defer freeStmt(gpa, &stmt);
         try std.testing.expect(stmt == .insert);
+    }
+    {
+        var p = try Parser.init(gpa, "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob');");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt == .insert);
+        try std.testing.expectEqual(@as(usize, 2), stmt.insert.rows.len);
+        try std.testing.expectEqual(@as(usize, 2), stmt.insert.rows[0].len);
     }
     {
         var p = try Parser.init(gpa, "SELECT id, name FROM users WHERE id = 1");

@@ -1,51 +1,88 @@
 # Pico
 
-轻量、高性能、通用数据库（Zig）。Pico 面向简单部署和高效的服务端数据访问：当前以单机单实例形态提供网络访问，通过 **PostgreSQL 线协议** 接入，并聚焦 **OLTP SQL 子集**。存储路径为自研 LSM 路线，见 [架构决策](docs/adr/)。
+[中文](README.zh-CN.md) | English
 
-“通用”描述 Pico 的产品定位，不表示完整 PostgreSQL SQL 兼容、OLAP 引擎或集群能力；不在 SQL 子集内的语句会明确报错。
+Pico is a lightweight, single-node OLTP database written in Zig. It runs as a
+standalone network service and exposes the PostgreSQL Frontend/Backend wire
+protocol so that existing PostgreSQL clients and drivers can connect without a
+custom SDK.
 
-## 状态
+Pico intentionally implements an OLTP SQL subset. It is not a full PostgreSQL
+server, and SQL outside the supported subset is rejected with an explicit
+error.
 
-**Phase 0（完成）**：TCP 服务 + PG 简单查询协议 + 内存表 + WAL 恢复。
+## Status
 
-**Phase 1（进行中）**：扩展首批迁移型 OLTP SQL 子集，范围见
-[ADR-0008](docs/adr/0008-first-batch-oltp-sql-subset.md)。
+Pico is under active development. The current implementation provides:
 
-持久化格式仍在 Phase 1 演进中。WAL 帧带格式版本与 CRC32 校验（覆盖长度字段与载荷）；默认在追加后 `sync`（可用 `--no-sync` 仅用于开发）。崩溃恢复规则：
+- A TCP server using the PostgreSQL wire protocol
+- Single-instance operation with a local data directory
+- `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
+- Single-column primary keys, column-level unique constraints, defaults, and
+  common PostgreSQL type aliases
+- `WHERE` predicates using `=`, `AND`, and `IS [NOT] NULL`, plus `LIMIT` and
+  `OFFSET`
+- Autocommit and explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
+- WAL-backed persistence and crash recovery
+- WAL frame versioning and CRC32 validation
+- Text primary keys, multi-statement scripts, and serial-style generated IDs
 
-- 仅重放**完整且校验通过**的帧；已确认写入的前缀在重启后可见
-- **末尾截断**（不完整尾帧）会被去掉，并持久化新的逻辑 EOF 后再接受写入
-- **完整帧损坏**、未知 magic/版本会**拒绝启动**，不猜测修复、不截掉中段证据
+The storage format and execution architecture are still evolving. Persistent
+LSM tables, secondary indexes, MVCC isolation, group commit, and the extended
+query protocol are planned parts of the architecture, not all current product
+capabilities.
 
-已支持（子集，非完整 PG）：
+The following are currently rejected explicitly: `CREATE INDEX`, foreign keys,
+table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`,
+multi-row `INSERT`, `ON CONFLICT`, `ORDER BY`, `OR`, `NOT`, comparisons other
+than `=`, `IN`, `LIKE`, aggregation, grouping, and the extended query messages
+`Parse`, `Bind`, `Describe`, and `Execute`.
 
-- DDL：`CREATE TABLE IF NOT EXISTS`、PG 类型别名（`BIGSERIAL`/`VARCHAR`/`DECIMAL`/`TIMESTAMPTZ`/`JSONB`…）、`DEFAULT`/`NOW()`/`NOT NULL`/列级 `UNIQUE`
-- DML：`INSERT`（缺省列 + SERIAL）、`SELECT`/`UPDATE`/`DELETE` 的 `WHERE`（`=` / `IS [NOT] NULL` / `AND`）、`LIMIT`/`OFFSET`
-- 文本主键、多语句脚本、语句级自动提交
+See the [SQL subset support matrix](docs/sql-subset.md) for the authoritative
+compatibility boundary.
 
-`CREATE INDEX`、外键、复合主键、`RETURNING`、`ORDER BY` 与
-`BEGIN` / `COMMIT` / `ROLLBACK` 尚未实现真实语义，会明确报错，不作为兼容标签成功返回。
+## Build
 
-当前验收：
-
-- `zig build test`（基础 DDL/DML 与 WAL 恢复）
-- 核心表 `INSERT`/`SELECT`/`UPDATE`/`DELETE`（含 `AND` / `IS NULL` / 非主键 WHERE）
-- 不支持的 SQL 返回明确错误
-
-首批待实现的能力、验收门槛与明确排除项见
-[ADR-0008](docs/adr/0008-first-batch-oltp-sql-subset.md)。
-
-## 构建与运行
-
-需要 Zig **0.16+**。
+Pico currently requires Zig 0.16 or newer.
 
 ```bash
 zig build
-zig build run -- --data-dir ./data --port 5433
+zig build test
+```
 
-# 另开终端
+## Run
+
+Start a server with the default loopback address, port, and data directory:
+
+```bash
+zig build run
+```
+
+Configure the server with command-line options:
+
+```bash
+zig build run -- \
+  --host 127.0.0.1 \
+  --port 5433 \
+  --data-dir ./data
+```
+
+Available options:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--host <address>` | `127.0.0.1` | Listen address |
+| `--port <port>` | `5433` | Listen port |
+| `--data-dir <path>` | `./data` | Instance data directory |
+| `--no-sync` | disabled | Disable WAL synchronization; development only |
+
+Connect with `psql` or another PostgreSQL client:
+
+```bash
 psql -h 127.0.0.1 -p 5433 -U pico -d pico
 ```
+
+Example SQL:
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -55,38 +92,54 @@ CREATE TABLE IF NOT EXISTS users (
   balance DECIMAL(20, 8) NOT NULL DEFAULT 0,
   deleted_at TIMESTAMPTZ
 );
+
 INSERT INTO users (email) VALUES ('alice@example.com');
-SELECT id, email, role FROM users WHERE email = 'alice@example.com' AND deleted_at IS NULL;
+
+SELECT id, email, role
+FROM users
+WHERE email = 'alice@example.com' AND deleted_at IS NULL;
+
 UPDATE users SET role = 'admin' WHERE email = 'alice@example.com';
 DELETE FROM users WHERE id = 1;
 ```
 
-```bash
-zig build test
-```
+## Durability and recovery
 
-## 文档
+Pico writes changes to a write-ahead log before applying them to table state.
+WAL synchronization is enabled by default. `--no-sync` relaxes this guarantee
+and should only be used for development.
 
-- [`CONTEXT.md`](CONTEXT.md) — 领域语言
-- [`docs/adr/`](docs/adr/) — 架构决策
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — 目标架构、数据归属与验证契约
-- [`docs/architecture/concurrency-control.md`](docs/architecture/concurrency-control.md) — 并发控制的目标语义与不变量
-- [`docs/architecture/vfs.md`](docs/architecture/vfs.md) — 数据目录 VFS
-- [`docs/architecture/pager-and-static-cache.md`](docs/architecture/pager-and-static-cache.md) — 页管理器与静态页缓存
-- [`docs/architecture/vdbe.md`](docs/architecture/vdbe.md) — VDBE 风格执行引擎（目标）
-- [`docs/architecture/runtime-and-concurrency.md`](docs/architecture/runtime-and-concurrency.md) — 运行时与连接
-- [`docs/architecture/io-scheduling.md`](docs/architecture/io-scheduling.md) — I/O 调度契约
+During recovery, Pico replays complete, supported, checksum-valid WAL frames.
+An incomplete final frame is truncated and the logical end of the WAL is
+persisted before accepting new writes. A corrupt complete frame, unknown WAL
+format, or invalid middle section causes startup to fail rather than silently
+discarding evidence.
 
-## 模块边界
+## Architecture
 
-| 目录 | 职责 |
-|------|------|
-| `net/` | TCP 接受、PostgreSQL 线协议 |
-| `sql/` | SQL 子集词法/解析/执行（目标为可步进执行程序） |
-| `storage/` | VFS、Pager、WAL、内存表、引擎与恢复 |
-| `txn/` | 事务边界（Phase 0 为自动提交） |
-| `util/` | 编解码等通用工具 |
+Pico is designed around a single-node, single-writer commit path, WAL-first
+durability, MVCC snapshots, and LSM-style ordered storage. The implementation
+is being built in small modules with explicit ownership boundaries:
 
-## 许可证
+| Directory | Responsibility |
+| --- | --- |
+| `src/net/` | TCP connections and PostgreSQL wire protocol |
+| `src/sql/` | SQL subset tokenization, parsing, and execution |
+| `src/storage/` | Tables, WAL, VFS, pager, values, and recovery |
+| `src/txn/` | Transaction boundaries and session state |
+| `src/util/` | Shared encoding and utility code |
+
+Read [ARCHITECTURE.md](docs/ARCHITECTURE.md) for target boundaries and
+invariants. It distinguishes the target LSM/MVCC architecture from the
+currently implemented components.
+
+## Documentation
+
+- [SQL subset support matrix](docs/sql-subset.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Architecture decision records](docs/adr/)
+- [Domain terminology and product constraints](CONTEXT.md)
+
+## License
 
 [MIT](LICENSE)

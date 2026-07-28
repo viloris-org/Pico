@@ -30,6 +30,13 @@ pub fn handleConnection(
     const r = &reader.interface;
     const w = &writer.interface;
 
+    var session = exec.Session.init(gpa);
+    defer {
+        // Disconnect rolls back any open explicit transaction.
+        session.rollback();
+        session.deinit();
+    }
+
     // Startup / optional SSLRequest
     while (true) {
         const len_buf = try r.takeArray(4);
@@ -66,7 +73,7 @@ pub fn handleConnection(
     try sendParameterStatus(w, "integer_datetimes", "on");
     // BackendKeyData
     try sendBackendKeyData(w, 1, 1);
-    try sendReadyForQuery(w, 'I');
+    try sendReadyForQuery(w, session.readyStatus());
     try w.flush();
 
     // Simple query loop
@@ -87,38 +94,38 @@ pub fn handleConnection(
             'Q' => {
                 // Query: body is null-terminated SQL
                 const sql = std.mem.sliceTo(body, 0);
-                try handleQuery(gpa, eng, w, sql);
-                try sendReadyForQuery(w, 'I');
+                try handleQuery(gpa, eng, &session, w, sql);
+                try sendReadyForQuery(w, session.readyStatus());
                 try w.flush();
             },
             'S' => {
                 // Sync (extended protocol) — respond ReadyForQuery
-                try sendReadyForQuery(w, 'I');
+                try sendReadyForQuery(w, session.readyStatus());
                 try w.flush();
             },
             'H', 'C', 'B', 'E', 'D', 'P' => {
                 // Extended protocol stubs — not supported yet
                 try sendError(w, "0A000", "extended query protocol not supported in Phase 0");
-                try sendReadyForQuery(w, 'I');
+                try sendReadyForQuery(w, session.readyStatus());
                 try w.flush();
             },
             else => {
                 try sendError(w, "08P01", "unsupported message type");
-                try sendReadyForQuery(w, 'I');
+                try sendReadyForQuery(w, session.readyStatus());
                 try w.flush();
             },
         }
     }
 }
 
-fn handleQuery(gpa: Allocator, eng: *engine_mod.Engine, w: *Io.Writer, sql: []const u8) !void {
+fn handleQuery(gpa: Allocator, eng: *engine_mod.Engine, session: *exec.Session, w: *Io.Writer, sql: []const u8) !void {
     const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
     if (trimmed.len == 0) {
         try sendCommandComplete(w, "EMPTY");
         return;
     }
 
-    const results = exec.executeScript(gpa, eng, sql) catch |err| {
+    const results = exec.executeScript(gpa, eng, session, sql) catch |err| {
         try sendError(w, "42000", execErrorMessage(err));
         return;
     };
@@ -161,6 +168,9 @@ fn execErrorMessage(err: anyerror) []const u8 {
         error.UnsupportedSyntax => "unsupported SQL syntax (Pico subset)",
         error.UnexpectedToken => "syntax error",
         error.NotImplemented => "feature not implemented",
+        error.InFailedTransaction => "current transaction is aborted, commands ignored until end of transaction block",
+        error.DdlInTransaction => "DDL inside an explicit transaction is not supported yet",
+        error.TxnRequiresPrimaryKey => "explicit transactions require a single-column primary key",
         else => "query failed",
     };
 }

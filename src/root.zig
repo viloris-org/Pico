@@ -7,6 +7,9 @@ pub const pager = @import("storage/pager.zig");
 pub const wal = @import("storage/wal.zig");
 pub const table = @import("storage/table.zig");
 pub const engine = @import("storage/engine.zig");
+pub const txn = struct {
+    pub const session = @import("txn/session.zig");
+};
 pub const sql = struct {
     pub const token = @import("sql/token.zig");
     pub const parse = @import("sql/parse.zig");
@@ -23,6 +26,7 @@ test {
     _ = wal;
     _ = table;
     _ = engine;
+    _ = txn.session;
     _ = sql.token;
     _ = sql.parse;
     _ = sql.exec;

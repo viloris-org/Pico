@@ -48,6 +48,16 @@ pub const Engine = struct {
 
     fn applyRecord(self: *Engine, view: wal_mod.RecordView) !void {
         switch (view) {
+            .txn_batch => |batch| {
+                try wal_mod.forEachTxnBatchOp(self.gpa, batch.body, self, applyRecord);
+            },
+            else => try self.applyOne(view),
+        }
+    }
+
+    fn applyOne(self: *Engine, view: wal_mod.RecordView) !void {
+        switch (view) {
+            .txn_batch => return error.InvalidWal,
             .create_table => |ct| {
                 try self.registerTable(ct.name, ct.columns);
             },
@@ -105,6 +115,34 @@ pub const Engine = struct {
             .set_not_null => |set| {
                 const table = self.tables.getPtr(set.table) orelse return error.TableNotFound;
                 try table.setNotNull(set.column, set.enabled);
+            },
+        }
+    }
+
+    /// Publish an explicit-transaction write set: one WAL frame, then apply all ops.
+    /// Ops were validated incrementally while staging against base + earlier write-set
+    /// entries; apply order must match staging order so later ops see earlier ones.
+    pub fn commitTxnOps(self: *Engine, ops: []const wal_mod.TxnOp) !void {
+        if (ops.len == 0) return;
+        try self.wal.appendTxnBatch(ops);
+        for (ops) |op| {
+            try self.applyTxnOp(op);
+        }
+    }
+
+    fn applyTxnOp(self: *Engine, op: wal_mod.TxnOp) !void {
+        switch (op) {
+            .insert => |ins| {
+                const table = self.tables.getPtr(ins.table) orelse return error.TableNotFound;
+                try table.insert(self.gpa, ins.values);
+            },
+            .update => |upd| {
+                const table = self.tables.getPtr(upd.table) orelse return error.TableNotFound;
+                try table.update(self.gpa, upd.pk, upd.values);
+            },
+            .delete => |del| {
+                const table = self.tables.getPtr(del.table) orelse return error.TableNotFound;
+                try table.delete(self.gpa, del.pk);
             },
         }
     }
