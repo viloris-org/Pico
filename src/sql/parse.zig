@@ -87,8 +87,16 @@ pub const Select = struct {
     columns: ?[][]const u8,
     columns_owned: bool = false,
     where_preds: []Predicate, // owned slice
+    /// One ordering key. Multi-key ordering remains outside the current subset.
+    order_by: ?OrderTerm = null,
     limit: ?u64 = null,
     offset: u64 = 0,
+};
+
+pub const OrderTerm = struct {
+    column: []const u8,
+    column_owned: bool = false,
+    descending: bool = false,
 };
 
 pub const SetClause = struct {
@@ -831,9 +839,22 @@ pub const Parser = struct {
             self.gpa.free(where_preds);
         }
 
-        // The memtable's physical row order is not SQL ORDER BY semantics.
+        var order_by: ?OrderTerm = null;
         if (self.cur.kind == .kw_order) {
-            return error.UnsupportedSyntax;
+            try self.advance();
+            _ = try self.expect(.kw_by);
+            const column = try self.parseIdent();
+            var descending = false;
+            if (self.cur.kind == .kw_asc) {
+                try self.advance();
+            } else if (self.cur.kind == .kw_desc) {
+                try self.advance();
+                descending = true;
+            }
+            // Keep the supported surface explicit until multi-key sort has
+            // deterministic semantics and coverage.
+            if (self.cur.kind == .comma) return error.UnsupportedSyntax;
+            order_by = .{ .column = column, .descending = descending };
         }
 
         var limit: ?u64 = null;
@@ -854,6 +875,7 @@ pub const Parser = struct {
             .table = table,
             .columns = cols,
             .where_preds = where_preds,
+            .order_by = order_by,
             .limit = limit,
             .offset = offset,
         } };
@@ -999,6 +1021,9 @@ pub fn freeStmt(gpa: Allocator, stmt: *Stmt) void {
                 }
                 gpa.free(c);
             }
+            if (sel.order_by) |order| {
+                if (order.column_owned) gpa.free(order.column);
+            }
             for (sel.where_preds) |*p| p.deinit(gpa);
             gpa.free(sel.where_preds);
         },
@@ -1100,4 +1125,16 @@ test "parse where and is null" {
     defer freeStmt(gpa, &stmt);
     try std.testing.expectEqual(@as(usize, 2), stmt.select.where_preds.len);
     try std.testing.expect(stmt.select.where_preds[1] == .is_null);
+}
+
+test "parse select single-column order by" {
+    const gpa = std.testing.allocator;
+    var p = try Parser.init(gpa, "SELECT id FROM users WHERE active = true ORDER BY name DESC LIMIT 2 OFFSET 1");
+    defer p.deinit();
+    var stmt = try p.parseStatement();
+    defer freeStmt(gpa, &stmt);
+    try std.testing.expect(stmt == .select);
+    try std.testing.expect(stmt.select.order_by != null);
+    try std.testing.expectEqualStrings("name", stmt.select.order_by.?.column);
+    try std.testing.expect(stmt.select.order_by.?.descending);
 }

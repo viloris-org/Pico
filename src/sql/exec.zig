@@ -519,6 +519,51 @@ fn valueToText(gpa: Allocator, arena_data: *std.ArrayList([]u8), v: value.Value)
     }
 }
 
+/// Compare values using SQL ordering for the scalar types currently stored by
+/// Pico. ASC places NULL last, matching PostgreSQL's default; DESC reverses it.
+fn compareOrderValues(a: value.Value, b: value.Value, descending: bool) std.math.Order {
+    const base: std.math.Order = switch (a) {
+        .null => switch (b) {
+            .null => .eq,
+            else => .gt,
+        },
+        .int => |av| switch (b) {
+            .null => .lt,
+            .int => |bv| std.math.order(av, bv),
+            else => .eq,
+        },
+        .text => |av| switch (b) {
+            .null => .lt,
+            .text => |bv| std.mem.order(u8, av, bv),
+            else => .eq,
+        },
+        .bool => |av| switch (b) {
+            .null => .lt,
+            .bool => |bv| std.math.order(@intFromBool(av), @intFromBool(bv)),
+            else => .eq,
+        },
+    };
+    return if (descending) switch (base) {
+        .lt => .gt,
+        .gt => .lt,
+        .eq => .eq,
+    } else base;
+}
+
+fn sortRowIndices(indices: []usize, rows: []const engine_mod.Row, column: usize, descending: bool) void {
+    // Stable insertion sort keeps the scan order for equal values. The Phase 0
+    // memtable is small and this avoids allocating a second row representation.
+    var i: usize = 1;
+    while (i < indices.len) : (i += 1) {
+        const current = indices[i];
+        var j = i;
+        while (j > 0 and compareOrderValues(rows[indices[j - 1]].values[column], rows[current].values[column], descending) == .gt) : (j -= 1) {
+            indices[j] = indices[j - 1];
+        }
+        indices[j] = current;
+    }
+}
+
 fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, sel: parse.Select) !QueryResult.Rows {
     const table = eng.getTable(sel.table) orelse return error.TableNotFound;
 
@@ -535,6 +580,11 @@ fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, sel: p
 
     const preds = try bindPreds(gpa, table, sel.where_preds);
     defer gpa.free(preds);
+
+    const order_column = if (sel.order_by) |order|
+        findColumn(table, order.column) orelse return error.ColumnNotFound
+    else
+        null;
 
     const col_names = try gpa.alloc([]const u8, proj.items.len);
     errdefer gpa.free(col_names);
@@ -563,6 +613,9 @@ fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, sel: p
         for (rows, 0..) |row, i| {
             if (rowMatchesPreds(row.values, preds)) try matched.append(gpa, i);
         }
+        if (order_column) |column| {
+            sortRowIndices(matched.items, rows, column, sel.order_by.?.descending);
+        }
 
         var start: usize = @intCast(sel.offset);
         if (start > matched.items.len) start = matched.items.len;
@@ -584,6 +637,10 @@ fn execSelect(gpa: Allocator, eng: *engine_mod.Engine, session: *Session, sel: p
     } else {
         const indices = try eng.matchIndices(table, preds);
         defer gpa.free(indices);
+
+        if (order_column) |column| {
+            sortRowIndices(indices, table.rows.items, column, sel.order_by.?.descending);
+        }
 
         var start: usize = @intCast(sel.offset);
         if (start > indices.len) start = indices.len;
@@ -653,6 +710,35 @@ test "exec create insert select" {
     try std.testing.expectEqual(@as(usize, 0), r7.rows.cells.len);
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+}
+
+test "exec select order by sorts before limit and offset" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-order-by";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
+
+    var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, rank INT, name TEXT)");
+    defer create.deinit();
+    var insert = try execute(gpa, &eng, &session, "INSERT INTO t VALUES (1, 20, 'zoe'), (2, 10, 'amy'), (3, NULL, 'nil'), (4, 30, 'max')");
+    defer insert.deinit();
+
+    var asc = try execute(gpa, &eng, &session, "SELECT name FROM t ORDER BY rank ASC LIMIT 2 OFFSET 1");
+    defer asc.deinit();
+    try std.testing.expectEqual(@as(usize, 2), asc.rows.cells.len);
+    try std.testing.expectEqualStrings("zoe", asc.rows.cells[0][0].?);
+    try std.testing.expectEqualStrings("max", asc.rows.cells[1][0].?);
+
+    var desc = try execute(gpa, &eng, &session, "SELECT name FROM t ORDER BY rank DESC");
+    defer desc.deinit();
+    try std.testing.expectEqualStrings("nil", desc.rows.cells[0][0].?);
+    try std.testing.expectEqualStrings("max", desc.rows.cells[1][0].?);
 }
 
 test "exec multi-row insert is atomic and reports its row count" {
@@ -806,7 +892,7 @@ test "exec rejects syntax whose semantics are not implemented" {
     var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
     defer create.deinit();
     try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "INSERT INTO t VALUES (1, 'alice') RETURNING id"));
-    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "SELECT * FROM t ORDER BY id"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, &session, "SELECT * FROM t ORDER BY id, name"));
 }
 
 test "alter table changes survive WAL recovery" {

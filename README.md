@@ -20,8 +20,8 @@ Pico is under active development. The current implementation provides:
 - `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
 - Single-column primary keys, column-level unique constraints, defaults, and
   common PostgreSQL type aliases
-- `WHERE` predicates using `=`, `AND`, and `IS [NOT] NULL`, plus `LIMIT` and
-  `OFFSET`
+- `WHERE` predicates using `=`, `AND`, and `IS [NOT] NULL`; single-column
+  `ORDER BY [ASC|DESC]`; `LIMIT` and `OFFSET`
 - Autocommit and explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
@@ -34,8 +34,8 @@ capabilities.
 
 The following are currently rejected explicitly: `CREATE INDEX`, foreign keys,
 table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`,
-multi-row `INSERT`, `ON CONFLICT`, `ORDER BY`, `OR`, `NOT`, comparisons other
-than `=`, `IN`, `LIKE`, aggregation, grouping, and the extended query messages
+`ON CONFLICT`, multi-column `ORDER BY`, `OR`, `NOT`, comparisons other than
+`=`, `IN`, `LIKE`, aggregation, grouping, and the extended query messages
 `Parse`, `Bind`, `Describe`, and `Execute`.
 
 See the [SQL subset support matrix](docs/sql-subset.md) for the authoritative
