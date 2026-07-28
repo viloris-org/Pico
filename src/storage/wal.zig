@@ -10,6 +10,10 @@ pub const RecordType = enum(u8) {
     insert = 2,
     update = 3,
     delete = 4,
+    add_column = 5,
+    drop_column = 6,
+    set_default = 7,
+    set_not_null = 8,
 };
 
 /// WAL files are self-identifying so a changed frame layout never reinterprets old bytes.
@@ -46,6 +50,11 @@ pub const DeleteRecord = struct {
     table: []const u8,
     pk: value.Value,
 };
+
+pub const AddColumnRecord = struct { table: []const u8, column: value.Column };
+pub const DropColumnRecord = struct { table: []const u8, column: []const u8 };
+pub const SetDefaultRecord = struct { table: []const u8, column: []const u8, default_expr: value.DefaultExpr };
+pub const SetNotNullRecord = struct { table: []const u8, column: []const u8, enabled: bool };
 
 /// Append-only WAL with a versioned file header and checksummed LE frames.
 pub const Wal = struct {
@@ -172,6 +181,44 @@ pub const Wal = struct {
         try self.appendPayload(list.items);
     }
 
+    pub fn appendAddColumn(self: *Wal, rec: AddColumnRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try list.append(self.gpa, @intFromEnum(RecordType.add_column));
+        try writeStr(&list, self.gpa, rec.table);
+        try writeColumn(&list, self.gpa, rec.column);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendDropColumn(self: *Wal, rec: DropColumnRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try list.append(self.gpa, @intFromEnum(RecordType.drop_column));
+        try writeStr(&list, self.gpa, rec.table);
+        try writeStr(&list, self.gpa, rec.column);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendSetDefault(self: *Wal, rec: SetDefaultRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try list.append(self.gpa, @intFromEnum(RecordType.set_default));
+        try writeStr(&list, self.gpa, rec.table);
+        try writeStr(&list, self.gpa, rec.column);
+        try writeDefault(&list, self.gpa, rec.default_expr);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendSetNotNull(self: *Wal, rec: SetNotNullRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try list.append(self.gpa, @intFromEnum(RecordType.set_not_null));
+        try writeStr(&list, self.gpa, rec.table);
+        try writeStr(&list, self.gpa, rec.column);
+        try list.append(self.gpa, if (rec.enabled) 1 else 0);
+        try self.appendPayload(list.items);
+    }
+
     fn appendPayload(self: *Wal, payload: []const u8) !void {
         if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
 
@@ -241,6 +288,10 @@ pub const RecordView = union(RecordType) {
         table: []const u8,
         pk: value.Value,
     },
+    add_column: struct { table: []const u8, column: ParsedColumn },
+    drop_column: struct { table: []const u8, column: []const u8 },
+    set_default: struct { table: []const u8, column: []const u8, default_expr: value.DefaultExpr },
+    set_not_null: struct { table: []const u8, column: []const u8, enabled: bool },
 
     pub const ParsedColumn = struct {
         name: []const u8,
@@ -351,6 +402,31 @@ pub const RecordView = union(RecordType) {
                     .owned = owned,
                 };
             },
+            .add_column => {
+                const table = try readStr(payload, &i);
+                const column = try readColumn(gpa, payload, &i);
+                try owned.columns.append(gpa, column);
+                return .{ .view = .{ .add_column = .{ .table = table, .column = owned.columns.items[0] } }, .owned = owned };
+            },
+            .drop_column => {
+                const table = try readStr(payload, &i);
+                const column = try readStr(payload, &i);
+                return .{ .view = .{ .drop_column = .{ .table = table, .column = column } }, .owned = owned };
+            },
+            .set_default => {
+                const table = try readStr(payload, &i);
+                const column = try readStr(payload, &i);
+                const default_expr = try readDefault(gpa, payload, &i);
+                if (default_expr == .literal) try owned.values.append(gpa, default_expr.literal);
+                return .{ .view = .{ .set_default = .{ .table = table, .column = column, .default_expr = default_expr } }, .owned = owned };
+            },
+            .set_not_null => {
+                const table = try readStr(payload, &i);
+                const column = try readStr(payload, &i);
+                if (i >= payload.len) return error.InvalidWal;
+                const enabled = payload[i] != 0;
+                return .{ .view = .{ .set_not_null = .{ .table = table, .column = column, .enabled = enabled } }, .owned = owned };
+            },
         }
     }
 
@@ -455,6 +531,29 @@ fn writeValue(list: *std.ArrayList(u8), gpa: Allocator, v: value.Value) !void {
     }
 }
 
+fn writeDefault(list: *std.ArrayList(u8), gpa: Allocator, default_expr: value.DefaultExpr) !void {
+    switch (default_expr) {
+        .none => try list.append(gpa, 0),
+        .now => try list.append(gpa, 1),
+        .literal => |v| {
+            try list.append(gpa, 2);
+            try writeValue(list, gpa, v);
+        },
+    }
+}
+
+fn writeColumn(list: *std.ArrayList(u8), gpa: Allocator, col: value.Column) !void {
+    try writeStr(list, gpa, col.name);
+    try list.append(gpa, @intFromEnum(col.type_tag));
+    var flags: u8 = 0;
+    if (col.primary_key) flags |= 1;
+    if (col.not_null) flags |= 2;
+    if (col.unique) flags |= 4;
+    if (col.serial) flags |= 8;
+    try list.append(gpa, flags);
+    try writeDefault(list, gpa, col.default_expr);
+}
+
 fn readU16(payload: []const u8, i: *usize) !u16 {
     if (i.* + 2 > payload.len) return error.InvalidWal;
     const v = bytes.readU16LE(payload[i.*..][0..2]);
@@ -494,6 +593,36 @@ fn readValue(gpa: Allocator, payload: []const u8, i: *usize) !value.Value {
         },
         else => return error.InvalidWal,
     }
+}
+
+fn readDefault(gpa: Allocator, payload: []const u8, i: *usize) !value.DefaultExpr {
+    if (i.* >= payload.len) return error.InvalidWal;
+    const tag = payload[i.*];
+    i.* += 1;
+    return switch (tag) {
+        0 => .none,
+        1 => .now,
+        2 => .{ .literal = try readValue(gpa, payload, i) },
+        else => error.InvalidWal,
+    };
+}
+
+fn readColumn(gpa: Allocator, payload: []const u8, i: *usize) !RecordView.ParsedColumn {
+    const name = try readStr(payload, i);
+    if (i.* + 2 > payload.len) return error.InvalidWal;
+    const type_tag = std.enums.fromInt(value.TypeTag, payload[i.*]) orelse return error.InvalidWal;
+    i.* += 1;
+    const flags = payload[i.*];
+    i.* += 1;
+    return .{
+        .name = name,
+        .type_tag = type_tag,
+        .primary_key = flags & 1 != 0,
+        .not_null = flags & 2 != 0,
+        .unique = flags & 4 != 0,
+        .serial = flags & 8 != 0,
+        .default_expr = try readDefault(gpa, payload, i),
+    };
 }
 
 const TestSink = struct {

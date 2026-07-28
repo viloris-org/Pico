@@ -18,6 +18,8 @@ pub const ExecError = parse.ParseError || error{
     TypeMismatch,
     NotNullViolation,
     UniqueViolation,
+    ColumnExists,
+    CannotDropPrimaryKey,
 };
 
 pub const QueryResult = union(enum) {
@@ -93,10 +95,11 @@ pub fn executeScript(gpa: Allocator, eng: *engine_mod.Engine, sql: []const u8) !
 fn execStmt(gpa: Allocator, eng: *engine_mod.Engine, stmt: parse.Stmt) !QueryResult {
     return switch (stmt) {
         .empty => .{ .empty = "EMPTY" },
-        .begin_tx => .{ .empty = "BEGIN" },
-        .commit_tx => .{ .empty = "COMMIT" },
-        .rollback_tx => .{ .empty = "ROLLBACK" },
-        .create_index => .{ .empty = "CREATE INDEX" },
+        // A successful transaction command must provide a private write set,
+        // failed-transaction state, and atomic WAL publication. Those pieces
+        // are deliberately not emulated by command tags.
+        .begin_tx, .commit_tx, .rollback_tx => error.NotImplemented,
+        .create_index => error.NotImplemented,
         .create_table => |ct| {
             if (ct.if_not_exists) {
                 try eng.createTableIfNotExists(ct.name, ct.columns);
@@ -104,6 +107,17 @@ fn execStmt(gpa: Allocator, eng: *engine_mod.Engine, stmt: parse.Stmt) !QueryRes
                 try eng.createTable(ct.name, ct.columns);
             }
             return .{ .empty = "CREATE TABLE" };
+        },
+        .alter_table => |at| {
+            switch (at.action) {
+                .add_column => |add| try eng.addColumn(at.table, add.column, add.if_not_exists),
+                .drop_column => |drop| try eng.dropColumn(at.table, drop.name, drop.if_exists),
+                .set_default => |set| try eng.setDefault(at.table, set.column, set.default_expr),
+                .drop_default => |drop| try eng.setDefault(at.table, drop.column, .none),
+                .set_not_null => |set| try eng.setNotNull(at.table, set.column, true),
+                .drop_not_null => |drop| try eng.setNotNull(at.table, drop.column, false),
+            }
+            return .{ .empty = "ALTER TABLE" };
         },
         .insert => |ins| {
             try execInsert(gpa, eng, ins);
@@ -116,7 +130,7 @@ fn execStmt(gpa: Allocator, eng: *engine_mod.Engine, stmt: parse.Stmt) !QueryRes
             const n = try execUpdate(gpa, eng, upd);
             // Tag buffer lifetime: return static-ish via allocated? PG uses "UPDATE n".
             // Store in empty as static only works for fixed; use heap tag via... QueryResult.empty is []const u8.
-            // Allocate tag on gpa — but empty deinit doesn't free. Use stack-fixed via fmt into static threadlocal? 
+            // Allocate tag on gpa — but empty deinit doesn't free. Use stack-fixed via fmt into static threadlocal?
             // For protocol path we need dynamic. Change empty to own optional later.
             // Workaround: only return common tags; for count use format into a leaked... bad.
             // Better: encode count in a small static pool — for tests, "UPDATE 1" is enough if n==1.
@@ -516,7 +530,6 @@ test "exec sub2api-shaped settings and users" {
         \\  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         \\  deleted_at TIMESTAMPTZ
         \\);
-        \\CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
     ;
 
     const results = try executeScript(gpa, &eng, ddl);
@@ -558,6 +571,65 @@ test "exec sub2api-shaped settings and users" {
     defer r8.deinit();
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+}
+
+test "exec rejects syntax whose semantics are not implemented" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-rejections";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+
+    try std.testing.expectError(error.NotImplemented, execute(gpa, &eng, "BEGIN"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, "CREATE INDEX idx_t_id ON t(id)"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, "CREATE TABLE t (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id))"));
+
+    var create = try execute(gpa, &eng, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    defer create.deinit();
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, "INSERT INTO t VALUES (1, 'alice') RETURNING id"));
+    try std.testing.expectError(error.UnsupportedSyntax, execute(gpa, &eng, "SELECT * FROM t ORDER BY id"));
+}
+
+test "alter table changes survive WAL recovery" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-alter-recovery";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+        defer eng.deinit();
+        var create = try execute(gpa, &eng, "CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT)");
+        defer create.deinit();
+        var insert = try execute(gpa, &eng, "INSERT INTO accounts VALUES (1, 'alice')");
+        defer insert.deinit();
+        var add = try execute(gpa, &eng, "ALTER TABLE accounts ADD COLUMN active BOOLEAN NOT NULL DEFAULT true");
+        defer add.deinit();
+        var set_default = try execute(gpa, &eng, "ALTER TABLE accounts ALTER COLUMN name SET DEFAULT 'anonymous'");
+        defer set_default.deinit();
+        var set_null = try execute(gpa, &eng, "ALTER TABLE accounts ALTER COLUMN name SET NOT NULL");
+        defer set_null.deinit();
+        var clear_default = try execute(gpa, &eng, "ALTER TABLE accounts ALTER COLUMN name DROP DEFAULT");
+        defer clear_default.deinit();
+        var clear_null = try execute(gpa, &eng, "ALTER TABLE accounts ALTER COLUMN name DROP NOT NULL");
+        defer clear_null.deinit();
+        var drop = try execute(gpa, &eng, "ALTER TABLE accounts DROP COLUMN name");
+        defer drop.deinit();
+    }
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+        defer eng.deinit();
+        var result = try execute(gpa, &eng, "SELECT active FROM accounts WHERE id = 1");
+        defer result.deinit();
+        try std.testing.expectEqualStrings("t", result.rows.cells[0][0].?);
+        const active = eng.getTable("accounts").?.columns[1];
+        try std.testing.expect(active.not_null);
+        try std.testing.expect(active.default_expr == .literal);
+    }
 }
 
 const Io = std.Io;

@@ -5,6 +5,7 @@ const value = @import("../storage/value.zig");
 
 pub const Stmt = union(enum) {
     create_table: CreateTable,
+    alter_table: AlterTable,
     create_index: CreateIndex,
     insert: Insert,
     select: Select,
@@ -14,6 +15,21 @@ pub const Stmt = union(enum) {
     commit_tx,
     rollback_tx,
     empty,
+};
+
+pub const AlterTable = struct {
+    table: []const u8,
+    table_owned: bool = false,
+    action: Action,
+
+    pub const Action = union(enum) {
+        add_column: struct { column: value.Column, if_not_exists: bool },
+        drop_column: struct { name: []const u8, name_owned: bool = false, if_exists: bool },
+        set_default: struct { column: []const u8, column_owned: bool = false, default_expr: value.DefaultExpr },
+        drop_default: struct { column: []const u8, column_owned: bool = false },
+        set_not_null: struct { column: []const u8, column_owned: bool = false },
+        drop_not_null: struct { column: []const u8, column_owned: bool = false },
+    };
 };
 
 pub const CreateTable = struct {
@@ -132,6 +148,7 @@ pub const Parser = struct {
         if (self.cur.kind == .eof) return .empty;
         return switch (self.cur.kind) {
             .kw_create => self.parseCreate(),
+            .kw_alter => self.parseAlter(),
             .kw_insert => self.parseInsert(),
             .kw_select => self.parseSelect(),
             .kw_update => self.parseUpdate(),
@@ -245,16 +262,13 @@ pub const Parser = struct {
                 }
                 break;
             }
+            // Table constraints other than PRIMARY KEY do not yet have storage
+            // semantics. Reject them rather than accepting a no-op definition.
             if (self.cur.kind == .kw_unique or self.cur.kind == .kw_references or
                 (self.cur.kind == .ident and token.eqlIgnoreCase(self.cur.text, "FOREIGN")) or
                 (self.cur.kind == .ident and token.eqlIgnoreCase(self.cur.text, "CONSTRAINT")))
             {
-                try self.skipBalancedConstraint();
-                if (self.cur.kind == .comma) {
-                    try self.advance();
-                    continue;
-                }
-                break;
+                return error.UnsupportedSyntax;
             }
 
             try cols.append(self.gpa, try self.parseColumnDef());
@@ -267,8 +281,9 @@ pub const Parser = struct {
         _ = try self.expect(.rparen);
         if (self.cur.kind == .semicolon) try self.advance();
 
-        // Apply single-column table PRIMARY KEY (...). Multi-column PK: leave no column-level PK
-        // (engine uses scan-based addressing; composite uniqueness not yet enforced).
+        // Apply a single-column table PRIMARY KEY. Composite keys are not
+        // accepted until their uniqueness and WAL semantics are implemented.
+        if (table_pk_cols.items.len > 1) return error.UnsupportedSyntax;
         if (table_pk_cols.items.len == 1) {
             const pk_name = table_pk_cols.items[0];
             var found = false;
@@ -287,7 +302,6 @@ pub const Parser = struct {
         for (cols.items) |c| {
             if (c.primary_key) has_pk = true;
         }
-        // Allow tables with multi-column PRIMARY KEY (no single-column PK) or with column PK.
         if (!has_pk and table_pk_cols.items.len == 0) return error.MissingPrimaryKey;
 
         return .{ .create_table = .{
@@ -297,38 +311,74 @@ pub const Parser = struct {
         } };
     }
 
-    fn parseCreateIndex(self: *Parser, is_unique: bool) ParseError!Stmt {
-        _ = is_unique;
-        var if_not_exists = false;
-        if (self.cur.kind == .kw_if) {
+    fn parseAlter(self: *Parser) ParseError!Stmt {
+        _ = try self.expect(.kw_alter);
+        _ = try self.expect(.kw_table);
+        const table = try self.parseIdent();
+        if (self.cur.kind == .kw_add) {
             try self.advance();
-            _ = try self.expect(.kw_not);
-            _ = try self.expect(.kw_exists);
-            if_not_exists = true;
-        }
-        // index name
-        _ = try self.parseIdent();
-        _ = try self.expect(.kw_on);
-        _ = try self.parseIdent();
-        _ = try self.expect(.lparen);
-        // column list
-        while (true) {
-            _ = try self.parseIdent();
-            if (self.cur.kind == .kw_asc or self.cur.kind == .kw_desc) try self.advance();
-            if (self.cur.kind == .comma) {
+            if (self.cur.kind == .kw_column) try self.advance();
+            var if_not_exists = false;
+            if (self.cur.kind == .kw_if) {
                 try self.advance();
-                continue;
+                _ = try self.expect(.kw_not);
+                _ = try self.expect(.kw_exists);
+                if_not_exists = true;
             }
-            break;
+            const column = try self.parseColumnDef();
+            if (self.cur.kind == .semicolon) try self.advance();
+            return .{ .alter_table = .{ .table = table, .action = .{ .add_column = .{ .column = column, .if_not_exists = if_not_exists } } } };
         }
-        _ = try self.expect(.rparen);
-        // optional WHERE for partial index — skip remainder until semicolon/eof
-        if (self.cur.kind == .kw_where) {
+        if (self.cur.kind == .kw_drop) {
             try self.advance();
-            try self.skipUntilStmtEnd();
+            if (self.cur.kind == .kw_column) try self.advance();
+            if (self.cur.kind == .kw_default) {
+                try self.advance();
+                if (self.cur.kind == .semicolon) try self.advance();
+                return error.UnexpectedToken;
+            }
+            var if_exists = false;
+            if (self.cur.kind == .kw_if) {
+                try self.advance();
+                _ = try self.expect(.kw_exists);
+                if_exists = true;
+            }
+            const name = try self.parseIdent();
+            if (self.cur.kind == .semicolon) try self.advance();
+            return .{ .alter_table = .{ .table = table, .action = .{ .drop_column = .{ .name = name, .if_exists = if_exists } } } };
         }
+        if (self.cur.kind == .kw_alter) try self.advance();
+        if (self.cur.kind == .kw_column) try self.advance();
+        const column = try self.parseIdent();
+        if (self.cur.kind == .kw_set) {
+            try self.advance();
+            if (self.cur.kind == .kw_default) {
+                try self.advance();
+                const default_expr = try self.parseDefaultExpr();
+                if (self.cur.kind == .semicolon) try self.advance();
+                return .{ .alter_table = .{ .table = table, .action = .{ .set_default = .{ .column = column, .default_expr = default_expr } } } };
+            }
+            _ = try self.expect(.kw_not);
+            _ = try self.expect(.kw_null);
+            if (self.cur.kind == .semicolon) try self.advance();
+            return .{ .alter_table = .{ .table = table, .action = .{ .set_not_null = .{ .column = column } } } };
+        }
+        _ = try self.expect(.kw_drop);
+        if (self.cur.kind == .kw_default) {
+            try self.advance();
+            if (self.cur.kind == .semicolon) try self.advance();
+            return .{ .alter_table = .{ .table = table, .action = .{ .drop_default = .{ .column = column } } } };
+        }
+        _ = try self.expect(.kw_not);
+        _ = try self.expect(.kw_null);
         if (self.cur.kind == .semicolon) try self.advance();
-        return .{ .create_index = .{ .if_not_exists = if_not_exists } };
+        return .{ .alter_table = .{ .table = table, .action = .{ .drop_not_null = .{ .column = column } } } };
+    }
+
+    fn parseCreateIndex(self: *Parser, is_unique: bool) ParseError!Stmt {
+        _ = self;
+        _ = is_unique;
+        return error.UnsupportedSyntax;
     }
 
     fn skipUntilStmtEnd(self: *Parser) ParseError!void {
@@ -406,7 +456,7 @@ pub const Parser = struct {
                     col.default_expr = try self.parseDefaultExpr();
                 },
                 .kw_references => {
-                    try self.skipReferences();
+                    return error.UnsupportedSyntax;
                 },
                 else => break,
             }
@@ -605,10 +655,10 @@ pub const Parser = struct {
             break;
         }
         _ = try self.expect(.rparen);
-        // optional RETURNING — skip
+        // RETURNING needs the rows produced by the write path; accepting it
+        // before that exists would report a successful statement with lost data.
         if (self.cur.kind == .ident and token.eqlIgnoreCase(self.cur.text, "RETURNING")) {
-            try self.advance();
-            try self.skipUntilStmtEnd();
+            return error.UnsupportedSyntax;
         }
         if (self.cur.kind == .semicolon) try self.advance();
 
@@ -768,19 +818,9 @@ pub const Parser = struct {
             self.gpa.free(where_preds);
         }
 
-        // ORDER BY col [ASC|DESC] — accept and ignore (memtable scan order)
+        // The memtable's physical row order is not SQL ORDER BY semantics.
         if (self.cur.kind == .kw_order) {
-            try self.advance();
-            _ = try self.expect(.kw_by);
-            while (true) {
-                _ = try self.parseIdent();
-                if (self.cur.kind == .kw_asc or self.cur.kind == .kw_desc) try self.advance();
-                if (self.cur.kind == .comma) {
-                    try self.advance();
-                    continue;
-                }
-                break;
-            }
+            return error.UnsupportedSyntax;
         }
 
         var limit: ?u64 = null;
@@ -910,6 +950,20 @@ pub fn freeStmt(gpa: Allocator, stmt: *Stmt) void {
             gpa.free(ct.columns);
         },
         .create_index => {},
+        .alter_table => |*at| {
+            if (at.table_owned) gpa.free(at.table);
+            switch (at.action) {
+                .add_column => |*add| add.column.deinit(gpa),
+                .drop_column => |drop| if (drop.name_owned) gpa.free(drop.name),
+                .set_default => |*set| {
+                    if (set.column_owned) gpa.free(set.column);
+                    set.default_expr.deinit(gpa);
+                },
+                .drop_default => |drop| if (drop.column_owned) gpa.free(drop.column),
+                .set_not_null => |set| if (set.column_owned) gpa.free(set.column),
+                .drop_not_null => |drop| if (drop.column_owned) gpa.free(drop.column),
+            }
+        },
         .insert => |*ins| {
             if (ins.table_owned) gpa.free(ins.table);
             if (ins.columns) |c| {

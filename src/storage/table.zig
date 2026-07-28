@@ -16,6 +16,9 @@ pub const Error = error{
     InvalidIdentifier,
     NotNullViolation,
     UniqueViolation,
+    ColumnExists,
+    ColumnNotFound,
+    CannotDropPrimaryKey,
 };
 
 pub const Row = struct {
@@ -345,6 +348,68 @@ pub const Table = struct {
         const id = self.next_serial;
         self.next_serial += 1;
         return id;
+    }
+
+    pub fn columnIndex(self: *const Table, name: []const u8) ?usize {
+        for (self.columns, 0..) |col, i| {
+            if (std.ascii.eqlIgnoreCase(col.name, name)) return i;
+        }
+        return null;
+    }
+
+    /// Applies a precomputed value to every existing row, then publishes the
+    /// column definition. Engine owns evaluation of dynamic defaults and WAL.
+    pub fn addColumn(self: *Table, gpa: Allocator, column: value.Column, existing_value: value.Value) (Error || Allocator.Error)!void {
+        if (self.columnIndex(column.name) != null) return error.ColumnExists;
+        if (column.primary_key) return error.MissingPrimaryKey;
+        if (column.not_null and existing_value == .null and self.rows.items.len != 0) return error.NotNullViolation;
+
+        const new_columns = try gpa.realloc(self.columns, self.columns.len + 1);
+        self.columns = new_columns;
+        errdefer self.columns = gpa.realloc(self.columns, self.columns.len - 1) catch self.columns;
+        self.columns[self.columns.len - 1] = try column.clone(gpa);
+
+        for (self.rows.items) |*row| {
+            const values = try gpa.realloc(row.values, row.values.len + 1);
+            row.values = values;
+            row.values[row.values.len - 1] = try existing_value.clone(gpa);
+        }
+    }
+
+    pub fn dropColumn(self: *Table, gpa: Allocator, name: []const u8) (Error || Allocator.Error)!void {
+        const idx = self.columnIndex(name) orelse return error.ColumnNotFound;
+        if (self.pk_index != null and self.pk_index.? == idx) return error.CannotDropPrimaryKey;
+
+        var removed = self.columns[idx];
+        var i = idx;
+        while (i + 1 < self.columns.len) : (i += 1) self.columns[i] = self.columns[i + 1];
+        self.columns = try gpa.realloc(self.columns, self.columns.len - 1);
+        removed.deinit(gpa);
+
+        for (self.rows.items) |*row| {
+            var removed_value = row.values[idx];
+            i = idx;
+            while (i + 1 < row.values.len) : (i += 1) row.values[i] = row.values[i + 1];
+            row.values = try gpa.realloc(row.values, row.values.len - 1);
+            removed_value.deinit(gpa);
+        }
+        if (self.pk_index) |pki| {
+            if (pki > idx) self.pk_index = pki - 1;
+        }
+    }
+
+    pub fn setDefault(self: *Table, gpa: Allocator, name: []const u8, default_expr: value.DefaultExpr) (Error || Allocator.Error)!void {
+        const idx = self.columnIndex(name) orelse return error.ColumnNotFound;
+        self.columns[idx].default_expr.deinit(gpa);
+        self.columns[idx].default_expr = try default_expr.clone(gpa);
+    }
+
+    pub fn setNotNull(self: *Table, name: []const u8, enabled: bool) Error!void {
+        const idx = self.columnIndex(name) orelse return error.ColumnNotFound;
+        if (enabled) {
+            for (self.rows.items) |row| if (row.values[idx] == .null) return error.NotNullViolation;
+        }
+        self.columns[idx].not_null = enabled;
     }
 
     /// Collect row indices matching all predicates (AND). Caller owns the slice.

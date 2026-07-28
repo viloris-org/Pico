@@ -156,6 +156,8 @@ fn execErrorMessage(err: anyerror) []const u8 {
         error.ColumnNotFound => "column not found",
         error.NotNullViolation => "null value in not-null column",
         error.UniqueViolation => "unique constraint violated",
+        error.ColumnExists => "column already exists",
+        error.CannotDropPrimaryKey => "cannot drop primary-key column",
         error.UnsupportedSyntax => "unsupported SQL syntax (Pico subset)",
         error.UnexpectedToken => "syntax error",
         error.NotImplemented => "feature not implemented",

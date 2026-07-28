@@ -79,6 +79,33 @@ pub const Engine = struct {
                     try table.deleteAt(self.gpa, idx);
                 }
             },
+            .add_column => |add| {
+                const table = self.tables.getPtr(add.table) orelse return error.TableNotFound;
+                const col: value.Column = .{
+                    .name = @constCast(add.column.name),
+                    .type_tag = add.column.type_tag,
+                    .primary_key = add.column.primary_key,
+                    .not_null = add.column.not_null,
+                    .unique = add.column.unique,
+                    .serial = add.column.serial,
+                    .default_expr = add.column.default_expr,
+                };
+                var existing = try existingColumnValue(self.gpa, col.default_expr);
+                defer existing.deinit(self.gpa);
+                try table.addColumn(self.gpa, col, existing);
+            },
+            .drop_column => |drop| {
+                const table = self.tables.getPtr(drop.table) orelse return error.TableNotFound;
+                try table.dropColumn(self.gpa, drop.column);
+            },
+            .set_default => |set| {
+                const table = self.tables.getPtr(set.table) orelse return error.TableNotFound;
+                try table.setDefault(self.gpa, set.column, set.default_expr);
+            },
+            .set_not_null => |set| {
+                const table = self.tables.getPtr(set.table) orelse return error.TableNotFound;
+                try table.setNotNull(set.column, set.enabled);
+            },
         }
     }
 
@@ -135,6 +162,48 @@ pub const Engine = struct {
     pub fn createTableIfNotExists(self: *Engine, name: []const u8, columns: []const value.Column) !void {
         if (self.tables.contains(name)) return;
         try self.createTable(name, columns);
+    }
+
+    pub fn addColumn(self: *Engine, table_name: []const u8, column: value.Column, if_not_exists: bool) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (table.columnIndex(column.name) != null) {
+            if (if_not_exists) return;
+            return error.ColumnExists;
+        }
+        var existing = try existingColumnValue(self.gpa, column.default_expr);
+        defer existing.deinit(self.gpa);
+        if (column.not_null and existing == .null and table.rows.items.len != 0) return error.NotNullViolation;
+        try self.wal.appendAddColumn(.{ .table = table_name, .column = column });
+        try table.addColumn(self.gpa, column, existing);
+    }
+
+    pub fn dropColumn(self: *Engine, table_name: []const u8, name: []const u8, if_exists: bool) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (table.columnIndex(name) == null) {
+            if (if_exists) return;
+            return error.ColumnNotFound;
+        }
+        if (table.pk_index != null and table.pk_index.? == table.columnIndex(name).?) return error.CannotDropPrimaryKey;
+        try self.wal.appendDropColumn(.{ .table = table_name, .column = name });
+        try table.dropColumn(self.gpa, name);
+    }
+
+    pub fn setDefault(self: *Engine, table_name: []const u8, name: []const u8, default_expr: value.DefaultExpr) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        _ = table.columnIndex(name) orelse return error.ColumnNotFound;
+        try self.wal.appendSetDefault(.{ .table = table_name, .column = name, .default_expr = default_expr });
+        try table.setDefault(self.gpa, name, default_expr);
+    }
+
+    pub fn setNotNull(self: *Engine, table_name: []const u8, name: []const u8, enabled: bool) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        _ = table.columnIndex(name) orelse return error.ColumnNotFound;
+        if (enabled) for (table.rows.items) |row| {
+            const idx = table.columnIndex(name).?;
+            if (row.values[idx] == .null) return error.NotNullViolation;
+        };
+        try self.wal.appendSetNotNull(.{ .table = table_name, .column = name, .enabled = enabled });
+        try table.setNotNull(name, enabled);
     }
 
     pub fn insert(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
@@ -248,6 +317,13 @@ pub const Engine = struct {
         return table.allocSerial();
     }
 };
+
+fn existingColumnValue(gpa: Allocator, default_expr: value.DefaultExpr) !value.Value {
+    return switch (default_expr) {
+        .none, .now => .null,
+        .literal => |v| try v.clone(gpa),
+    };
+}
 
 test "engine create insert select roundtrip with wal" {
     const gpa = std.testing.allocator;

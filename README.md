@@ -8,7 +8,8 @@
 
 **Phase 0（完成）**：TCP 服务 + PG 简单查询协议 + 内存表 + WAL 恢复。
 
-**Phase 1（进行中）**：面向 sub2api 类 OLTP 负载扩展 SQL 子集。
+**Phase 1（进行中）**：扩展首批迁移型 OLTP SQL 子集，范围见
+[ADR-0008](docs/adr/0008-first-batch-oltp-sql-subset.md)。
 
 持久化格式仍在 Phase 1 演进中。WAL 帧带格式版本与 CRC32 校验（覆盖长度字段与载荷）；默认在追加后 `sync`（可用 `--no-sync` 仅用于开发）。崩溃恢复规则：
 
@@ -18,18 +19,21 @@
 
 已支持（子集，非完整 PG）：
 
-- DDL：`CREATE TABLE IF NOT EXISTS`、PG 类型别名（`BIGSERIAL`/`VARCHAR`/`DECIMAL`/`TIMESTAMPTZ`/`JSONB`…）、`DEFAULT`/`NOW()`/`NOT NULL`/`UNIQUE`、列级 `REFERENCES`（解析忽略）
-- `CREATE INDEX IF NOT EXISTS`（兼容接受，当前为扫描访问）
+- DDL：`CREATE TABLE IF NOT EXISTS`、PG 类型别名（`BIGSERIAL`/`VARCHAR`/`DECIMAL`/`TIMESTAMPTZ`/`JSONB`…）、`DEFAULT`/`NOW()`/`NOT NULL`/列级 `UNIQUE`
 - DML：`INSERT`（缺省列 + SERIAL）、`SELECT`/`UPDATE`/`DELETE` 的 `WHERE`（`=` / `IS [NOT] NULL` / `AND`）、`LIMIT`/`OFFSET`
-- 文本主键、多语句脚本、`BEGIN`/`COMMIT`/`ROLLBACK`（语句级自动提交下的兼容标签）
+- 文本主键、多语句脚本、语句级自动提交
 
-验收：
+`CREATE INDEX`、外键、复合主键、`RETURNING`、`ORDER BY` 与
+`BEGIN` / `COMMIT` / `ROLLBACK` 尚未实现真实语义，会明确报错，不作为兼容标签成功返回。
 
-- `zig build test`（含 sub2api 风格 DDL/DML 单测）
-- 可执行 `sub2api/backend/migrations/001_init.sql` 全量建表
+当前验收：
+
+- `zig build test`（基础 DDL/DML 与 WAL 恢复）
 - 核心表 `INSERT`/`SELECT`/`UPDATE`/`DELETE`（含 `AND` / `IS NULL` / 非主键 WHERE）
+- 不支持的 SQL 返回明确错误
 
-仍不支持（sub2api 完整跑通还需继续）：扩展查询协议（`$1` 参数）、JOIN、JSONB 算子、`ALTER TABLE`、事务隔离、部分唯一索引语义等。
+首批待实现的能力、验收门槛与明确排除项见
+[ADR-0008](docs/adr/0008-first-batch-oltp-sql-subset.md)。
 
 ## 构建与运行
 
