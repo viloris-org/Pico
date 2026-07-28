@@ -1,25 +1,31 @@
-# Pico
+# Pico Server
 
 [中文](README.zh-CN.md) | English
 
-Pico is a lightweight, single-node OLTP database written in Zig. It runs as a
-standalone network service and exposes the PostgreSQL Frontend/Backend wire
-protocol so that existing PostgreSQL clients and drivers can connect without a
-custom SDK.
+Pico Server is a lightweight, single-node OLTP database written in Zig. It
+runs as a standalone network service. It is one of two independently released
+Pico products; Pico Client provides the CLI, drivers, and developer tools.
 
-Pico intentionally implements an OLTP SQL subset. It is not a full PostgreSQL
-server, and SQL outside the supported subset is rejected with an explicit
-error.
+Pico intentionally implements an OLTP SQL subset. It is not PostgreSQL
+compatible: its protocol, SQL dialect, types, errors, drivers, and tools are
+Pico-owned contracts. SQL outside the published support matrix is rejected with
+an explicit error.
+
+Pico Server and Pico Client communicate only through the versioned Pico wire
+protocol, Pico SQL, and the public error model. This repository contains Pico
+Server only. See [product boundaries](docs/products.md).
 
 ## Status
 
-Pico is under active development. The current implementation provides:
+Pico Server is under active development. The current implementation provides:
 
-- A TCP server using the PostgreSQL wire protocol
+- A TCP server; the current implementation still uses a temporary PostgreSQL
+  Frontend/Backend Protocol adapter, which is not a product compatibility
+  commitment
 - Single-instance operation with a local data directory
 - `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
 - Single-column primary keys, column-level unique constraints, defaults, and
-  common PostgreSQL type aliases
+  current SQL type aliases
 - `WHERE` predicates using `=`, `AND`, and `IS [NOT] NULL`; single-column
   `ORDER BY [ASC|DESC]`; `LIMIT` and `OFFSET`
 - Autocommit and explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
@@ -39,7 +45,8 @@ table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`,
 `Parse`, `Bind`, `Describe`, and `Execute`.
 
 See the [SQL subset support matrix](docs/sql-subset.md) for the authoritative
-compatibility boundary.
+Pico SQL boundary. The target protocol and ecosystem decision is recorded in
+[ADR-0009](docs/adr/0009-pico-native-ecosystem.md).
 
 ## Build
 
@@ -90,7 +97,8 @@ Available options:
 | `--data-dir <path>` | `./data` | Instance data directory |
 | `--no-sync` | disabled | Disable WAL synchronization; development only |
 
-Connect with `psql` or another PostgreSQL client:
+The current development adapter can be exercised with `psql`, but this is not
+supported Pico client compatibility and will be replaced by the Pico protocol:
 
 ```bash
 psql -h 127.0.0.1 -p 5433 -U pico -d pico
@@ -137,7 +145,7 @@ is being built in small modules with explicit ownership boundaries:
 
 | Directory | Responsibility |
 | --- | --- |
-| `src/net/` | TCP connections and PostgreSQL wire protocol |
+| `src/net/` | TCP connections and Pico wire protocol (the current PG adapter is transitional) |
 | `src/sql/` | SQL subset tokenization, parsing, and execution |
 | `src/storage/` | Tables, WAL, VFS, pager, values, and recovery |
 | `src/txn/` | Transaction boundaries and session state |

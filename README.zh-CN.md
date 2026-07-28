@@ -1,22 +1,26 @@
-# Pico
+# Pico Server
 
 中文 | [English](README.md)
 
-Pico 是一个使用 Zig 编写的轻量级单节点 OLTP 数据库。它以独立网络服务
-运行，并提供 PostgreSQL Frontend/Backend 线协议，因此现有 PostgreSQL 客户端
-和驱动无需专用 SDK 即可连接。
+Pico Server 是一个使用 Zig 编写的轻量级单节点 OLTP 数据库。它以独立网络服务
+运行；Pico Client 则作为另一项独立发布的 Pico 产品，提供 CLI、驱动和开发者工具。
 
-Pico 有意实现面向 OLTP 的 SQL 子集。它不是完整的 PostgreSQL 服务端，超出
-支持范围的 SQL 会返回明确错误。
+Pico 有意实现面向 OLTP 的 SQL 子集。它不兼容 PostgreSQL：线协议、SQL 方言、
+类型、错误、驱动和工具均是 Pico 自己定义的契约。超出公开支持矩阵范围的 SQL 会
+返回明确错误。
+
+Pico Server 与 Pico Client 只通过版本化 Pico 线协议、Pico SQL 和公开错误模型协作。
+本仓库只包含 Pico Server。产品边界见[产品边界](docs/products.md)。
 
 ## 当前状态
 
-Pico 仍在积极开发中。目前已提供：
+Pico Server 仍在积极开发中。目前已提供：
 
-- 使用 PostgreSQL 线协议的 TCP 服务
+- TCP 服务；当前实现仍带有临时 PostgreSQL Frontend/Backend Protocol 适配层，
+  但它不是产品兼容承诺
 - 带本地数据目录的单机单实例运行模式
 - `CREATE TABLE`、`ALTER TABLE`、`INSERT`、`SELECT`、`UPDATE` 和 `DELETE`
-- 单列主键、列级唯一约束、默认值和常用 PostgreSQL 类型别名
+- 单列主键、列级唯一约束、默认值和当前 SQL 类型别名
 - 支持 `=`、`AND` 和 `IS [NOT] NULL` 的 `WHERE` 条件，以及 `LIMIT` 和 `OFFSET`
 - 自动提交以及显式 `BEGIN` / `COMMIT` / `ROLLBACK` 事务
 - 基于 WAL 的持久化与崩溃恢复
@@ -31,7 +35,8 @@ group commit 和扩展查询协议属于目标架构，并不代表当前都已�
 除 `=` 以外的比较运算、`IN`、`LIKE`、聚合、分组，以及扩展查询消息
 `Parse`、`Bind`、`Describe` 和 `Execute`。
 
-完整的兼容边界请参阅 [SQL 子集支持矩阵](docs/sql-subset.md)。
+Pico SQL 的完整边界请参阅 [SQL 子集支持矩阵](docs/sql-subset.md)。目标协议和
+生态的决策见 [ADR-0009](docs/adr/0009-pico-native-ecosystem.md)。
 
 ## 构建
 
@@ -80,7 +85,8 @@ zig build run -- \
 | `--data-dir <path>` | `./data` | 实例数据目录 |
 | `--no-sync` | 禁用 | 禁止 WAL 同步，仅用于开发 |
 
-使用 `psql` 或其他 PostgreSQL 客户端连接：
+当前开发适配层可使用 `psql` 验证，但它不是 Pico 客户端兼容承诺，后续将由 Pico
+线协议替代：
 
 ```bash
 psql -h 127.0.0.1 -p 5433 -U pico -d pico
@@ -123,7 +129,7 @@ LSM 风格有序存储。实现按明确的所有权边界拆分为小模块：
 
 | 目录 | 职责 |
 | --- | --- |
-| `src/net/` | TCP 连接与 PostgreSQL 线协议 |
+| `src/net/` | TCP 连接与 Pico 线协议（当前 PG 适配层仅作过渡） |
 | `src/sql/` | SQL 子集的词法分析、解析和执行 |
 | `src/storage/` | 表、WAL、VFS、页管理器、值类型和恢复 |
 | `src/txn/` | 事务边界与连接状态 |

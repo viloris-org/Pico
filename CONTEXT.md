@@ -1,14 +1,23 @@
 # Pico
 
-Pico 是一款用 Zig 实现的**单机、轻量、可网络访问**的 OLTP 数据库：部署简单、资源占用低、启动快；写路径在高争用下保持可预期；对公开产品提供足够的故障恢复与耐久性；对外优先兼容 PostgreSQL 线协议与常用 SQL 子集，以便复用现有驱动与工具。
+Pico 是一款用 Zig 实现的**单机、轻量、可网络访问**的 OLTP 数据库：部署简单、资源占用低、启动快；写路径在高争用下保持可预期；对公开产品提供足够的故障恢复与耐久性；对外以 Pico 线协议与 Pico SQL 构建独立生态，不承诺 PostgreSQL 兼容。
 
 ## Language
 
 ### 产品与部署
 
 **Pico**：
-本仓库所构建的数据库系统本身；对外表现为一个可独立部署的服务端进程。
-_Avoid_: 引擎、内核（除非特指存储子系统）
+由 **Pico Server** 与 **Pico Client** 组成的数据库产品生态；两项产品通过 Pico
+线协议与 Pico SQL 协作。
+_Avoid_: 将 Pico 等同于单一二进制、引擎、内核（除非特指存储子系统）
+
+**Pico Server**：
+本仓库构建的、可独立部署的数据库服务端进程；持有数据、事务、耐久性与恢复语义。
+_Avoid_: 服务端内置客户端、数据库引擎（除非特指存储子系统）
+
+**Pico Client**：
+独立发布的官方 CLI、驱动与开发者工具产品；不读取数据目录或依赖服务端内部模块。
+_Avoid_: Server CLI、内置驱动、服务端 SDK
 
 **实例（Instance）**：
 一次正在运行的 Pico 进程及其绑定的数据目录；当前产品形态为**单机单实例**，不构成集群。
@@ -24,13 +33,15 @@ _Avoid_: 数据库文件（暗示单一文件）、仓库
 客户端与实例之间的一条网络会话；承载认证、会话状态与请求/响应。
 _Avoid_: Session（若与「事务会话」混淆时优先用连接）、Socket（实现细节）
 
-**线协议（Wire Protocol）**：
-连接上交换的报文约定。Pico 的对外线协议是 **PostgreSQL Frontend/Backend Protocol** 的兼容实现。
-_Avoid_: API、RPC（除非指内部模块边界）
+**Pico 线协议（Pico Wire Protocol）**：
+连接上交换的、由 Pico 版本化定义的报文约定；它是 Pico 的对外接口，不承诺
+PostgreSQL Frontend/Backend Protocol 兼容。
+_Avoid_: API、RPC（除非指内部模块边界）、「PostgreSQL 兼容协议」
 
-**驱动兼容**：
-客户端通过既有 PostgreSQL 生态客户端/驱动（如 `psql`、libpq、pgx 等）访问 Pico，而不要求专用 SDK。
-_Avoid_: 「完全兼容 PostgreSQL」（见 SQL 子集）
+**Pico 客户端**：
+Pico Client 产品中的官方 CLI、驱动或工具。其语言覆盖、版本策略与支持范围由
+Pico Client 单独发布，并通过兼容性矩阵声明对 Pico Server 的支持。
+_Avoid_: 驱动兼容、`psql` / libpq / pgx 兼容、专用 SDK（在未定义具体工具前）
 
 ### 数据模型
 
@@ -64,9 +75,10 @@ _Avoid_: Schema 定义（易与 SQL schema 混淆）
 客户端提交的一条 SQL 文本或其已解析形式；在连接上顺序或按协议规则执行。
 _Avoid_: 请求（太泛）、查询（仅 SELECT 时用 Query 亦可）
 
-**SQL 子集（SQL Subset）**：
-Pico 有意支持的 SQL 方言范围：面向 OLTP 的常用结构，**不**承诺完整 PostgreSQL SQL。
-_Avoid_: PostgreSQL 兼容（未限定范围时）、方言全集
+**Pico SQL**：
+Pico 有意支持的、面向 OLTP 的 SQL 方言范围；只承诺公开支持矩阵中的语句、类型和
+语义，不以 PostgreSQL SQL 为兼容目标。
+_Avoid_: PostgreSQL 兼容、PostgreSQL SQL 子集、方言全集
 
 **事务（Transaction）**：
 一组语句的原子工作单元；以 **BEGIN / COMMIT / ROLLBACK**（或自动提交单语句）界定。
@@ -153,8 +165,9 @@ _Avoid_: 数据库游标声明式 SQL 语法（未支持前不要当产品特性
 
 ## Example dialogue
 
-> **开发**：客户端用 `psql` 连上来，算不算已经「兼容 PostgreSQL」？  
-> **领域**：那叫**驱动兼容**——**线协议**能通。**SQL 子集**里没有的语法仍会明确报错，不要对外说「完整 PG」。
+> **开发**：当前实现能用 `psql` 连上，算 Pico 的产品兼容承诺吗？  
+> **领域**：不算。这是迁移适配层的实现状态；对外契约是版本化的 **Pico 线协议** 与
+> **Pico SQL**。适配层不得定义 SQL、类型或事务语义。
 >
 > **开发**：两个连接同时改同一主键，算**争用**还是故障？  
 > **领域**：是**争用**。一个**事务**会**提交**，另一个按隔离规则等待或因写冲突失败；**写路径**必须保持可预期，不能整实例锁死。

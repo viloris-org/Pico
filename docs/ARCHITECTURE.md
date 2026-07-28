@@ -2,7 +2,10 @@
 
 ## 决策摘要
 
-Pico 是一个单机、轻量、可网络访问的 OLTP 数据库。一个实例拥有一个数据目录，通过 PostgreSQL Frontend/Backend Protocol 为多个客户端连接提供已声明的 SQL 子集。它不是嵌入式库、集群或完整 PostgreSQL 实现。
+Pico Server 是一个单机、轻量、可网络访问的 OLTP 数据库。它是独立的 Pico Server
+产品，Pico Client 是另一个独立产品。一个实例拥有一个数据目录，通过版本化 Pico
+线协议为 Pico Client 提供已声明的 Pico SQL。它不是嵌入式库、集群或 PostgreSQL
+兼容实现。
 
 目标实现以单写者为提交排序点、以 MVCC 快照服务并行读、以 WAL 为恢复事实来源，并将表和二级索引落在独立的 LSM 有序集合中。WAL 默认在确认提交前持久化；检查点只推进数据目录内部的持久化进度，不是用户备份。
 
@@ -18,28 +21,31 @@ Pico 是一个单机、轻量、可网络访问的 OLTP 数据库。一个实例
 
 ## 依据、取舍与非目标
 
-已接受的 ADR-0001 至 ADR-0007 是本架构的约束来源。决定架构的优先级依次为：
+已接受的 ADR-0001、ADR-0004 至 ADR-0009 是本架构的约束来源。决定架构的优先级依次为：
 
 1. 崩溃后提交语义可恢复，且未知格式或完整记录损坏不猜测恢复。
 2. 高争用下写路径可预期，提交顺序唯一而可观察。
-3. 通过 PostgreSQL 线协议获得驱动兼容，同时严格限定 SQL 子集。
+3. 以 Pico 线协议和 Pico SQL 建立独立、严格限定的客户端契约。
 4. 以清晰模块边界和故障注入维持 Zig 存储代码的可演进性。
 5. 保持单实例部署、资源占用与启动路径简单。
 
 SQLite 的 VFS、pager 不变量、静态 `PAGECACHE` 池和 VDBE 执行循环提供了方法参考：把平台 I/O、页缓存上限、崩溃安全假设和语句执行拆成可验证的层。其 B-Tree 页更新、多进程锁/SHM、可插拔多 VFS 注册和 rollback journal 主路径不适用于 Pico 的 LSM 与单写者模型。TigerBeetle 说明了 WAL、检查点、不可变 LSM 文件和故障注入如何组成可验证的持久化设计；其复制、共识、跨副本修复和单线程运行时均不属于 Pico v1。
 
-明确非目标：多实例复制、分片、故障转移、完整 PostgreSQL SQL、原地 B-Tree 写路径、检查点作为备份或 PITR。
+明确非目标：多实例复制、分片、故障转移、PostgreSQL 兼容、原地 B-Tree 写路径、检查点作为备份或 PITR。
 
 ## 系统上下文
 
 ```mermaid
 flowchart LR
-  client["psql / PostgreSQL 驱动"] -->|"PostgreSQL 线协议 + SQL 子集"| pico["Pico 实例"]
+  client["Pico Client\nCLI / 驱动 / 工具"] -->|"Pico 线协议 + Pico SQL"| pico["Pico Server 实例"]
   pico -->|"WAL、检查点、LSM 文件、目录元数据"| data["本地数据目录"]
   operator["部署者"] -->|"耐久级别、数据目录、端口"| pico
 ```
 
-客户端只依赖线协议和已发布的 SQL 支持矩阵；它们不依赖存储文件格式。Pico 只使用本地数据目录，不向其他实例复制状态。认证、授权和 TLS 的具体策略在单独设计前不由本架构承诺。
+Pico Client 只依赖线协议、公开错误模型和已发布的 SQL 支持矩阵；它不依赖存储文件
+格式或服务端内部模块。Pico Server 只使用本地数据目录，不向其他实例复制状态。认证、
+授权和 TLS 的具体策略在单独设计前不由本架构承诺。产品职责和发布边界见
+[Pico 产品边界](products.md)。
 
 ## 模块与所有权
 
@@ -87,7 +93,7 @@ flowchart TB
 - `storage/table` **不**知道 WAL；耐久顺序与恢复重放只在 `engine`。
 - 引入独立 `catalog` / `lsm` / `commit` 时，应把登记与持久有序集合从 `engine`/`table` 迁出，而不是再把逻辑打回单文件。
 
-`net` 不得导入 `storage`；`sql` 不得读写 WAL 或 LSM 文件；`storage` 不得了解 SQL 文本或 PostgreSQL 报文。`commit` 是修改目录、WAL 与 LSM 可见状态的唯一写入方。后台压缩可以并行准备新文件，但只能通过 `commit`/manifest 发布路径让其对新读者可见。`storage/pager` 的 `flush`/`sync` 不是用户提交；用户表主路径不得退化为无 WAL 保护的页覆盖写。
+`net` 不得导入 `storage`；`sql` 不得读写 WAL 或 LSM 文件；`storage` 不得了解 SQL 文本或 Pico 报文。`commit` 是修改目录、WAL 与 LSM 可见状态的唯一写入方。后台压缩可以并行准备新文件，但只能通过 `commit`/manifest 发布路径让其对新读者可见。`storage/pager` 的 `flush`/`sync` 不是用户提交；用户表主路径不得退化为无 WAL 保护的页覆盖写。
 
 ## 数据归属与不变量
 
@@ -140,7 +146,7 @@ sequenceDiagram
 
 ## 兼容性、可观测性与验证
 
-对外兼容边界是 PostgreSQL 线协议和公开 SQL 支持矩阵。新增 SQL 语义须先更新支持矩阵与真实客户端回归；不支持语句必须明确报错。WAL、manifest 与检查点都是内部格式：格式破坏性变化必须有版本、迁移或明确拒绝策略，绝不将新字节按旧格式解释。
+对外边界是版本化 Pico 线协议和公开 Pico SQL 支持矩阵。新增语义须先更新支持矩阵与官方 Pico 客户端回归；不支持语句必须明确报错。WAL、manifest 与检查点都是内部格式：格式破坏性变化必须有版本、迁移或明确拒绝策略，绝不将新字节按旧格式解释。当前 PG 适配层不构成兼容承诺。
 
 必须输出并测试以下信号：提交队列深度和批次大小、提交与 WAL 同步延迟、耐久级别、恢复耗时与重放记录数、WAL 大小、检查点进度、压缩积压/读写放大/空间放大、校验失败数和拒绝恢复原因。
 
@@ -148,7 +154,7 @@ sequenceDiagram
 
 1. `zig build test`：WAL 编解码、格式拒绝、完整帧损坏、末尾截断、目录与索引原子性、MVCC 可见性和 VFS 路径约束。
 2. 崩溃矩阵：在 WAL 写入、同步、LSM 文件写入、manifest 发布、检查点推进的每个故障点终止实例；重启后只能看到已确认提交的前缀。
-3. 线协议集成：`psql` 与至少一种主流 PostgreSQL 驱动执行支持矩阵中的成功和拒绝用例。
+3. 线协议集成：官方 Pico CLI 与至少一种官方 Pico 驱动执行支持矩阵中的成功和拒绝用例。
 4. 压缩压力：并发读、写和压缩下验证快照可见性、索引一致性及无过早文件回收。
 
 可执行模块边界、数据写权和初始质量门槛见 [architecture-contract.yml](architecture-contract.yml)。在 CI 引入边界检查之前，它是待实施的架构契约，而不是已自动满足的声明。
@@ -159,13 +165,14 @@ sequenceDiagram
 2. 引入目录持久化、检查点位置和内存表/不可变表的最小 LSM 路径，恢复仍只依赖“检查点 + WAL”。
 3. 将提交排序抽出为有界单写者队列，加入 group commit、写集冲突和 Read Committed 快照。
 4. 加入二级索引、manifest 原子发布、压缩与回收，再将读路径从内存表扩展为 LSM 查找。
-5. 在每个语义已验证的阶段扩展 SQL 子集和扩展查询协议。
+5. 在每个语义已验证的阶段扩展 Pico SQL 和 Pico 线协议。
 
 若单写者在已测工作负载下成为不可接受的瓶颈，应先用提交队列、WAL 同步和 LSM/压缩指标定位原因。只有确认提交排序本身是限制时，才以新 ADR 评估分片；不得把细粒度锁、跨实例协调或隐式异步耐久塞入现有路径。
 
 ## 参考材料
 
-- [ADR 0001--0007](adr/)：Pico 已接受的产品、协议、SQL、存储、并发、耐久与语言决策。
+- [ADRs](adr/)：Pico 已接受的产品、协议、SQL、存储、并发、耐久与语言决策；ADR-0009
+  取代了 ADR-0002 的对外协议选择。
 - [VFS](architecture/vfs.md)：数据目录围栏、实例锁、位置 I/O 与原子发布；对照 SQLite `sqlite3_vfs` 而收窄为单实例存储边界。
 - [Pager 与静态页缓存](architecture/pager-and-static-cache.md)：定长页 pin/驱逐与编译期缓存硬顶；对照 SQLite Pager/PCache/`PAGECACHE`，不继承 rollback journal 主路径。
 - [执行引擎（VDBE 风格）](architecture/vdbe.md)：SQL 子集到可步进执行程序的目标分层；对照 SQLite VDBE，游标与写集落在 MVCC+LSM+单写者上。

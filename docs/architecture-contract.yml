@@ -73,7 +73,7 @@ gates:
   unknown_wal_format_replayed: 0
   complete_corrupt_wal_frames_replayed: 0
   unversioned_internal_format_breaks: 0
-  real_client_protocol_suites: [psql, mainstream_postgresql_driver]
+  real_client_protocol_suites: [official_pico_cli, official_pico_driver]
 
 change_classes:
   routine:
@@ -93,8 +93,8 @@ validation:
   required_before_durable_commit_claim:
     - crash_matrix_recovery_test
     - wal_format_and_checksum_test
-    - psql_integration_test
-    - mainstream_postgresql_driver_integration_test
+    - pico_cli_integration_test
+    - pico_driver_integration_test
   required_before_lsm_release:
     - checkpoint_recovery_test
     - manifest_atomic_publication_test

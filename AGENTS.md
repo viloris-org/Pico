@@ -1,6 +1,6 @@
 # Pico — Agent Instructions
 
-Pico is a **single-node, lightweight, network-accessible OLTP database** implemented in **Zig**. Clients connect via the **PostgreSQL wire protocol** and a deliberate **SQL subset** (not full PostgreSQL).
+This repository contains **Pico Server**, a **single-node, lightweight, network-accessible OLTP database** implemented in **Zig**. **Pico Client** is a separate product; the two communicate only through a versioned **Pico wire protocol** and **Pico SQL**. Pico does not promise PostgreSQL compatibility.
 
 ## Source of truth
 
@@ -13,22 +13,23 @@ Read `CONTEXT.md` before naming public APIs, errors, docs, or config. New produc
 
 ## Product constraints (v1)
 
-From ADRs 0001–0007 — treat as hard defaults:
+From ADRs 0001 and 0004–0009 — treat as hard defaults:
 
 1. **Single-instance server**, not embedded-first, not multi-node cluster.
-2. **PostgreSQL Frontend/Backend Protocol** for wire access; protocol ≠ full SQL compatibility.
-3. **OLTP SQL subset** only; unsupported SQL must fail clearly (no silent wrong results).
-4. **LSM-style** primary storage for tables/indexes; keep logical boundary “ordered set + WAL + MVCC”.
-5. **Single-writer commit ordering** + **MVCC** reads; multi-thread OK for net/IO/compaction, not concurrent commit of write sets.
-6. **WAL first**, durable commit by default, **group commit**; looser durability must be explicit and non-default.
-7. **Zig** for the server/engine; no heavy managed runtime on the critical path.
+2. **Pico wire protocol** and **Pico SQL** are the public contracts; no PostgreSQL protocol, SQL, driver, or tool compatibility is promised.
+3. **Pico Client and Pico Server are separate products**: do not add client CLI, drivers, or developer tooling to this server repository.
+4. **OLTP SQL subset** only; unsupported SQL must fail clearly (no silent wrong results).
+5. **LSM-style** primary storage for tables/indexes; keep logical boundary “ordered set + WAL + MVCC”.
+6. **Single-writer commit ordering** + **MVCC** reads; multi-thread OK for net/IO/compaction, not concurrent commit of write sets.
+7. **WAL first**, durable commit by default, **group commit**; looser durability must be explicit and non-default.
+8. **Zig** for the server/engine; no heavy managed runtime on the critical path.
 
-Out of scope until a new ADR: multi-node consensus, full PG dialect, OLAP engine, treating checkpoint as user backup.
+Out of scope until a new ADR: multi-node consensus, PostgreSQL compatibility, OLAP engine, treating checkpoint as user backup.
 
 ## Language & terminology
 
 - Prefer Chinese domain terms from `CONTEXT.md` in product/docs discussion when the user does; code identifiers stay English.
-- Say **驱动兼容 / 线协议** or **SQL 子集**, never bare “兼容 PostgreSQL”.
+- Say **Pico 线协议** or **Pico SQL**; do not describe Pico as PostgreSQL-compatible.
 - **连接** not Session for client sessions; **争用** not “lock storm” as the product concept; **耐久级别** not raw “fsync switch” in user-facing text.
 - “安全” in product talk means crash/durability guarantees, not auth/crypto, unless explicitly about access control.
 
@@ -38,7 +39,7 @@ Out of scope until a new ADR: multi-node consensus, full PG dialect, OLAP engine
 - Keep public interfaces small; push policy and details inward.
 - Storage/txn code must stay recoverable: crash recovery is correctness, not a nicety.
 - Observability for compaction, write-path latency, durability level, and recovery is first-class—not a later bolt-on.
-- Protocol and SQL tests should include real clients where practical (`psql` and at least one mainstream PG driver), not only unit codecs.
+- Protocol and SQL tests should include the official Pico CLI/driver where practical, not only unit codecs. The current PG adapter has separate, transitional coverage only.
 
 ## Build & test (when code exists)
 
@@ -52,10 +53,10 @@ Prefer deterministic tests, fault injection, and recovery regressions over “it
 ## What not to do
 
 - Do not introduce cluster/shard/failover semantics into v1 storage or txn paths.
-- Do not expand catalog/types “for future full PG” without an ADR and support-matrix update.
+- Do not expand catalog/types to imitate PostgreSQL without an ADR and support-matrix update.
 - Do not default production durability to async/unsafe modes.
 - Do not treat checkpoint as user backup or PITR.
-- Do not invent a custom client SDK as the primary access path; wire protocol is the product surface.
+- Do not make an unofficial SDK the primary access path; the versioned Pico wire protocol is the product surface.
 
 ## Working style
 
