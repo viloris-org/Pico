@@ -16,6 +16,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, a, "--port") and i + 1 < raw_args.len) {
             i += 1;
             cfg.port = try std.fmt.parseInt(u16, raw_args[i], 10);
+        } else if (std.mem.eql(u8, a, "--pico-port") and i + 1 < raw_args.len) {
+            i += 1;
+            cfg.pico_port = try std.fmt.parseInt(u16, raw_args[i], 10);
         } else if (std.mem.eql(u8, a, "--data-dir") and i + 1 < raw_args.len) {
             i += 1;
             cfg.data_dir = raw_args[i];
@@ -45,7 +48,8 @@ fn printUsage() !void {
         \\
         \\Options:
         \\  --host <addr>       Listen address (default 127.0.0.1)
-        \\  --port <port>       Listen port (default 5433)
+        \\  --port <port>       PG protocol port (default 5433)
+        \\  --pico-port <port>  Native Pico protocol port (default 5434, 0=disable)
         \\  --data-dir <path>   Data directory (default ./data)
         \\  --no-sync           Disable WAL fsync (dev only)
         \\  -h, --help          Show help

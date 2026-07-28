@@ -4,11 +4,33 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Shared Pico wire protocol definitions (used by both server and client).
+    const clint_proto_mod = b.addModule("clint_proto", .{
+        .root_source_file = b.path("clint/proto/def.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("pico", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "clint_proto", .module = clint_proto_mod },
+        },
     });
+
+    // Zig client library module.
+    const clint_mod = b.addModule("clint", .{
+        .root_source_file = b.path("clint/zig/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "clint_proto", .module = clint_proto_mod },
+        },
+    });
+
+    // ── Server binary ──
 
     const exe = b.addExecutable(.{
         .name = "pico",
@@ -18,6 +40,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "pico", .module = mod },
+                .{ .name = "clint_proto", .module = clint_proto_mod },
             },
         }),
     });
@@ -41,6 +64,31 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_bench.step);
     if (b.args) |args| {
         run_bench.addArgs(args);
+    }
+
+    // ── CLI binary ──
+
+    const cli_exe = b.addExecutable(.{
+        .name = "pico-cli",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("clint/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "clint_proto", .module = clint_proto_mod },
+                .{ .name = "clint", .module = clint_mod },
+            },
+        }),
+    });
+
+    b.installArtifact(cli_exe);
+
+    const run_cli_step = b.step("cli", "Run Pico CLI (REPL)");
+    const run_cli = b.addRunArtifact(cli_exe);
+    run_cli_step.dependOn(&run_cli.step);
+    run_cli.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cli.addArgs(args);
     }
 
     const run_step = b.step("run", "Run Pico server");
