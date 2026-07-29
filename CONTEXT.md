@@ -1,200 +1,189 @@
 # Pico
 
-Pico 是一款用 Zig 实现的**单机、轻量、可网络访问**的 OLTP 数据库：部署简单、资源占用低、启动快；写路径在高争用下保持可预期；对公开产品提供足够的故障恢复与耐久性；对外以 Pico 线协议与 Pico SQL 构建独立生态，不承诺 PostgreSQL 兼容。
+Pico is a **lightweight, single-node, network-accessible** OLTP database built in Zig. It is easy to deploy, uses few resources, and starts quickly. Its write path remains predictable under high contention, it provides the fault recovery and durability expected of a public product, and it supports an independent ecosystem built around the Pico Wire Protocol and Pico SQL without promising PostgreSQL compatibility.
 
 ## Language
 
-### 产品与部署
+### Product and Deployment
 
-**Pico**：
-由 **Pico Server** 与 **Pico Client** 组成的数据库产品生态；两项产品通过 Pico
-线协议与 Pico SQL 协作。
-_Avoid_: 将 Pico 等同于单一二进制、引擎、内核（除非特指存储子系统）
+**Pico**:
+The database product ecosystem consisting of **Pico Server** and **Pico Client**. The two products work together through the Pico Wire Protocol and Pico SQL.
+_Avoid_: Equating Pico with a single binary, engine, or kernel (unless specifically referring to the storage subsystem)
 
-**Pico Server**：
-本仓库构建的、可独立部署的数据库服务端进程；持有数据、事务、耐久性与恢复语义。
-_Avoid_: 服务端内置客户端、数据库引擎（除非特指存储子系统）
+**Pico Server**:
+The independently deployable database server process built in this repository. It owns the data and defines transaction, durability, and recovery semantics.
+_Avoid_: Built-in client, database engine (unless specifically referring to the storage subsystem)
 
-**Pico Client**：
-独立发布的官方 CLI、驱动与开发者工具产品；不读取数据目录或依赖服务端内部模块。
-_Avoid_: Server CLI、内置驱动、服务端 SDK
+**Pico Client**:
+The independently released product that provides the official CLI, drivers, and developer tools. It does not read the data directory or depend on internal server modules.
+_Avoid_: Server CLI, built-in driver, server SDK
 
-**实例（Instance）**：
-一次正在运行的 Pico 进程及其绑定的数据目录；当前产品形态为**单机单实例**，不构成集群。
-_Avoid_: 节点（在引入复制/集群前不要用）、集群成员
+**Instance**:
+A running Pico process and its associated data directory. The current product is **single-node, single-instance** and is not a cluster.
+_Avoid_: Node (before replication/clustering is introduced), cluster member
 
-**数据目录（Data Directory）**：
-实例持久化状态所在的本地目录（含 WAL、数据文件、目录元数据等）；一个实例对应一个数据目录。
-_Avoid_: 数据库文件（暗示单一文件）、仓库
+**Data Directory**:
+The local directory containing an instance's persistent state, including the WAL, data files, and catalog metadata. Each instance corresponds to one data directory.
+_Avoid_: Database file (which implies a single file), repository
 
-### 连接与协议
+### Connections and Protocols
 
-**连接（Connection）**：
-客户端与实例之间的一条网络会话；承载认证、会话状态与请求/响应。
-_Avoid_: Session（若与「事务会话」混淆时优先用连接）、Socket（实现细节）
+**Connection**:
+A network session between a client and an instance. It carries authentication, session state, and requests and responses.
+_Avoid_: Session (prefer Connection when it could be confused with a transaction session), Socket (an implementation detail)
 
-**Pico 线协议（Pico Wire Protocol）**：
-连接上交换的、由 Pico 版本化定义的报文约定；它是 Pico 的对外接口，不承诺
-PostgreSQL Frontend/Backend Protocol 兼容。
-_Avoid_: API、RPC（除非指内部模块边界）、「PostgreSQL 兼容协议」
+**Pico Wire Protocol**:
+The versioned message contract defined by Pico and exchanged over a connection. It is Pico's external interface and does not promise compatibility with the PostgreSQL Frontend/Backend Protocol.
+_Avoid_: API, RPC (unless referring to an internal module boundary), "PostgreSQL-compatible protocol"
 
-**Pico 客户端**：
-Pico Client 产品中的官方 CLI、驱动或工具。其语言覆盖、版本策略与支持范围由
-Pico Client 单独发布，并通过兼容性矩阵声明对 Pico Server 的支持。
-_Avoid_: 驱动兼容、`psql` / libpq / pgx 兼容、专用 SDK（在未定义具体工具前）
+**Pico Client**:
+An official CLI, driver, or tool in the Pico Client product. Pico Client releases its language coverage, version policy, and support scope separately and declares its support for Pico Server through a compatibility matrix.
+_Avoid_: Driver compatibility, `psql` / libpq / pgx compatibility, dedicated SDK (until a specific tool is defined)
 
-### 数据模型
+### Data Model
 
-**数据库（Database）**：
-实例内的命名命名空间，持有一组**关系**及目录对象；客户端连接时选定当前数据库。
-_Avoid_: Schema（在未引入 PG 风格 schema 分层前不要混用）、Catalog（特指系统目录时再用）
+**Database**:
+A named namespace within an instance that holds a set of **relations** and catalog objects. A client selects the current database when connecting.
+_Avoid_: Schema (until a PG-style schema hierarchy is introduced), Catalog (use only when specifically referring to the system catalog)
 
-**关系（Relation） / 表（Table）**：
-具名的行集合，带固定列定义；用户可见的主存储对象。两词在口语中可互换，文档优先用**表**。
-_Avoid_: Collection、Bucket、Namespace（指表时）
+**Relation / Table**:
+A named set of rows with fixed column definitions. It is the primary user-visible storage object. The terms are interchangeable in informal speech, but documentation should prefer **table**.
+_Avoid_: Collection, Bucket, Namespace (when referring to a table)
 
-**行（Row）**：
-表中的一条记录；由列值组成，在 MVCC 下可对应多个**版本**。
-_Avoid_: Document、Tuple（除非讨论物理/代数层）
+**Row**:
+A record in a table composed of column values. Under MVCC, it may correspond to multiple **versions**.
+_Avoid_: Document, Tuple (unless discussing the physical or algebraic layer)
 
-**主键（Primary Key）**：
-表上唯一标识一行的键；写路径与定位更新/删除的默认依据。
-_Avoid_: ID（未指明是否为主键时）
+**Primary Key**:
+A key that uniquely identifies a row in a table. It is the default basis for locating updates and deletes on the write path.
+_Avoid_: ID (when it is not clear whether it is a primary key)
 
-**二级索引（Secondary Index）**：
-按非主键列（或表达式，若未来支持）建立的辅助访问路径；不改变表的主存储身份。
-_Avoid_: 键（单独使用时指代不明）
+**Secondary Index**:
+An auxiliary access path built on non-primary-key columns (or expressions, if supported in the future). It does not change the table's primary storage identity.
+_Avoid_: Key (when used alone and therefore ambiguous)
 
-**目录（Catalog）**：
-描述数据库、表、列、索引等对象的系统元数据；与用户表数据区分开。
-_Avoid_: Schema 定义（易与 SQL schema 混淆）
+**Catalog**:
+System metadata describing objects such as databases, tables, columns, and indexes. It is distinct from user table data.
+_Avoid_: Schema definition (which is easily confused with an SQL schema)
 
-### 查询与事务
+### Queries and Transactions
 
-**语句（Statement）**：
-客户端提交的一条 SQL 文本或其已解析形式；在连接上顺序或按协议规则执行。
-_Avoid_: 请求（太泛）、查询（仅 SELECT 时用 Query 亦可）
+**Statement**:
+An SQL text submitted by a client, or its parsed form. It is executed sequentially on a connection or according to protocol rules.
+_Avoid_: Request (too broad), Query (use Query only for SELECT when a distinction is needed)
 
-**Pico SQL**：
-Pico 有意支持的、面向 OLTP 的 SQL 方言范围；只承诺公开支持矩阵中的语句、类型和
-语义，不以 PostgreSQL SQL 为兼容目标。
-_Avoid_: PostgreSQL 兼容、PostgreSQL SQL 子集、方言全集
+**Pico SQL**:
+The intentionally supported, OLTP-oriented scope of the Pico SQL dialect. Only the statements, types, and semantics in the published support matrix are promised; PostgreSQL SQL is not the compatibility target.
+_Avoid_: PostgreSQL-compatible, PostgreSQL SQL subset, complete dialect
 
-**事务（Transaction）**：
-一组语句的原子工作单元；以 **BEGIN / COMMIT / ROLLBACK**（或自动提交单语句）界定。
-_Avoid_: 批次（batch 是写路径实现手段，不是用户事务语义）
+**Transaction**:
+An atomic unit of work consisting of a group of statements, delimited by **BEGIN / COMMIT / ROLLBACK**, or by a single autocommitted statement.
+_Avoid_: Batch (a write-path implementation technique, not user transaction semantics)
 
-**快照（Snapshot）**：
-事务在某一时刻可见的数据视图；读操作基于快照，使读不阻塞写成为可能。
-_Avoid_: 备份快照（物理备份语境需写明「备份点」）
+**Snapshot**:
+The view of data visible to a transaction at a point in time. Reads operate on snapshots, making non-blocking reads possible.
+_Avoid_: Backup snapshot (in physical backup contexts, explicitly say "backup point")
 
-**提交（Commit）**：
-事务成功结束，其写集对后续快照可见，并按当前**耐久级别**进入持久化路径。
-_Avoid_: Flush、Sync（实现动作，不是用户语义）
+**Commit**:
+The successful completion of a transaction. Its write set becomes visible to later snapshots and enters the persistence path according to the current **durability level**.
+_Avoid_: Flush, Sync (implementation actions, not user semantics)
 
-**回滚（Rollback）**：
-事务放弃写集，不产生对外可见效果。
+**Rollback**:
+A transaction abandons its write set and produces no externally visible effect.
 
-### 耐久与故障
+### Durability and Faults
 
-**耐久级别（Durability Level）**：
-实例（或会话/负载）上可配置的持久化严格程度，决定提交后在进程崩溃或机器断电场景下的保证强弱。
-_Avoid_: fsync 开关（实现旋钮，对外应映射为耐久级别）
+**Durability Level**:
+The configurable strictness of persistence for an instance, session, or workload. It determines the strength of the guarantees after commit in the event of a process crash or machine power loss.
+_Avoid_: fsync switch (an implementation control that should be mapped externally to a durability level)
 
-**WAL（Write-Ahead Log）**：
-先于数据文件写入的追加日志；崩溃恢复的依据，也是写路径的顺序落盘基础。
-_Avoid_: binlog（除非做复制对接时再引入）、redo log（可作同义内部称呼，对外统一 WAL）
+**WAL (Write-Ahead Log)**:
+An append-only log written before data files. It is the basis for crash recovery and establishes durability ordering for the write path.
+_Avoid_: binlog (unless replication integration is being discussed), redo log (acceptable as an internal synonym; use WAL consistently in external documentation)
 
-**恢复（Recovery）**：
-实例启动时根据 WAL 与检查点将状态重放到一致点的过程；必须在「可接受的启动时间」内完成。
-_Avoid_: 修复（repair，暗示损坏抢救）、重放（replay，偏实现步骤）
+**Recovery**:
+The process of bringing an instance's state to a consistent point at startup using the WAL and checkpoints. It must complete within an acceptable startup time.
+_Avoid_: Repair (which implies rescuing damaged data), replay (which emphasizes an implementation step)
 
-**检查点（Checkpoint）**：
-将已持久化进度固化到数据文件/清单，从而截断或回收旧 WAL 的过程。
-_Avoid_: 快照（与 MVCC 快照区分）、备份
+**Checkpoint**:
+The process of materializing persisted progress into data files and manifests so that old WAL can be truncated or reclaimed.
+_Avoid_: Snapshot (to distinguish it from an MVCC snapshot), backup
 
-### 并发与写路径
+### Concurrency and the Write Path
 
-**写路径（Write Path）**：
-从语句产生修改到进入 WAL/存储结构的路径；产品优先保证其在高争用下吞吐可预期、不因锁风暴崩溃。
-_Avoid_: 插入路径（只覆盖一种语句）
+**Write Path**:
+The path from a statement producing a modification to its entry in the WAL and storage structures. The product prioritizes predictable throughput under high contention and must not crash because of lock storms.
+_Avoid_: Insert path (which covers only one kind of statement)
 
-**争用（Contention）**：
-多个事务同时修改相同或相邻数据时的竞争；设计目标是**降级可预期**，而不是在热点上静默卡死。
-_Avoid_: 锁（实现机制）、冲突（可作更窄的写写冲突）
+**Contention**:
+Competition that occurs when multiple transactions modify the same or adjacent data simultaneously. The design goal is **predictable degradation**, not silent hangs on hot spots.
+_Avoid_: Lock (an implementation mechanism), conflict (usable for a narrower write-write conflict)
 
-**单写者（Single Writer）**：
-同一时刻仅一条执行流负责应用变更与提交排序的并发模型选择（见 ADR）；读者可并行。
-_Avoid_: 单线程（实现可能用多线程，但 mutate 串行化）
+**Single Writer**:
+A concurrency model in which only one execution flow applies changes and orders commits at a time (see the ADR). Readers may run in parallel.
+_Avoid_: Single-threaded (the implementation may use multiple threads while serializing mutation)
 
-### 存储文件与执行
+### Storage Files and Execution
 
-**VFS（Virtual File System）**：
-绑定一个**数据目录**的存储文件抽象：校验逻辑文件名、管理句柄生命周期、提供位置
-I/O 与同步、以及 manifest/SSTable 等的原子发布。存储上层只使用逻辑名，不拼绝对路径。
-_Avoid_: 可插拔多文件系统产品特性、把 OS 路径直接传给 WAL/LSM
+**VFS (Virtual File System)**:
+A storage-file abstraction bound to a **data directory**. It validates logical filenames, manages handle lifetimes, provides positional I/O and synchronization, and atomically publishes manifests, SSTables, and similar artifacts. The storage layer uses only logical names and does not construct absolute paths.
+_Avoid_: Pluggable multi-filesystem product feature, passing OS paths directly to WAL/LSM
 
-**页（Page）**：
-定长、按页号寻址的磁盘与缓存单位；偏移为 `page_id * page_size`。用于需要页式布局
-的文件，不是用户可见的「行」或 SQL 页。
-_Avoid_: 用「页」指代网络协议帧或结果集分页（后者说 LIMIT/OFFSET 或结果流）
+**Page**:
+A fixed-size disk and cache unit addressed by page number. Its offset is `page_id * page_size`. It is used by files requiring page-oriented layouts, not for a user-visible "row" or SQL page.
+_Avoid_: Using "page" for network protocol frames or result-set pagination (say LIMIT/OFFSET or result streams for the latter)
 
-**页管理器 / Pager**：
-在单个文件上提供页的获取、pin、脏标记、写回与截断的模块；**不**单独定义事务或
-崩溃恢复策略。
-_Avoid_: 把 Pager 等同于 SQLite 带 rollback journal 的完整 pager 子系统
+**Pager**:
+A module that provides page acquisition, pinning, dirty marking, writeback, and truncation for a single file. It does **not** define transaction or crash-recovery policy on its own.
+_Avoid_: Treating Pager as SQLite's complete pager subsystem with a rollback journal
 
-**静态页缓存（Static Page Cache）**：
-编译期（或启动期一次性）固定页框数量与大小的缓存；`acquire` 路径不为页框做通用堆
-扩容，耗尽时显式失败（如 `CacheFull`）。
-_Avoid_: 「建议 cache_size、不足再 malloc」的软限制；把缓存命中当成正确性来源
+**Static Page Cache**:
+A cache with a fixed number and size of page frames determined at compile time (or once at startup). The `acquire` path does not grow the page-frame pool using the general-purpose heap and fails explicitly when exhausted (for example, with `CacheFull`).
+_Avoid_: A soft limit that recommends `cache_size` and mallocs when insufficient; treating cache hits as a source of correctness
 
-**执行程序（Execution Program） / VDBE**：
-一条已绑定语句编译成的操作序列及其一次执行实例（寄存器、游标、程序计数器）。对
-外不承诺与 SQLite 字节码兼容；产品叙述优先说 SQL 子集的执行。
-_Avoid_: 虚拟机（易与整实例或 OS VM 混淆）、把 AST 直解释当作长期架构终点而不写边界
+**Execution Program / VDBE**:
+The sequence of operations compiled from a bound statement, together with one execution instance of that sequence (registers, cursors, and program counter). External compatibility with SQLite bytecode is not promised; product descriptions should primarily discuss execution of the SQL subset.
+_Avoid_: Virtual machine (easily confused with the whole instance or an OS VM), treating direct AST interpretation as the long-term architectural endpoint without stating the boundary
 
-**操作码（Opcode）**：
-执行程序中的单步指令；应在文档中标明是否 I/O、是否可取消点、是否只改写集。
-_Avoid_: 字节码 ABI（未单独 ADR 前不是稳定对外接口）
+**Opcode**:
+A single-step instruction in an execution program. Documentation should state whether it performs I/O, is a cancellation point, or only modifies the write set.
+_Avoid_: Bytecode ABI (not a stable external interface without a separate ADR)
 
-**游标（Cursor）**：
-执行层在某一**快照**下对表或二级索引的有序迭代/点查句柄；不暴露 SST 文件名或页号
-作为 SQL 语义。
-_Avoid_: 数据库游标声明式 SQL 语法（未支持前不要当产品特性）
+**Cursor**:
+An execution-layer handle for ordered iteration or point lookup over a table or secondary index under a particular **snapshot**. It does not expose SST filenames or page numbers as SQL semantics.
+_Avoid_: Declarative SQL cursor syntax (do not present it as a product feature before it is supported)
 
 ## Example dialogue
 
-> **开发**：当前实现能用 `psql` 连上，算 Pico 的产品兼容承诺吗？  
-> **领域**：不算。这是迁移适配层的实现状态；对外契约是版本化的 **Pico 线协议** 与
-> **Pico SQL**。适配层不得定义 SQL、类型或事务语义。
+> **Developer**: The current implementation can connect with `psql`. Does that count as a Pico product compatibility commitment?
+> **Domain**: No. That is an implementation detail of the migration adapter; the external contracts are the versioned **Pico Wire Protocol** and **Pico SQL**. The adapter must not define SQL, type, or transaction semantics.
 >
-> **开发**：两个连接同时改同一主键，算**争用**还是故障？  
-> **领域**：是**争用**。一个**事务**会**提交**，另一个按隔离规则等待或因写冲突失败；**写路径**必须保持可预期，不能整实例锁死。
+> **Developer**: If two connections modify the same primary key at the same time, is that **contention** or a fault?
+> **Domain**: It is **contention**. One **transaction** will **commit**; the other waits according to isolation rules or fails with a write conflict. The **write path** must remain predictable and must not lock up the entire instance.
 >
-> **开发**：kill -9 之后再启动，数据还在吗？  
-> **领域**：取决于**耐久级别**。默认级别下，已**提交**且进入 **WAL** 持久化路径的修改应在**恢复**后可见；未提交的**事务**视同**回滚**。
+> **Developer**: After `kill -9` and a restart, is the data still there?
+> **Domain**: It depends on the **durability level**. At the default level, modifications that were **committed** and entered the **WAL** persistence path should be visible after **recovery**; an uncommitted **transaction** is treated as **rolled back**.
 >
-> **开发**：**检查点**是不是给用户做备份用的？  
-> **领域**：不是。检查点是实例内部截断 WAL、推进持久化进度的机制。用户要的时间点副本应叫备份，并单独定义。
+> **Developer**: Is a **checkpoint** for users to make backups?
+> **Domain**: No. A checkpoint is an internal instance mechanism for truncating the WAL and advancing persistence progress. A point-in-time copy requested by a user should be called a backup and defined separately.
 >
-> **开发**：一个**实例**能当三个「库」用吗？  
-> **领域**：可以——一个实例可有多个**数据库**，每个库有自己的**表**与**目录**对象；但当前没有多个实例组成的集群语义。
+> **Developer**: Can one **instance** serve as three "databases"?
+> **Domain**: Yes, an instance can contain multiple **databases**, each with its own **tables** and **catalog** objects. However, there is currently no cluster semantics involving multiple instances.
 >
-> **开发**：存储能不能直接 `open("/var/pico/../other/wal")`？  
-> **领域**：不能。必须走 **VFS**，只用**数据目录**内的逻辑文件名；路径逃逸是错误，不是「帮你规范化」。
+> **Developer**: Can storage directly call `open("/var/pico/../other/wal")`?
+> **Domain**: No. It must go through **VFS** and use only logical filenames within the **data directory**. Path traversal is an error, not something to "normalize" for you.
 >
-> **开发**：Pager `sync` 了是不是就等于 **COMMIT** 成功？  
-> **领域**：不是。用户**提交**的耐久边界在 **WAL** 与单写者发布；Pager 只管理某个页文件的缓存写回。
+> **Developer**: Does Pager `sync` mean **COMMIT** succeeded?
+> **Domain**: No. The durability boundary of a user **commit** is WAL plus single-writer publication; Pager only manages cached writeback for a page file.
 >
-> **开发**：要不要对外兼容 SQLite 的 VDBE 字节码？  
-> **领域**：不要。内部可以有 **执行程序**／操作码，那是实现分层；对外是**线协议** + **SQL 子集**。
+> **Developer**: Should we provide external compatibility with SQLite VDBE bytecode?
+> **Domain**: No. Internally there may be an **execution program** and opcodes; that is an implementation layer. Externally, the product is the **wire protocol** plus the **SQL subset**.
 
 ## Flagged ambiguities
 
-- **Session**：协议层常与 Connection 混用。Pico 文档默认用**连接**；若指「事务边界之外的会话级状态」（时区、search_path 等），写明「会话状态」，不要单独抛一个未定义的 Session 实体。
-- **Schema**：PostgreSQL 中有 namespace 含义；Pico 在引入等价物之前，避免用 schema 指代「表结构」或「数据库」。表结构说「表定义 / 列定义」。
-- **Query**：口语可指任何语句；文档在需要区分时，Query = 只读语句，Statement = 任意语句。
-- **安全**：产品讨论里的「够安全」指**故障与耐久**（崩溃恢复、校验、耐久级别），不是访问控制/加密。认证与权限是单独能力，不要与耐久混称「安全」。
-- **VDBE**：与 SQLite 对照时可用；写入产品文档时优先**执行程序**，并声明不兼容 SQLite 字节码。
-- **Pager**：不要默认脑补成「带 journal 的 SQLite pager」；Pico 的 Pager 是静态页缓存 + 文件后端，恢复主路径仍是 WAL。
+- **Session**: Frequently mixed with Connection at the protocol layer. Pico documentation uses **Connection** by default; when referring to session-level state outside transaction boundaries (time zone, search_path, and so on), write "session state" and do not introduce an undefined Session entity by itself.
+- **Schema**: Has a namespace meaning in PostgreSQL; until Pico introduces an equivalent, avoid using schema to mean "table structure" or "database." Say "table definition / column definition" for table structure.
+- **Query**: Can mean any statement in informal speech; where documentation needs a distinction, Query means a read-only statement and Statement means any statement.
+- **Security**: In product discussions, "secure enough" means **fault and durability** (crash recovery, validation, and durability level), not access control or encryption. Authentication and authorization are separate capabilities and must not be conflated with durability as "security."
+- **VDBE**: Usable when comparing with SQLite; in product documentation, prefer **execution program** and state that SQLite bytecode is not compatible.
+- **Pager**: Do not assume it means "SQLite pager with a journal"; Pico's Pager is a static page cache plus a file backend, and the primary recovery path remains the WAL.

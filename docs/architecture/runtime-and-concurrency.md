@@ -1,190 +1,194 @@
-# 运行时、连接与并发控制
+# Runtime, Connections, and Concurrency Control
 
-## 状态与范围
+## Status and Scope
 
-本文是 Pico v1 的目标运行时设计，不表示当前 Phase 0 已实现。当前
-`src/net/server.zig` 按 `accept -> handleConnection` 顺序处理连接；它只用于
-验证当前迁移适配层的最小闭环。本文所述的并发接入、提交队列和 I/O
-调度在相应模块落地并有回归后才成为实现保证。
+This is the target Pico v1 runtime design, not a claim that Phase 0 implements it. The
+current `src/net/server.zig` handles connections in `accept -> handleConnection` order and
+exists only to validate the migration adapter's minimal working loop. Concurrent admission,
+commit queues, and I/O scheduling become implementation guarantees only after the relevant
+modules and regressions land.
 
-本设计细化 ADR-0005、ADR-0006 与 ADR-0009，不能改变其中的以下约束：
+This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 
-1. Pico 是单机单实例服务，连接通过版本化 Pico 线协议进入。
-2. SQL 是明确的 SQL 子集；协议可解析不代表语义受支持。
-3. 提交排序和已提交状态发布只有单写者可以执行；读可并行。
-4. 默认耐久级别下，提交响应要等待对应 WAL 的持久化边界。
+1. Pico is a single-machine, single-instance service entered through the versioned Pico wire protocol.
+2. SQL is an explicit subset; a parseable protocol message does not imply supported semantics.
+3. Only the single writer performs commit ordering and publication of committed state; reads may run in parallel.
+4. At the default durability level, a commit response waits for the corresponding WAL persistence boundary.
 
-版本可见性、隔离级别、提交前冲突验证与版本回收的语义由
-[并发控制契约](concurrency-control.md) 定义；本文只定义它们在连接、队列与
-I/O 运行时中的所有权和调度边界。
+Version visibility, isolation levels, pre-commit conflict validation, and version reclamation
+are defined by the [concurrency control contract](concurrency-control.md). This document
+defines their ownership and scheduling boundaries in the connection, queue, and I/O runtime.
 
-## 外部参考及适用性
+## External References and Applicability
 
-| 参考 | 已核对的机制 | Pico 的采用方式 | 明确不采用 |
+| Reference | Mechanisms reviewed | Pico's approach | Explicitly not adopted |
 | --- | --- | --- | --- |
-| [DuckDB `ClientContext`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/include/duckdb/main/client_context.hpp)、[`ConnectionManager`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/include/duckdb/main/connection_manager.hpp) 与 [`connection_manager.cpp`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/main/connection_manager.cpp) | 每个客户端上下文独立持有短生命周期执行状态；实例集中登记连接；中断状态独立于执行锁；销毁时先结束事务和查询，再清理上下文 | 每个 Pico **连接**拥有协议状态、取消状态、会话状态、输入/输出配额；实例运行时拥有连接登记和准入；取消仅标记当前语句，执行路径在可取消点观察它 | DuckDB 在此检出版本没有可复用的数据库网络服务层；不把嵌入式 API 的线程模型、嵌入式 `Connection` API 或其事务策略当成 Pico 的线协议模型 |
-| [TigerBeetle Linux I/O](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/src/io/linux.zig) | 提交请求与提取完成事件分离；完成回调脱离内核队列运行；队列满时先推进完成事件；记录内核和回调耗时 | I/O 驱动只收集完成事件，运行时在受控调度点执行回调；有界队列满时暂停读取或拒绝准入，绝不无界堆积 | io_uring、单线程运行时及 TigerBeetle 的复制/共识不是 Pico 的产品约束；平台后端可以不同 |
-| [PostgreSQL 事务 README](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/src/backend/access/transam/README) | 快照建立与事务退出必须有一致的提交顺序，否则可能看见不一致版本组合 | 快照水位与提交发布由单写者的提交序号建立全序；读路径只在稳定水位后解释 MVCC 可见性 | 行/表重量锁、死锁检测、`ProcArrayLock`、SSI 和多进程共享内存锁管理不进入 Pico v1 |
+| [DuckDB `ClientContext`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/include/duckdb/main/client_context.hpp), [`ConnectionManager`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/include/duckdb/main/connection_manager.hpp), and [`connection_manager.cpp`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/main/connection_manager.cpp) | Each client context owns short-lived execution state; the instance registers connections centrally; interrupt state is separate from execution locks; destruction ends transactions and queries before clearing context | Each Pico **connection** owns protocol, cancellation, session, and input/output quota state. The runtime owns registration and admission. Cancellation marks only the current statement and is observed at cancellation points | The checked DuckDB revision has no reusable database network-service layer. Pico does not treat its embedded API thread model, `Connection` API, or transaction policy as the Pico wire-protocol model |
+| [TigerBeetle Linux I/O](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/src/io/linux.zig) | Submission and completion extraction are separate; callbacks run outside the kernel queue; completions advance first when queues are full; kernel and callback time are measured | The I/O driver collects completions only; the runtime invokes callbacks at controlled scheduling points. Full bounded queues pause reads or reject admission and never grow without bound | io_uring, a single-threaded runtime, and TigerBeetle replication/consensus are not Pico product constraints; platform backends may differ |
+| [PostgreSQL transaction README](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/src/backend/access/transam/README) | Snapshot creation and transaction exit need a consistent commit order or readers may see inconsistent version combinations | A single-writer commit sequence establishes total order for snapshot watermarks and publication; readers interpret MVCC visibility only at a stable watermark | Heavy row/table locks, deadlock detection, `ProcArrayLock`, SSI, and multi-process shared-memory lock management |
 
-PostgreSQL 的并发控制是问题定义而不是代码模板：它需要在多后端并发提交
-下以锁保护活动事务数组。Pico 的单写者使“发布提交”和“推进可见水位”天然
-串行，但不免除快照与回收边界的证明责任。
+PostgreSQL concurrency control is a problem definition, not a code template: it protects an
+active-transaction array with locks during concurrent commits. Pico's single writer makes
+commit publication and watermark advancement serial, but snapshot and reclamation boundaries
+still require proof.
 
-## 责任边界
+## Responsibility Boundaries
 
 ```mermaid
 flowchart LR
-  client["Pico 客户端"] --> reactor["net/reactor\n接收、发送、协议帧、背压"]
-  reactor --> connection["net/connection\n连接状态与语句顺序"]
-  connection --> sql["sql + txn\n解析、执行、读快照、写集"]
-  sql -->|"有界提交请求"| commit["commit\n唯一提交排序与发布"]
-  commit --> wal["WAL\n追加与耐久边界"]
-  commit --> storage["目录与 LSM\n应用已提交变更"]
-  storage --> completion["runtime/completion\n完成通知"]
+  client["Pico client"] --> reactor["net/reactor\nreceive, send, frames, backpressure"]
+  reactor --> connection["net/connection\nconnection state and statement order"]
+  connection --> sql["sql + txn\nparse, execute, snapshots, write sets"]
+  sql -->|"bounded commit request"| commit["commit\ncommit order and publication"]
+  commit --> wal["WAL\nappend and durability boundary"]
+  commit --> storage["catalog and LSM\napply committed changes"]
+  storage --> completion["runtime/completion\ncompletion notification"]
   completion --> reactor
 ```
 
-| 所有者 | 负责 | 不负责 |
+| Owner | Responsible for | Not responsible for |
 | --- | --- | --- |
-| `net/reactor` | 监听、非阻塞读取/发送、连接准入、帧大小限制、读写背压、I/O 完成事件 | SQL 解析、事务状态、WAL 或存储文件 |
-| `net/connection` | 单连接协议状态机、同一连接内语句顺序、输出帧次序、取消请求路由 | 全局提交顺序、其他连接的执行状态 |
-| `sql` / `txn` | SQL 子集判定、语句级快照、写集和冲突候选 | 直接写 WAL、直接发布可见数据 |
-| `commit` | 接受有界提交请求、分配提交序号、WAL 持久化、原子发布、完成结果 | socket I/O、慢客户端的输出缓存 |
-| `runtime/completion` | 把完成结果转交到连接所属执行上下文 | 在内核完成队列内递归执行业务回调 |
+| `net/reactor` | Listening, nonblocking reads/writes, admission, frame limits, backpressure, and I/O completion events | SQL parsing, transaction state, WAL, or storage files |
+| `net/connection` | Per-connection protocol state, statement order, output-frame order, and cancellation routing | Global commit order or other connections' execution state |
+| `sql` / `txn` | SQL-subset decisions, statement snapshots, write sets, and conflict candidates | Writing WAL or publishing visible data directly |
+| `commit` | Accepting bounded requests, assigning commit sequences, WAL persistence, atomic publication, and completion results | Socket I/O and slow-client output buffers |
+| `runtime/completion` | Delivering completion results to the connection's execution context | Recursively running business callbacks inside the kernel completion queue |
 
-`net` 不得导入 `storage`。连接的慢读者不得占住 `commit`，且 `commit` 不得
-同步等待网络写出；它只返回可缓冲的完成结果或在连接已关闭时丢弃结果。
+`net` must not import `storage`. A slow reader must not hold `commit`, and `commit` must not
+wait synchronously for network output; it returns a bufferable completion or discards it when
+the connection has closed.
 
-## 连接身份、登记与关闭
+## Connection Identity, Registration, and Shutdown
 
-运行时为每条已完成启动的连接分配单调递增的内部连接标识，并将其登记在实例的
-有界连接表中。该表是准入、观测和取消路由的唯一事实来源，不是事务、快照或
-执行结果的所有者。注册表条目至少含内部标识、协议状态、当前语句代次、取消标记
-和对连接执行上下文的弱引用；不能持有 socket 写缓冲或结果集的所有权。这样，慢
-读者或已关闭连接不会因注册表意外延长其资源寿命，这一点直接借鉴 DuckDB 对已失效
-弱引用的清理方式。
+After startup, the runtime assigns each connection a monotonically increasing internal ID and
+registers it in a bounded instance connection table. This table is the source of truth for
+admission, observability, and cancellation routing, not the owner of transactions, snapshots,
+or results. An entry contains at least the internal ID, protocol state, current statement
+generation, cancellation flag, and a weak reference to the connection execution context. It
+must not own socket write buffers or result sets, so slow or closed readers cannot be kept alive
+by the registry.
 
-Pico 线协议的取消凭据由协议规范定义，不能使用固定值。启动成功后，Pico 为连接生成
-不可预测、在连接生命周期内唯一的取消凭据，并将其映射到内部连接标识。收到取消请求
-时，reactor 只做常数时间查找和取消标记，不创建 SQL 执行上下文、不写入原连接、也不
-等待语句结束；找不到、凭据不匹配、连接已关闭或语句代次已结束时以 Pico 协议规定的
-无副作用方式结束请求。凭据绝不能在旧登记项完全撤销前复用，否则延迟到达的取消请求
-可能取消无关连接。
+Cancellation credentials are defined by the Pico wire protocol and must not use a fixed value.
+After startup, Pico generates an unpredictable credential unique within the connection
+lifetime and maps it to the internal connection ID. A cancellation request performs only a
+constant-time lookup and marks cancellation: it does not create an execution context, write
+the original connection, or wait for the statement. Missing, mismatched, closed, or expired
+requests finish with the protocol-defined no-op behavior. Credentials must not be reused until
+the old registration is fully revoked.
 
-关闭按以下顺序发生：停止读取新帧；标记当前可取消语句；让执行路径释放读快照、
-写集和结果资源；撤销取消凭据和连接登记；丢弃尚未送出的输出并关闭传输。对显式
-事务，断连等价于回滚未提交写集；已经跨过不可逆提交点的事务继续由单写者完成，
-其完成结果因没有连接而丢弃。关闭不能同步等待 socket 排空，也不能让连接登记在
-`commit` 完成后才有机会回收。
+Shutdown stops new frames, marks the current cancellable statement, lets execution release
+snapshots/write sets/results, revokes the credential and registration, discards unsent output,
+and closes the transport. Disconnecting an explicit transaction rolls back its uncommitted
+write set. A transaction past the irreversible commit point still completes in the single
+writer; its result is discarded because the connection is gone. Shutdown must not synchronously
+drain the socket or wait for `commit` before reclaiming the registration.
 
-### 取消与语句代次
+### Cancellation and Statement Generations
 
-取消是“请求停止当前语句”的协作信号，不是回滚已提交事务、更改提交顺序或关闭
-实例。每次从 `ready` 进入 `executing` 时递增语句代次，并清除该代次的取消标记；
-解析、扫描、结果流送、提交队列等待和 WAL 同步前的执行路径必须在有界工作单元间
-检查该标记。检查命中后：
+Cancellation is a cooperative request to stop the current statement, not a rollback of a
+committed transaction, a change to commit order, or instance shutdown. Increment the statement
+generation on each `ready -> executing` transition and clear its flag. Parsing, scanning,
+result streaming, commit-queue waits, and pre-WAL-sync execution must inspect the flag between
+bounded work units.
 
-1. 尚未进入 `commit` 的语句丢弃其局部结果；自动提交语句不产生提交。
-2. 显式事务中的可取消语句报错，但事务是否进入失败状态必须由已发布 SQL 子集的
-   事务规则定义，不能由 reactor 猜测。
-3. 已入提交队列但尚未分配提交序号的请求撤销；已分配序号但未写入 WAL 的请求由
-   单写者以确定方式终止，不能留下序号可见性空洞。
-4. 完整提交记录进入 WAL 后，取消不再能把提交改为未提交。单写者完成发布，再将
-   对该连接的成功结果丢弃或以协议错误报告，取决于连接是否仍存活。
+1. Before `commit`, discard local results; an autocommit statement produces no commit.
+2. A cancellable statement in an explicit transaction reports an error, while transaction-failure semantics come from the published SQL subset rules, not reactor guesses.
+3. Withdraw requests queued without a commit sequence. Requests with a sequence but no WAL write terminate deterministically without a visibility hole.
+4. Once a complete commit record is in WAL, cancellation cannot make it uncommitted. The single writer publishes it and discards or reports the result depending on connection liveness.
 
-最后一条与 DuckDB 在不可逆操作后抑制中断的边界相同，但 Pico 的不可逆点由
-“完整提交记录达到所选耐久级别”定义。取消不会抢占 WAL 同步、manifest 发布或恢复；
-这些位置只允许完成或以明确的实例级故障终止，不能以半完成状态返回连接错误。
+The irreversible point is the complete commit record reaching the selected durability level.
+Cancellation cannot preempt WAL sync, manifest publication, or recovery; those operations
+finish or terminate with an explicit instance-level failure.
 
-## 连接和 I/O 调度
+## Connection and I/O Scheduling
 
-每条连接按下列状态推进：`accepting -> startup -> authenticating -> ready ->
-executing -> ready -> closing -> closed`。Phase 0 的无认证实现将
-`authenticating` 直接转为 `ready`，但状态仍须保留，避免将认证加进协议回调的
-隐式分支。`executing` 表示已有语句正在执行或等待提交；同一连接中的响应仍按协议
-次序发送。Pico 线协议中的事务状态只能由 `txn` 给出；`net` 不得根据最后一条报文
-自行推断。
+Connections progress through `accepting -> startup -> authenticating -> ready -> executing ->
+ready -> closing -> closed`. Phase 0 maps `authenticating` directly to `ready`, but keeps the
+state to avoid an implicit authentication branch in protocol callbacks. `executing` means a
+statement is running or waiting for commit; responses on one connection remain in protocol
+order. Only `txn` supplies wire-protocol transaction state; `net` must not infer it from the
+last message.
 
-错误有明确作用域：长度、格式、消息顺序或启动阶段违规是协议错误，发送可行的
-错误帧后关闭连接；不支持的 Pico SQL、绑定或执行错误只终结当前语句，并按协议回到
-可接收下一语句的状态；传输 EOF 直接走关闭清理，不尝试发送错误。批处理或预编译等
-协议扩展必须定义明确的错误恢复状态和恢复帧；该状态机不能散落在 socket 回调里。
+Length, format, message-order, and startup violations are protocol errors: send a feasible
+error frame and close. Unsupported Pico SQL, binding, and execution errors end only the current
+statement and return to the protocol's next-statement state. Transport EOF performs shutdown
+cleanup without attempting an error. Protocol extensions such as batching or prepared queries
+must define recovery states and frames explicitly rather than scattering state through socket
+callbacks.
 
-每个运行时 tick 必须按以下顺序工作：
+Each runtime tick:
 
-1. 向操作系统提交已排队的读、写、accept 和文件 I/O。
-2. 取走已完成事件并只记录其结果，避免在内核完成队列遍历中提交新 I/O。
-3. 在固定预算内运行完成回调；回调可以排队新工作，但不能递归驱动 I/O。
-4. 再提交回调产生的新 I/O，随后让出给下一批连接和提交任务。
+1. Submits queued reads, writes, accepts, and file I/O to the operating system.
+2. Extracts completed events and records only their results; it does not submit new I/O while traversing the kernel completion queue.
+3. Runs completion callbacks within a fixed budget. Callbacks may enqueue work but cannot recursively drive I/O.
+4. Submits callback-produced I/O, then yields to the next connections and commit tasks.
 
-这保留 TigerBeetle 避免递归、无界调用栈与不清晰提交时机的优点，同时不把
-某一种内核 API 固化为架构要求。运行时必须维护独立的网络、磁盘和提交队列；
-不得让磁盘完成风暴饿死网络读取，也不得让网络写出抢占 WAL 持久化。
+The runtime keeps separate network, disk, and commit queues. Disk completion storms must not
+starve network reads, and network output must not preempt WAL persistence. Operation categories,
+capacity reservations, connection fairness, tick budgets, backpressure, completion lifetimes,
+and critical-I/O failures are defined by the [I/O scheduling contract](io-scheduling.md).
 
-操作类别、关键容量保留、连接级公平、tick 预算、背压传播、完成对象生命周期和
-关键 I/O 故障处理，由 [I/O 调度契约](io-scheduling.md) 定义。该契约是本文这段
-“独立队列”要求的唯一细化来源；连接状态机不自行决定 I/O 优先级或重试策略。
+Queues and buffers are bounded deployment resources:
 
-队列和缓冲均为有界资源，初始阈值是部署配置而非协议常量：
-
-| 资源 | 饱和动作 | 禁止行为 |
+| Resource | Saturation action | Forbidden behavior |
 | --- | --- | --- |
-| 连接数 | 停止 accept 或快速拒绝新连接 | 以无界连接表换取可用性假象 |
-| 单连接输入帧 | 停止该连接读取；超出最大报文大小返回协议错误并关闭 | 将未验证长度分配给解析器 |
-| 单连接输出 | 暂停产生更多可流式结果的读取；超过硬上限取消该连接的未完成语句并关闭 | 把慢客户端的结果放入全局无界队列 |
-| 提交请求 | 暂停对应连接的下一条写语句，并计量等待时间 | 绕开单写者直接修改存储 |
-| 后台 I/O / 压缩 | 降低压缩并发度或延后任务；保留恢复和 WAL 的容量 | 以丢弃已确认提交为代价释放队列 |
+| Connections | Stop `accept` or quickly reject new connections | Pretend availability by using an unbounded registry |
+| Per-connection input frame | Stop reading that connection; oversized messages return a protocol error and close | Allocate based on an unvalidated length |
+| Per-connection output | Pause reads that produce more streamable results; over the hard limit cancel the unfinished statement and close | Put slow-client results in a global unbounded queue |
+| Commit requests | Pause the connection's next write statement and measure wait time | Modify storage around the single writer |
+| Background I/O/compaction | Reduce compaction concurrency or defer work while reserving recovery/WAL capacity | Free capacity by dropping confirmed commits |
 
-协议帧在长度字段通过最大值校验前不得分配。当前实现已有启动帧 1 MiB、普通
-帧 16 MiB 的临时上限；在引入配置后，文档、实现和协议回归必须使用同一命名
-配置，并验证长度溢出、截断帧、半关闭和慢读者。
+Do not allocate a protocol frame before validating its length against the maximum. The current
+temporary limits are 1 MiB for startup frames and 16 MiB for ordinary frames; once configurable,
+the document, implementation, and protocol regressions must use one configuration name and
+cover overflow, truncated frames, half-close, and slow readers.
 
-## 提交、快照与争用
+## Commit, Snapshots, and Contention
 
-一次写事务的事实顺序是：构造写集 -> 进入提交队列 -> 单写者分配连续提交序号
--> 追加 WAL -> 达到所选耐久级别 -> 应用目录、表和索引变更 -> 原子推进已发布
-提交水位 -> 唤醒等待连接。客户端只能在最后一步后收到成功响应。
+The sequence for a write transaction is: construct write set -> enter commit queue -> assign
+consecutive commit sequence in the single writer -> append WAL -> reach the selected durability
+level -> apply catalog/table/index changes -> atomically advance the published watermark ->
+wake waiting connections. A client receives success only after the final step.
 
-读语句在开始时取得已发布提交水位，并用它和事务本地状态判定版本可见性。单写
-者必须保证不会在该水位前后拆开一次提交的表、目录或二级索引效果。事务结束、
-快照建立和文件回收必须以同一个提交序号域协调：
+A read obtains the published watermark at start and uses it with local transaction state to
+decide visibility. The single writer must not split one commit's table, catalog, or secondary
+index effects around that watermark. Transaction end, snapshot creation, and file reclamation
+share the same commit-sequence domain:
 
-1. 快照只引用已发布水位及其之前的完整提交。
-2. 写写争用在单写者处按已发布状态重新验证；冲突事务明确失败或按已发布策略等待，不能静默覆盖。
-3. 活跃快照登记其最小所需提交序号；压缩和回收只能删除严格早于该下界的版本或文件。
-4. 未提交写集和连接状态在崩溃后丢弃；恢复只重放完整、校验通过且已提交的 WAL 记录。
+1. Snapshots reference only complete commits at or before the published watermark.
+2. The single writer revalidates write-write contention against published state; conflicts fail explicitly or wait under a published policy, never overwrite silently.
+3. Active snapshots register their minimum required sequence; compaction/reclamation deletes only versions/files strictly below that lower bound.
+4. Uncommitted write sets and connection state are discarded after a crash; recovery replays only complete, verified, committed WAL records.
 
-这与 PostgreSQL “快照不能夹在相互依赖的事务退出之间”的要求等价，但实现更小：
-Pico 不维护多进程活动事务数组，也不需要把普通 DML 放入重量锁等待图。DDL、
-取消、事务隔离级别和扩展查询在落地前仍需要各自的冲突与状态转换规则。
+This is equivalent to PostgreSQL's requirement that a snapshot not fall between dependent
+transaction exits, but with a smaller implementation: Pico has no multi-process active-transaction
+array and no heavy-lock wait graph for ordinary DML. DDL, cancellation, isolation levels, and
+extended queries still need their own conflict and state-transition rules.
 
-## 可观测性与验收
+## Observability and Acceptance
 
-运行时至少输出：连接数和拒绝数、连接状态迁移、每个队列的当前/峰值深度、每连接
-输入输出水位、帧拒绝原因、取消请求的命中/失配/已结束计数及从标记到观察的延迟、
-I/O 提交/完成延迟、回调耗时、提交排队/批次/WAL 同步延迟、快照存活时间、冲突
-结果、压缩等待及最老快照水位。所有指标都应带耐久级别，避免把不同保证下的延迟
-混为一个数字；连接标识和取消凭据不得作为日志或指标标签输出。
+At minimum emit connection and rejection counts, state transitions, current/peak queue depth,
+per-connection input/output watermarks, frame rejection reasons, cancellation hit/mismatch/
+expired counts and mark-to-observe latency, I/O submit/complete latency, callback duration,
+commit queue/batch/WAL-sync latency, snapshot lifetime, conflict results, compaction wait, and
+the oldest snapshot watermark. Every metric carries the durability level; connection IDs and
+cancellation credentials must not be metric or log labels.
 
-实施每一阶段前至少新增对应回归：
+Required regressions include slow readers, half-closes, oversized frames, and cancellation
+across multiple connections; reentrant completion callbacks without recursive scheduling,
+counter imbalance, or starvation; snapshot-correct parallel reads; deterministic same-key
+conflicts; crash injection at WAL append, sync, publication, and reclamation; official-client
+cancellation with invalid credentials; and cleanup of uncommitted writes and registrations
+after disconnect.
 
-1. 多连接下慢读者、半关闭、超长帧和连接取消不阻塞其他连接或提交。
-2. I/O 回调可重入压力下不存在递归调度、队列计数失衡或饥饿；满队列行为可观察。
-3. 并行读与连续提交下，每个结果只含其快照水位允许的版本。
-4. 同一主键的并发写在提交排序点产生确定的成功/冲突结果。
-5. 在 WAL 追加、同步、发布水位和回收边界注入崩溃后，恢复只暴露已确认提交前缀。
-6. 使用官方 Pico 客户端发出取消请求：错误凭据和已关闭连接不会影响其他连接；队列
-   等待中的语句可取消；WAL 耐久边界后的取消不能撤销已提交效果。
-7. 断开有显式事务的连接后未提交写集不可见；断开等待网络写出的连接不阻塞其他
-   连接，且连接登记和取消凭据均被回收。
+## Evolution Order
 
-## 演进顺序
+1. Define Pico wire-protocol startup, state, error, and cancellation semantics, including frame limits and official-client regressions.
+2. Extract the `net/connection` state machine and add connection/buffer limits; execution may remain single-task.
+3. Add the runtime reactor and bounded task queues; parallelize network I/O and read-only statements without changing commit.
+4. Extract the `commit` single-writer queue and commit sequence; connect WAL group commit and MVCC snapshot registration.
+5. Enable background compaction only after regressions cover snapshot lower bounds, manifest publication, and file reclamation.
 
-1. 定义 Pico 线协议的启动、状态、错误和取消语义，补齐帧限制与官方客户端协议回归。
-2. 抽取 `net/connection` 状态机并引入连接登记、连接/缓冲上限；执行仍可单任务。
-3. 引入运行时 reactor 与有界任务队列，先并行网络 I/O 和只读语句，不改变提交路径。
-4. 抽取 `commit` 单写者队列和提交序号，接入 WAL group commit 与 MVCC 快照登记。
-5. 在快照下界、manifest 发布和文件回收均有故障回归后，再允许后台压缩并发。
-
-任何试图把多写者、行锁等待图、跨实例协调或默认异步耐久引入上述路径的改动，
-均需要新 ADR；它们会改变既有产品约束，而不是普通调度优化。
+Any change that introduces multiple writers, row-lock wait graphs, cross-instance coordination,
+or default asynchronous durability requires a new ADR because it changes product constraints,
+not merely scheduling.

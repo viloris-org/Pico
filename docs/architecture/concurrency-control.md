@@ -1,171 +1,113 @@
-# 并发控制契约
+# Concurrency Control Contract
 
-## 状态与范围
+## Status and Scope
 
-本文细化 ADR-0005 的“单写者提交排序 + MVCC 读”，定义 Pico 在实现事务、
-版本化存储和后台回收时必须满足的语义边界。它是目标架构，不表示 Phase 0
-已经实现这些能力。
+This document refines ADR-0005's "single-writer commit ordering + MVCC reads" and defines the semantic boundaries Pico must satisfy when implementing transactions, versioned storage, and background reclamation. It describes the target architecture; it does not claim that Phase 0 already provides these capabilities.
 
-当前 Phase 0 中，`BEGIN`、`COMMIT` 和 `ROLLBACK` 只是线协议/SQL 子集的
-兼容标签；每条 DML 语句直接修改内存表并写入 WAL，尚没有跨语句写集、MVCC
-版本或事务隔离保证。对当前行为的唯一承诺以 [README](../../README.md) 的
-支持矩阵为准。实现进入本文所述阶段前，不能把这些标签宣传为事务支持。
+In Phase 0, `BEGIN`, `COMMIT`, and `ROLLBACK` are compatibility labels in the wire protocol/SQL subset. Each DML statement directly modifies an in-memory table and writes to the WAL; there are no cross-statement write sets, MVCC versions, or transaction-isolation guarantees yet. The only promise about current behavior is the support matrix in [README](../../README.md). Until the implementation reaches the phase described here, these labels must not be advertised as transaction support.
 
-本文只约束单个 Pico **实例**内的并发。它不定义跨实例协调、复制、分布式
-事务、用户可见的锁语法、`SAVEPOINT`、`SELECT FOR UPDATE` 或完整 PostgreSQL
-隔离级别。线协议能够传输相关 SQL，不等于 Pico 的 SQL 子集支持该语义。
+This document constrains concurrency within a single Pico **instance**. It does not define cross-instance coordination, replication, distributed transactions, user-visible lock syntax, `SAVEPOINT`, `SELECT FOR UPDATE`, or complete PostgreSQL isolation levels. The wire protocol's ability to carry related SQL does not mean that the Pico SQL subset supports its semantics.
 
-## 设计结论
+## Design Conclusions
 
-Pico 采用 MVCC，使读操作只解释稳定版本而不等待写路径；写事务先在连接的
-私有写集中执行，在唯一的提交排序点重新验证后发布。单写者消除了多个提交者
-同时改变已提交状态的可能，但**不**自动消除基于旧快照形成写集的争用；因此，
-提交前验证是正确性边界，不能被“已经串行进入队列”替代。
+Pico uses MVCC so readers see only stable versions without waiting on the write path. A write transaction first operates on the connection's private write set, then is revalidated and published at the sole commit-ordering point. A single writer prevents multiple committers from changing committed state simultaneously, but it does **not** automatically eliminate contention between write sets formed from old snapshots. Pre-commit validation is therefore a correctness boundary; serially queueing requests is not enough.
 
-借鉴 PostgreSQL 的不是其多后端锁管理，而是其快照一致性要求：若一个已发布
-提交依赖另一已发布提交，任一快照都不能只看见前者而看不见后者。PostgreSQL
-为此以 `ProcArrayLock` 协调快照与事务退出；Pico 以单写者发布提交水位，避免
-活动事务数组和重量锁，但仍须维护相同的可见性闭包。
+Pico borrows from PostgreSQL its snapshot-consistency requirement, not its multi-backend lock management: if one published commit depends on another published commit, no snapshot may see the former without seeing the latter. PostgreSQL coordinates snapshot acquisition and transaction exit with `ProcArrayLock`; Pico avoids an active-transaction array and heavyweight locks by publishing a commit watermark through the single writer while preserving the same visibility closure.
 
-## 时间与版本模型
+## Time and Version Model
 
-### 提交序号
+### Commit Sequence Numbers
 
-`commit_seq` 是单调递增、只由单写者分配的 64 位提交序号。它不是连接标识、
-WAL 字节位置、物理时间，也不在事务开始时分配。一个成功提交只占用一个连续
-序号；同一事务的目录、表、二级索引和删除标记共享该序号。
+`commit_seq` is a monotonically increasing 64-bit commit sequence number allocated only by the single writer. It is not a connection identifier, a WAL byte position, or physical time, and it is not allocated when a transaction begins. Each successful commit consumes one contiguous sequence number; the catalog, tables, secondary indexes, and deletion markers for one transaction share that number.
 
-运行时维护原子读取的 `published_commit_seq`。它只能在下列操作全部成功后从
-`n - 1` 推进为 `n`：
+The runtime maintains atomically readable `published_commit_seq`. It may advance from `n - 1` to `n` only after all of the following have succeeded:
 
-1. 写集已经过冲突和约束验证。
-2. 包含完整写集和提交意图的 WAL 记录已追加，并达到该请求的耐久级别。
-3. 目录、表和二级索引的版本已经可被读取路径定位。
-4. 内存中的版本/索引发布对并行读者是原子的。
+1. The write set has passed conflict and constraint validation.
+2. A WAL record containing the complete write set and commit intent has been appended and has reached the request's durability level.
+3. The catalog, table, and secondary-index versions can be located by the read path.
+4. The in-memory version/index publication is atomic to concurrent readers.
 
-成功响应只能在第 4 步之后发送。任一步失败时，`published_commit_seq` 不得
-前进，也不得留下读者可见的半提交效果。允许为失败或取消的排队请求消耗内部
-队列位置，但不得制造可见提交序号空洞。
+The success response may be sent only after step 4. If any step fails, `published_commit_seq` must not advance and no reader-visible partial commit may remain. Failed or cancelled queued requests may consume internal queue positions, but they must not create visible gaps in commit sequence numbers.
 
-### 版本与可见性
+### Versions and Visibility
 
-每个持久行版本至少有不可变的逻辑主键、创建提交序号和可选删除提交序号；
-`UPDATE` 创建新版本并结束旧版本的可见区间，`DELETE` 只结束旧版本的可见区间。
-实现可以把这些字段编码在 LSM 键、值或旁路版本元数据中，但不能把物理文件
-顺序当作可见性规则。
+Each persistent row version has at least an immutable logical primary key, a creation commit sequence number, and an optional deletion commit sequence number. `UPDATE` creates a new version and ends the old version's visibility interval; `DELETE` only ends the old version's visibility interval. An implementation may encode these fields in an LSM key, value, or sidecar version metadata, but it must not use physical file order to determine visibility.
 
-对不含本地修改的版本 `v`，快照水位 `s` 下的可见谓词为：
+For a version `v` without local modifications, the visibility predicate at snapshot watermark `s` is:
 
 ```
 visible(v, s) = v.created_seq <= s
              and (v.deleted_seq is absent or s < v.deleted_seq)
 ```
 
-读取还必须合并本事务私有写集：本事务插入/更新后的版本对自己可见，本事务
-删除的版本对自己不可见，即使事务尚未提交。其他连接永远不能读取私有写集。
-因此未提交写集既不能进入共享 memtable/LSM 的读路径，也不能进入可被其他
-连接解释的目录或二级索引。
+Reads must also merge the transaction's private write set: versions inserted or updated by the transaction are visible to itself, and versions deleted by it are invisible to itself even before the transaction commits. Other connections can never read a private write set. Consequently, an uncommitted write set must enter neither the shared memtable/LSM read path nor catalog or secondary-index state visible to other connections.
 
-一个语句取得快照时，先读取已发布水位 `s`，然后只解释 `s` 及之前的完整提交。
-单写者不得先推进水位再发布某个受影响的表或索引，也不得先发布版本再推进水位。
-读者不需要持有提交队列锁；它们只需要取得稳定水位并按上述谓词过滤版本。
+When a statement takes a snapshot, it first reads the published watermark `s`, then interprets only complete commits at or before `s`. The single writer must not advance the watermark before publishing an affected table or index, nor publish a version before advancing the watermark. Readers do not need the commit-queue lock; they only need a stable watermark and the visibility predicate above.
 
-## 事务、语句与隔离
+## Transactions, Statements, and Isolation
 
-目标实现的事务状态为：
+The target transaction states are:
 
 ```mermaid
 stateDiagram-v2
   [*] --> idle
-  idle --> active: BEGIN 或自动提交语句
-  active --> active: 成功语句
-  active --> failed: 语句错误或冲突
-  active --> commit_wait: COMMIT 入队
-  commit_wait --> idle: 已发布或提交失败
+  idle --> active: BEGIN or autocommit statement
+  active --> active: successful statement
+  active --> failed: statement error or conflict
+  active --> commit_wait: COMMIT queued
+  commit_wait --> idle: published or commit failed
   failed --> idle: ROLLBACK
-  idle --> [*]: 连接关闭
+  idle --> [*]: connection closed
 ```
 
-自动提交语句拥有一个临时事务，成功后经 `commit_wait` 回到 `idle`；失败时丢弃
-写集。显式事务在 `active` 中累积私有写集。发生执行错误或提交冲突后进入
-`failed`，除 `ROLLBACK` 外的 SQL 语句必须被拒绝，不能悄悄继续使用部分写集。
-连接关闭等价于对尚未跨过不可逆提交点的事务执行 `ROLLBACK`。
+An autocommit statement owns a temporary transaction and returns to `idle` through `commit_wait` after success; on failure it discards its write set. An explicit transaction accumulates a private write set in `active`. After an execution error or commit conflict it enters `failed`; every SQL statement other than `ROLLBACK` must be rejected rather than silently continuing with a partial write set. Closing a connection is equivalent to rolling back any transaction that has not crossed the irreversible commit point.
 
-初始可交付的隔离级别是 **Read Committed**：每条语句在开始时取得新的快照水位，
-并总能看见本事务较早语句的私有修改。它禁止脏读，但同一显式事务中两条
-`SELECT` 可以看见其他事务之间新提交的结果。Pico 不接受 `READ UNCOMMITTED`
-作为更弱承诺，也不把 PostgreSQL 对它的映射当作已支持语法。
+The initial deliverable isolation level is **Read Committed**: each statement takes a fresh snapshot watermark at the start and always sees earlier private modifications from the same transaction. It prohibits dirty reads, but two `SELECT` statements in one explicit transaction may see commits made by other transactions between them. Pico does not accept `READ UNCOMMITTED` as a weaker promise, nor does it treat PostgreSQL's mapping for it as supported syntax.
 
-“可选快照读”只有在 SQL 支持矩阵明确列出时才可开放。其快照必须在事务首次
-读/写前固定，并持续到提交或回滚；它仍不等于 `SERIALIZABLE`。在没有谓词
-依赖追踪、读写冲突图与回滚重试协议之前，`REPEATABLE READ`、`SERIALIZABLE`
-和导入/导出快照均须明确报“不支持”，而非降级执行。
+"Optional snapshot reads" may be enabled only when explicitly listed in the SQL support matrix. Their snapshot must be fixed before the transaction's first read/write and retained until commit or rollback; this still does not equal `SERIALIZABLE`. Until predicate-dependency tracking, a read/write conflict graph, and a rollback-retry protocol exist, `REPEATABLE READ`, `SERIALIZABLE`, and imported/exported snapshots must return an explicit "unsupported" error rather than being downgraded.
 
-## 写写争用与约束
+## Write-Write Contention and Constraints
 
-写事务在构造写集时记录每个写目标的“已观察版本”或等价的版本戳。到达单写者
-后，按提交队列顺序对最新**已发布**状态重新验证：
+While building a write set, a write transaction records the "observed version" or an equivalent version stamp for each write target. Once it reaches the single writer, the latest **published** state is revalidated in commit-queue order:
 
-| 写集操作 | 提交时验证 | 不满足时的结果 |
+| Write-set operation | Commit-time validation | Result if not satisfied |
 | --- | --- | --- |
-| 插入主键 | 主键在发布状态中不存在，且同批次没有重复插入 | 唯一约束错误 |
-| 更新主键 | 目标仍指向写集观察到的可见版本 | 写写冲突，事务失败 |
-| 删除主键 | 目标仍指向写集观察到的可见版本 | 写写冲突，事务失败 |
-| 更新/删除已不存在的行 | 目标在本事务快照后被删除或未出现 | 写写冲突，事务失败 |
-| 二级唯一键 | 全部受影响索引键在提交批次与已发布状态中唯一 | 唯一约束错误 |
+| Insert primary key | The key does not exist in published state, and is not inserted twice in the same batch | Unique-constraint error |
+| Update primary key | The target still refers to the visible version observed by the write set | Write-write conflict; transaction fails |
+| Delete primary key | The target still refers to the visible version observed by the write set | Write-write conflict; transaction fails |
+| Update/delete a row that no longer exists | The target was deleted or did not appear after the transaction's snapshot | Write-write conflict; transaction fails |
+| Secondary unique key | Every affected index key is unique within the commit batch and published state | Unique-constraint error |
 
-冲突结果必须确定且可观测：同一提交队列顺序和相同写集只能得到相同的成功、
-唯一约束错误或写写冲突结果。Pico v1 不等待行锁、不在提交时重新执行 `WHERE`
-谓词、也不隐式“最后写者获胜”。客户端需要重试的情况应以明确的 SQL 错误类别
-表达；错误码和对线协议的映射在 SQL 子集/协议设计中统一定义。
+Conflict outcomes must be deterministic and observable: the same commit-queue order and write sets must produce the same success, unique-constraint error, or write-write-conflict result. Pico v1 does not wait on row locks, re-execute `WHERE` predicates at commit, or silently implement "last writer wins." Cases requiring a client retry must use an explicit SQL error category; error codes and wire-protocol mapping are defined together with the SQL subset/protocol.
 
-Read Committed 与未来快照读都不能防止跨多行或范围谓词形成的写偏差。例如两个
-事务分别读取同一集合后更新不同主键，可能都通过上述版本验证。对这类业务，
-应用必须使用单个条件更新或重试协议；Pico 在实现可串行化之前不得声称避免
-幻读或序列化异常。
+Neither Read Committed nor future snapshot reads prevent write skew from multi-row or range predicates. For example, two transactions can read the same set and then update different primary keys, both passing the version checks above. Applications must use a single conditional update or a retry protocol for such workloads; until serializability is implemented, Pico must not claim to prevent phantoms or serialization anomalies.
 
-DDL 与目录修改也进入同一单写者队列。每个语句绑定其解析/绑定时使用的目录
-版本；若提交时目录已改变而使对象身份、列定义或约束解释发生歧义，则该语句
-失败并要求重新解析。后台压缩只能改变物理布局，不能创建新的 `commit_seq` 或
-改变逻辑冲突结果。
+DDL and catalog changes also enter the same single-writer queue. Each statement is bound to the catalog version used during parsing/binding; if the catalog changes before commit so that object identity, column definitions, or constraint interpretation becomes ambiguous, the statement fails and must be reparsed. Background compaction may change physical layout, but must not create a new `commit_seq` or change logical conflict outcomes.
 
-## WAL、恢复与回收
+## WAL, Recovery, and Reclamation
 
-对每个成功提交，WAL 必须先包含足以重建该事务所有逻辑变更的完整提交记录，
-然后才允许数据文件或 manifest 依赖该变更。默认耐久级别下，响应前 WAL 必须
-跨过持久化边界；更宽松的耐久级别只能改变“断电后是否保留已响应提交”的保证，
-不能改变提交排序、可见性或冲突验证。
+For every successful commit, the WAL must first contain a complete commit record sufficient to reconstruct all logical changes in the transaction; only then may data files or the manifest depend on those changes. At the default durability level, the WAL must cross the durability boundary before the response. A looser durability level may change whether a responded commit survives power loss, but must not change commit ordering, visibility, or conflict validation.
 
-恢复从最后一致的检查点开始，只重放完整、校验通过且有提交记录的事务，并按
-`commit_seq` 重建发布水位。没有完整提交记录的写集一律视为回滚。恢复完成前
-不得开放读写连接；完成后 `published_commit_seq` 必须恰好等于恢复出的最大连续
-提交序号。
+Recovery starts from the last consistent checkpoint and replays only complete, verified transactions with commit records, rebuilding the published watermark from `commit_seq`. A write set without a complete commit record is always treated as rolled back. Read/write connections must not be opened before recovery finishes; afterward, `published_commit_seq` must equal exactly the highest contiguous recovered commit sequence number.
 
-活跃快照登记其水位；运行时维护 `oldest_active_snapshot_seq`，无活跃快照时为
-`published_commit_seq + 1`。压缩或文件回收只能移除对所有活跃快照和未完成写集
-都不可见的版本。对版本区间 `[created_seq, deleted_seq)`，仅当
-`deleted_seq < oldest_active_snapshot_seq` 时才可回收；尚未删除的最新版本永不因
-该规则回收。注册与撤销快照必须在语句取消、事务失败、连接关闭和正常完成的
-每条路径执行，泄漏的快照应被监测为回收停滞，而不能由压缩器猜测释放。
+Active snapshots register their watermarks. The runtime maintains `oldest_active_snapshot_seq`, or `published_commit_seq + 1` when no snapshot is active. Compaction or file reclamation may remove only versions invisible to every active snapshot and unfinished write set. For a version interval `[created_seq, deleted_seq)`, reclamation is allowed only when `deleted_seq < oldest_active_snapshot_seq`; the newest version, while not deleted, is never reclaimed by this rule. Snapshot registration and deregistration must occur on every statement-cancellation, transaction-failure, connection-close, and normal-completion path. Leaked snapshots should be observed as reclamation stalls, not guessed away by the compactor.
 
-## 必测不变量
+## Required Invariants
 
-实现并发控制前，至少应有以下确定性测试和故障注入：
+Before implementing concurrency control, at least the following deterministic tests and fault injections should exist:
 
-1. 长时间 `SELECT` 与连续提交并行时，结果只含开始水位允许的版本；读不等待写。
-2. 两个连接基于同一旧版本更新或删除同一主键时，队列前者提交，后者得到写写冲突；不得丢失更新。
-3. 同键并发插入和二级唯一键冲突只允许一个提交，另一个得到唯一约束错误。
-4. 显式事务能读取自己的写集；其他连接在提交发布前看不到它，回滚后永远看不到它。
-5. 事务错误后，除 `ROLLBACK` 外的语句被拒绝；断连释放写集和快照。
-6. 在 WAL 追加、同步、版本发布和水位推进之间注入崩溃；恢复只暴露连续的已确认提交前缀。
-7. 活跃旧快照阻止版本回收；快照释放后压缩可以回收，且新快照结果不变。
+1. While a long-running `SELECT` runs alongside continuous commits, its result contains only versions allowed by its starting watermark; reads do not wait for writes.
+2. When two connections update or delete the same primary key from the same old version, the earlier queued transaction commits and the later one receives a write-write conflict; no update is lost.
+3. Concurrent same-key inserts and secondary unique-key conflicts allow only one commit; the other receives a unique-constraint error.
+4. An explicit transaction reads its own write set; other connections cannot see it before publication, and never see it after rollback.
+5. After a transaction error, statements other than `ROLLBACK` are rejected; disconnecting releases the write set and snapshot.
+6. Inject crashes between WAL append, sync, version publication, and watermark advancement; recovery exposes only the contiguous prefix of confirmed commits.
+7. An active old snapshot prevents version reclamation; after the snapshot is released, compaction can reclaim versions without changing results for new snapshots.
 
-至少记录提交队列等待、提交批次大小、WAL 持久化延迟、冲突类型、活跃快照数、
-最老快照水位、不可回收版本数量和压缩等待时间。指标按耐久级别分组，避免把
-不同崩溃保证下的延迟混为同一分位数。
+At minimum record commit-queue wait, commit batch size, WAL durability latency, conflict type, active snapshot count, oldest snapshot watermark, unreclaimable version count, and compaction wait time. Group metrics by durability level so latency under different crash guarantees is not combined into one percentile.
 
-## 参考
+## References
 
-- PostgreSQL 的 [MVCC 文档](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/doc/src/sgml/mvcc.sgml) 说明语句快照、Read Committed 行为与更强隔离的边界；Pico 不采纳其未支持的锁、SSI 或完整 SQL 语义。
-- PostgreSQL 的 [事务 README](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/src/backend/access/transam/README) 给出“快照与提交退出一致排序”的正确性条件；Pico 用单写者发布水位实现该条件。
-- [ADR-0005](../adr/0005-single-writer-mvcc.md) 是本设计的采纳决策；[运行时、连接与并发控制](runtime-and-concurrency.md) 定义提交队列、取消与 I/O 的运行时边界。
+- PostgreSQL's [MVCC documentation](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/doc/src/sgml/mvcc.sgml) describes statement snapshots, Read Committed behavior, and the boundary of stronger isolation; Pico does not adopt its unsupported locking, SSI, or complete SQL semantics.
+- PostgreSQL's [transaction README](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/src/backend/access/transam/README) states the correctness condition for consistent ordering between snapshots and transaction exit; Pico implements that condition with the single writer's published watermark.
+- [ADR-0005](../adr/0005-single-writer-mvcc.md) is the adoption decision for this design; [Runtime, Connections, and Concurrency Control](runtime-and-concurrency.md) defines the runtime boundaries for the commit queue, cancellation, and I/O.

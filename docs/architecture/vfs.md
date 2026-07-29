@@ -1,170 +1,163 @@
-# VFS：数据目录内的存储文件抽象
+# VFS: Storage File Abstraction Within the Data Directory
 
-## 状态与范围
+## Status and Scope
 
-本文细化 [架构总览](../ARCHITECTURE.md) 中的 `storage/vfs` 边界，并对照
-SQLite VFS 设计（[`sqlite.h.in` 中 `sqlite3_vfs` / `sqlite3_io_methods`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/sqlite.h.in)、
-[`os.h` 包装层](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/os.h)、
-[`test_demovfs.c` 最小实现](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/test_demovfs.c)）。
+This document details the `storage/vfs` boundary in the [architecture overview](../ARCHITECTURE.md), using
+the SQLite VFS design as a reference ([`sqlite3_vfs` / `sqlite3_io_methods` in `sqlite.h.in`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/sqlite.h.in),
+the [`os.h` wrapper layer](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/os.h), and the
+[`test_demovfs.c` minimal implementation](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/test_demovfs.c)).
 
-当前实现以 `src/storage/vfs.zig` 为准：一个 **实例** 打开一个 **数据目录**，在目录上
-取得排他实例锁，只允许相对该目录的**逻辑文件名**做打开、定位读写、同步、截断、
-存在性检查、删除和原子发布。本文中的更深规则（与 I/O 调度对接、故障注入、WAL/LSM
-专用打开标志）在对应模块落地前是目标契约，不是已实现保证。
+The current implementation is defined by `src/storage/vfs.zig`: one **instance** opens one
+**data directory**, takes an exclusive instance lock on it, and permits open, positioned
+read/write, sync, truncate, existence checks, deletion, and atomic publication only for
+**logical file names** relative to that directory. The deeper rules in this document
+(I/O-scheduler integration, fault injection, and WAL/LSM-specific open flags) are target
+contracts until the corresponding modules land; they are not implemented guarantees yet.
 
-VFS **不**拥有：WAL 格式、页缓存、事务、SQL、线协议、压缩策略或检查点语义。它只
-拥有「数据目录内文件名如何解析、句柄如何生命周期管理、以及哪些 I/O 原语可被上层
-调用」。
+VFS does **not** own the WAL format, page cache, transactions, SQL, wire protocol,
+compression policy, or checkpoint semantics. It owns only how names within the data
+directory are resolved, how handles are managed, and which I/O primitives callers may use.
 
-## 外部参考及适用性
+## External References and Applicability
 
-| 参考 | 已核对的机制 | Pico 的采用方式 | 明确不采用 |
+| Reference | Mechanisms reviewed | Pico's approach | Explicitly not adopted |
 | --- | --- | --- | --- |
-| SQLite `sqlite3_vfs` | 把「打开/删除/访问/路径规范化」与平台分离；上层只谈逻辑路径 | 存储层只使用逻辑文件名；平台细节集中在 VFS 与 `std.Io` 适配 | 可插拔多 VFS 注册表、按连接选择 VFS、动态扩展加载（`xDl*`） |
-| SQLite `sqlite3_io_methods` | 定位读写 `xRead`/`xWrite`、`xSync`、`xTruncate`、`xFileSize`、`xClose` | 提供位置 I/O、`sync`、`size`、`truncate`、`close`；WAL 与页文件共用同一原语 | 多进程 `xLock`/`xUnlock` 层次、`xShmMap`/`xShmLock`、mmap fetch |
-| SQLite Demo VFS | 省略锁与共享缓存，假定单连接；同步前可合并写缓冲 | 单实例排他锁；写缓冲策略留给调用方与 I/O 调度，不在 VFS 隐式合并 | 回滚日志扇区对齐写合并作为默认行为；嵌入式 journal 缓冲 |
-| [SQLite `vfs-shm.txt`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/doc/vfs-shm.txt) | WAL-index 七态锁 | 无 | 整份 SHM 锁状态机与多连接共享内存索引 |
-| [I/O 调度契约](io-scheduling.md) | 完成事件与回调分离、容量与类别 | VFS 调用最终应作为可分类 I/O 操作进入调度器 | 在 VFS 内嵌业务回调或无界队列 |
+| SQLite `sqlite3_vfs` | Separates open/delete/access/path normalization from the platform; upper layers use logical paths | The storage layer uses only logical file names; platform details are confined to VFS and the `std.Io` adapter | Pluggable multi-VFS registries, per-connection VFS selection, and dynamic extension loading (`xDl*`) |
+| SQLite `sqlite3_io_methods` | Positioned `xRead`/`xWrite`, `xSync`, `xTruncate`, `xFileSize`, and `xClose` | Provides positioned I/O, `sync`, `size`, `truncate`, and `close`; WAL and page files share these primitives | Multi-process `xLock`/`xUnlock` levels, `xShmMap`/`xShmLock`, and mmap fetch |
+| SQLite Demo VFS | Omits locks and shared cache, assumes one connection, and may coalesce write buffers before sync | Uses an exclusive single-instance lock; callers and the I/O scheduler own write buffering, with no implicit VFS coalescing | Rollback-journal sector-aligned write coalescing by default and embedded journal buffering |
+| [SQLite `vfs-shm.txt`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/doc/vfs-shm.txt) | Seven-state WAL-index locking | None | The complete SHM lock state machine and shared-memory index for multiple connections |
+| [I/O scheduling contract](io-scheduling.md) | Separates completion events from callbacks, with capacities and categories | VFS calls should eventually enter the scheduler as categorized I/O operations | Business callbacks or unbounded queues embedded in VFS |
 
-SQLite 的 VFS 是「让同一核心跑在多 OS / 多部署形态」的扩展点。Pico 的 VFS 是
-「让存储层永远不能逃出数据目录」的**安全与所有权边界**，顺带隔离平台 I/O。两者
-都把文件 I/O 从存储语义中抽出，但 Pico 不以可替换文件系统为产品特性。
+SQLite's VFS is an extension point that lets one core run across operating systems and
+deployment environments. Pico's VFS is a **security and ownership boundary** that prevents the
+storage layer from escaping the data directory, while also isolating platform I/O. Both
+separate file I/O from storage semantics, but Pico does not make replaceable filesystems a
+product feature.
 
-## 责任与不变量
+## Responsibilities and Invariants
 
 ```mermaid
 flowchart TB
   wal["storage/wal"] --> vfs["storage/vfs"]
   lsm["storage/lsm / pager"] --> vfs
   compaction["storage/compaction"] --> vfs
-  vfs --> dir["数据目录句柄 + LOCK"]
-  vfs --> files["逻辑文件：wal / manifest / sst / pages ..."]
+  vfs --> dir["data directory handle + LOCK"]
+  vfs --> files["logical files: wal / manifest / sst / pages ..."]
 ```
 
-| 所有者 | 负责 | 不负责 |
+| Owner | Responsible for | Not responsible for |
 | --- | --- | --- |
-| `storage/vfs` | 数据目录打开与关闭、实例排他锁、逻辑名校验、文件/原子文件生命周期、位置 I/O 与 `sync` | WAL 帧布局、页对齐策略、提交顺序、压缩选择 |
-| `storage/wal`、`storage/lsm`、`storage/pager` | 在逻辑文件上编码内容、决定何时 `sync`、何时原子发布 | 解析 `../`、绝对路径或子目录逃逸 |
-| `runtime` I/O 调度 | 何时提交/完成磁盘操作、容量与类别 | 文件名合法性 |
-| `commit` | 何时认为一次写入达到**耐久级别** | 直接调用 OS 路径 API 绕过 VFS |
+| `storage/vfs` | Opening and closing the data directory, the exclusive instance lock, logical-name validation, file/atomic-file lifetimes, positioned I/O, and `sync` | WAL frame layout, page-alignment policy, commit order, and compression choice |
+| `storage/wal`, `storage/lsm`, `storage/pager` | Encoding content in logical files and deciding when to `sync` and atomically publish | Parsing `../`, absolute paths, or escapes into subdirectories |
+| `runtime` I/O scheduler | When disk operations are submitted/completed, their capacity, and their category | File-name validity |
+| `commit` | When a write has reached the **durability level** | Calling OS path APIs directly and bypassing VFS |
 
-必须保持的不变量：
+Required invariants:
 
-1. **目录围栏**：所有存储文件名必须通过校验，且相对数据目录解析。拒绝空名、绝对路径、
-   含路径分隔符的名、`.` / `..`。存储层不得接受调用方任意路径。
-2. **单实例锁**：打开数据目录时在 `LOCK` 上取得排他锁；锁失败则返回
-   `InstanceInUse`，不得两个进程同时写同一目录。
-3. **逻辑名稳定**：上层只使用短逻辑名（如 `wal`、`manifest`、`sst-…`）。物理路径
-   拼接只发生在 VFS 内部。
-4. **句柄所有权**：`openFile` / `createAtomicFile` 返回的句柄由调用方关闭；VFS
-   在 `close` 时释放目录与实例锁，不隐式关闭已借出的文件。
-5. **原子发布原语**：不可变文件（manifest、SSTable 等）通过「写临时 → `sync` →
-   原子替换 → 目录 `sync`」发布；半写入文件不得成为读者可见的最终名。
-6. **删除耐久**：删除存储文件后同步目录项，避免崩溃后幽灵目录项或已删文件仍被
-   恢复路径误用。
-7. **存在性非事务**：`exists` 只是顾问信息；调用方必须仍处理并发打开/删除失败。
+1. **Directory fence**: Every storage file name must be validated and resolved relative to the data directory. Reject empty names, absolute paths, names containing separators, and `.` / `..`. The storage layer must not accept arbitrary paths from callers.
+2. **Single-instance lock**: Take an exclusive lock on `LOCK` when opening the data directory. Failure returns `InstanceInUse`; two processes must not write the same directory.
+3. **Stable logical names**: Upper layers use only short logical names such as `wal`, `manifest`, and `sst-…`. Physical path construction occurs only inside VFS.
+4. **Handle ownership**: Callers close handles returned by `openFile` / `createAtomicFile`. VFS releases the directory and instance lock on `close` and does not implicitly close borrowed files.
+5. **Atomic publication primitive**: Publish immutable files such as manifests and SSTables as “write temporary -> `sync` -> atomic replace -> directory `sync`”. A partially written file must never become the reader-visible final name.
+6. **Durable deletion**: Sync directory entries after deleting a storage file so that a crash cannot leave ghost entries or cause recovery to use a deleted file.
+7. **Non-transactional existence**: `exists` is advisory; callers must still handle concurrent open/delete failures.
 
-## 与 SQLite 方法的映射
+## Mapping to SQLite Methods
 
-| SQLite | Pico VFS | 说明 |
+| SQLite | Pico VFS | Description |
 | --- | --- | --- |
-| `xOpen` | `Vfs.openFile` / `createAtomicFile` | 仅逻辑名；打开标志映射为 `OpenOptions` |
-| `xDelete` | `Vfs.deleteFile` | 删除后目录 sync |
-| `xAccess` | `Vfs.exists` | 顾问性；无 F_OK 以外的权限模型承诺 |
-| `xFullPathname` | 内部解析，不对外暴露 | 防止上层拼路径 |
-| `xRead` / `xWrite` | `File.readAt` / `writeAtAll` | 位置 I/O；完整写用 `writeAtAll` |
-| `xSync` | `File.sync` / `AtomicFile.sync` | 耐久边界由调用方按**耐久级别**决定何时调用 |
-| `xTruncate` / `xFileSize` | `truncate` / `size` | 页文件与 WAL 截断/测量 |
+| `xOpen` | `Vfs.openFile` / `createAtomicFile` | Logical names only; open flags map to `OpenOptions` |
+| `xDelete` | `Vfs.deleteFile` | Sync the directory afterward |
+| `xAccess` | `Vfs.exists` | Advisory; no permission model beyond F_OK is promised |
+| `xFullPathname` | Resolved internally and not exposed | Prevents upper layers from joining paths |
+| `xRead` / `xWrite` | `File.readAt` / `writeAtAll` | Positioned I/O; complete writes use `writeAtAll` |
+| `xSync` | `File.sync` / `AtomicFile.sync` | Callers choose the durability boundary according to the **durability level** |
+| `xTruncate` / `xFileSize` | `truncate` / `size` | Truncation and measurement for page files and WAL |
 | `xClose` | `File.close` / `AtomicFile.deinit` | |
-| `xLock` 族 | 仅实例级 `LOCK` | 无 SHARED/RESERVED/PENDING/EXCLUSIVE 页锁 |
-| `xShm*` | 无 | 单实例无 WAL-index 共享内存 |
-| `xRandomness` / `xSleep` / `xCurrentTime` | 不在 VFS | 需要时由 `util`/运行时提供，避免把时钟/熵绑在文件层 |
-| `xDl*` | 无 | 不加载动态扩展进存储路径 |
+| `xLock` family | Instance-level `LOCK` only | No SHARED/RESERVED/PENDING/EXCLUSIVE page locks |
+| `xShm*` | None | A single instance has no shared-memory WAL index |
+| `xRandomness` / `xSleep` / `xCurrentTime` | Outside VFS | Supplied by `util`/runtime when needed, keeping clocks/entropy out of the file layer |
+| `xDl*` | None | Dynamic extensions are not loaded into the storage path |
 
-## 打开、原子发布与同步
+## Opening, Atomic Publication, and Sync
 
-### 打开选项
+### Open Options
 
-`OpenOptions` 表达存储意图，而不是照搬 POSIX 标志全集：
+`OpenOptions` expresses storage intent rather than copying the complete POSIX flag set:
 
-- `read` / `write`：访问模式。
-- `create` / `truncate` / `exclusive`：创建与互斥创建。
-- `lock` / `lock_nonblocking`：文件级顾问锁（若平台提供）；**不能**替代实例
-  `LOCK`，也不能实现 SQLite 式多进程页锁协议。
+- `read` / `write`: access mode.
+- `create` / `truncate` / `exclusive`: creation and exclusive creation.
+- `lock` / `lock_nonblocking`: advisory file lock when supported by the platform; it **cannot** replace the instance `LOCK` or implement SQLite-style multi-process page locking.
 
-WAL、页文件、manifest 准备文件应通过同一 `openFile` 进入，以便测试可用同一故障
-注入点。
+WAL, page files, and manifest staging files should all enter through the same `openFile`
+so tests can use the same fault-injection point.
 
-### 原子发布
+### Atomic Publication
 
 ```mermaid
 sequenceDiagram
   participant C as compaction / commit
   participant V as VFS
-  participant D as 数据目录
+  participant D as data directory
 
   C->>V: createAtomicFile("manifest")
-  V->>D: 创建无名/临时文件
+  V->>D: create unnamed/temporary file
   C->>V: writeAtAll + sync
   C->>V: commit
-  V->>D: 原子替换最终名
-  V->>D: sync 目录项
-  C-->>C: 读者可见新 manifest
+  V->>D: atomically replace final name
+  V->>D: sync directory entry
+  C-->>C: readers see new manifest
 ```
 
-规则：
+Rules:
 
-1. 写入完成并 `sync` 之前，最终名上的旧内容（若有）对读者仍有效。
-2. `commit` 失败不得留下「最终名指向未 sync 内容」的状态；临时文件由 `deinit` 清理。
-3. 新文件成为恢复或读路径输入之前，内容校验（若格式要求）由上层完成；VFS 只保证
-   字节按序落盘与目录项发布，不解释内容。
+1. Until the write completes and is synced, any old content under the final name remains valid to readers.
+2. A failed `commit` must not leave the final name pointing to unsynced content; `deinit` cleans up the temporary file.
+3. The upper layer validates content before a new file becomes recovery or read-path input when the format requires it. VFS guarantees only ordered bytes and directory-entry publication; it does not interpret content.
 
-### 同步与耐久
+### Sync and Durability
 
-VFS 的 `sync` 是**平台持久化原语**，不是用户可见的**提交**。默认**耐久级别**下：
+VFS `sync` is a **platform persistence primitive**, not a user-visible **commit**. At the default **durability level**:
 
-- WAL 追加路径在确认提交前必须对 WAL 文件 `sync`（见 ADR-0006）。
-- 原子发布路径在替换前对数据文件 `sync`，替换后对目录 `sync`。
-- 页管理器的 `Pager.sync` 只使该页文件上的脏页写回并同步；它不构成事务提交。
+- The WAL append path must `sync` the WAL file before confirming a commit (see ADR-0006).
+- The atomic publication path syncs the data file before replacement and the directory after replacement.
+- `Pager.sync` writes and syncs dirty pages in that page file; it does not constitute a transaction commit.
 
-较松耐久级别可以推迟或合并 `sync`，但必须显式配置、可观察，且不得成为默认。
+Looser durability levels may defer or coalesce `sync`, but must be explicit and observable and must not be the default.
 
-## 与 I/O 调度的衔接
+## I/O Scheduler Integration
 
-目标实现中，VFS 底层读写/sync 应登记为 [I/O 调度](io-scheduling.md) 中的操作：
+In the target implementation, VFS reads, writes, and syncs should be registered as operations in the [I/O scheduler](io-scheduling.md):
 
-| VFS 用途 | I/O 类别 |
+| VFS use | I/O category |
 | --- | --- |
-| WAL 追加与同步、恢复读取、已开始的 manifest 发布收尾 | `critical` |
-| 前台只读语句所需的文件读 | `foreground_read` |
-| 压缩写、预取、检查点准备 | `maintenance` |
+| WAL append and sync, recovery reads, and completion of an in-progress manifest publication | `critical` |
+| File reads required by foreground read-only statements | `foreground_read` |
+| Compaction writes, prefetch, and checkpoint preparation | `maintenance` |
 
-VFS API 本身保持同步外观或显式异步句柄均可，但不得在平台完成回调里直接跑 SQL
-或提交逻辑。当前 Phase 实现可以是阻塞 `std.Io` 调用；引入异步调度时，调用方与
-VFS 的错误模型和取消语义必须保持：已进入不可逆 WAL/manifest 步骤的操作不可被
-连接取消撤销。
+The VFS API may retain a synchronous shape or expose explicit asynchronous handles, but
+platform completion callbacks must not run SQL or commit logic directly. The current phase
+may use blocking `std.Io` calls. When asynchronous scheduling is introduced, caller and VFS
+error models and cancellation semantics must remain intact: connection cancellation cannot
+undo an operation that has entered an irreversible WAL/manifest step.
 
-## 故障、观测与验收
+## Faults, Observability, and Acceptance
 
-最低回归（已有部分覆盖于 `vfs.zig` 测试）：
+Minimum regressions (partly covered by `vfs.zig` tests):
 
-1. 路径逃逸：`../outside`、绝对路径、含 `/` 或 `\` 的名、`.` / `..` 一律
-   `InvalidStoragePath`。
-2. 实例锁：同一数据目录第二次 `Vfs.open` 失败为 `InstanceInUse`（在测试允许的
-   进程模型下）。
-3. 原子发布：替换后读取为新内容；崩溃注入点在 write、file sync、replace、dir
-   sync 四处时，读者只见旧完整文件或新完整文件，不见撕裂最终名。
-4. 删除：`deleteFile` 后 `exists` 为假，且目录 sync 失败时不得静默宣称成功。
-5. 与上层联调：WAL 与 Pager 只通过 VFS 打开文件，测试中可替换为故障注入 VFS。
+1. Path escape: `../outside`, absolute paths, names containing `/` or `\`, and `.` / `..` all return `InvalidStoragePath`.
+2. Instance lock: a second `Vfs.open` for the same data directory returns `InstanceInUse` under the process model allowed by the test.
+3. Atomic publication: reads after replacement return new content; with crash injection at write, file sync, replace, and directory sync, readers see only the old complete file or the new complete file, never a torn final name.
+4. Deletion: `exists` is false after `deleteFile`, and a directory-sync failure is not silently reported as success.
+5. Upper-layer integration: WAL and Pager open files only through VFS, which tests can replace with a fault-injecting VFS.
 
-建议指标：打开/关闭次数、sync 次数与延迟、原子发布成功/失败、路径拒绝次数、
-实例锁冲突次数。不把完整路径或 SQL 文本作为标签。
+Recommended metrics: open/close counts, sync count and latency, atomic publication
+successes/failures, rejected paths, and instance-lock conflicts. Do not use full paths or
+SQL text as labels.
 
-## 实施边界
+## Implementation Boundaries
 
-1. **已完成**：数据目录围栏、实例锁、位置 I/O、原子发布、删除与目录 sync、单测。
-2. **下一步**：把 WAL/引擎打开路径统一到 VFS；为测试提供可注入失败的 VFS 适配。
-3. **再下一步**：与 `runtime` I/O 调度对接类别与容量；禁止存储模块直接使用
-   `std.fs` 逃逸。
-4. **需要新 ADR 才能做的**：多进程共享同一数据目录、可插拔用户 VFS、网络块设备
-   语义、把检查点当作备份介质。
+1. **Complete**: data-directory fencing, instance lock, positioned I/O, atomic publication, deletion and directory sync, and unit tests.
+2. **Next**: route WAL/engine open paths through VFS and provide a fault-injectable VFS adapter for tests.
+3. **After that**: integrate categories and capacities with `runtime` I/O scheduling; prevent storage modules from escaping through direct `std.fs` use.
+4. **Requires a new ADR**: sharing one data directory across processes, pluggable user VFSes, network block-device semantics, and treating checkpoints as backup media.

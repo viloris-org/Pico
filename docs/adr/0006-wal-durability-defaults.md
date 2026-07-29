@@ -1,17 +1,17 @@
-# 耐久：WAL 先行，默认持久化提交，提供明确降档
+# Durability: WAL First, Durable Commits by Default, with Explicit Relaxation
 
-所有提交的修改先进入 **WAL**；默认**耐久级别**在进程崩溃（及在约定平台上的断电模型）后，已提交事务可通过**恢复**重新可见。允许配置更松的级别用于开发或明确接受风险的场景，但**不得**将松级别作为生产默认。
+All committed changes first enter the **WAL**; under the default **durability level**, committed transactions become visible again through **recovery** after a process crash (and under the agreed power-loss model for the platform). Less durable levels may be configured for development or explicitly accepted-risk scenarios, but a less durable level **must not** be the production default.
 
-采用 **group commit**：多个事务共享落盘轮次，以在高争用下摊薄同步 IO 成本。数据文件通过**检查点**推进；块级校验和用于发现静默损坏。
+Use **group commit**: multiple transactions share a flush round to amortize synchronous I/O costs under high contention. Data files advance through **checkpoints**; block checksums detect silent corruption.
 
 ## Considered Options
 
-- **默认不同步（内存/异步落盘）**：基准好看，公开产品易丢已提交数据，不可接受为默认。
-- **每事务独立 fsync**：语义直观，高争用下 fsync 成为崩溃点。
-- **WAL + group commit + 默认同步（采纳）**：在「够安全」与写吞吐之间取得可叙述的平衡；用耐久级别把风险选择交给部署方。
+- **Unsynchronized by default (memory/asynchronous flushes)**: Looks good in benchmarks, but a public product could easily lose committed data; unacceptable as the default.
+- **Independent `fsync` per transaction**: Intuitive semantics, but `fsync` becomes the bottleneck under high contention.
+- **WAL + group commit + synchronous by default (adopted)**: Provides a clear balance between “safe enough” and write throughput; durability levels leave the risk decision to the deployer.
 
 ## Consequences
 
-- 必须文档化各级别的保证与反保证（杀进程 vs 断电 vs `kill -9` 测试范围）。
-- 启动路径的**恢复**是功能正确性的一部分，需有固定回归，而不仅是「能启动」。
-- 备份与 PITR 不在本 ADR 范围；检查点不能冒充用户备份语义（见 `CONTEXT.md`）。
+- The guarantees and limitations of every level must be documented, including test scope for process termination, power loss, and `kill -9`.
+- Startup **recovery** is part of functional correctness and requires fixed regression tests, not merely “it starts.”
+- Backups and PITR are outside this ADR; a checkpoint must not masquerade as user-backup semantics (see `CONTEXT.md`).

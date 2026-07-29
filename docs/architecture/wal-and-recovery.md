@@ -1,28 +1,28 @@
-# WAL 与崩溃恢复
+# WAL and Crash Recovery
 
-> **关键文件：** `src/storage/wal.zig`（WAL 格式与 I/O）、`src/storage/engine.zig`（恢复调度与应用）
+> **Key files:** `src/storage/wal.zig` (WAL format and I/O), `src/storage/engine.zig` (recovery scheduling and application)
 
-## 概述
+## Overview
 
-WAL（Write-Ahead Log）是 Pico 崩溃恢复的事实来源。**WAL 先于 MemTable** 是不变式：每笔写入在应用到内存状态前必须完整持久化到 WAL。崩溃恢复时，从 WAL 重放已确认的写入，重建内存表状态。
+The WAL (Write-Ahead Log) is Pico's source of truth for crash recovery. **WAL before
+MemTable** is an invariant: every write must be fully persisted to WAL before it is applied
+to memory state. Recovery replays confirmed writes from WAL to rebuild the in-memory tables.
 
-默认耐久级别下，`COMMIT` 成功响应前完整提交记录已同步到 WAL。支持降档级别用于开发或明确接受风险的场景（见 ADR-0006）。
+At the default durability level, the complete commit record is synced to WAL before a
+successful `COMMIT` response. Lower durability levels are available for development or
+explicitly accepted risk (see ADR-0006).
 
----
+## Design Goals
 
-## 设计目标
+- **Crash consistency**: confirmed commits are not lost; only incomplete tail writes are discarded.
+- **Versioned format**: the file identifies itself with `magic + version`, so frames from different formats are not misinterpreted.
+- **CRC validation**: each frame covers its payload and length field with CRC32 to detect silent corruption.
+- **Atomic batch commit**: all operations in an explicit transaction form one WAL frame and are either all applied or all discarded during recovery.
+- **Sequential single-file append**: the current implementation uses one WAL file and append-only writes; it does not perform random writes.
 
-- **崩溃一致性**：不丢失已确认提交；仅抛出"末尾截断"的不完整写入。
-- **格式版本化**：文件自标识 `magic + version`，不同格式的帧不会互相误解释。
-- **CRC 校验**：每个帧的 payload 与长度字段均覆盖 CRC32，检测静默损坏。
-- **原子批提交**：显式事务的所有操作为一个 WAL 帧，恢复时要么全应用要么全丢弃。
-- **单文件顺序追加**：当前实现为单个 WAL 文件，追加为主，无随机写。
+## WAL File Format
 
----
-
-## WAL 文件格式
-
-### 文件头
+### File Header
 
 ```
 Offset  Size  Field
@@ -33,61 +33,61 @@ Offset  Size  Field
         11    Total header size = file_header_len
 ```
 
-- Magic 值 `PICO_WAL` 用以快速识别 Pico WAL 文件。
-- `format_version` 当前为 **1**。格式破坏性变更（帧布局、记录类型编码、校验算法）须递增此版本。
-- 打开时验证 magic + version；不匹配时返回 `error.UnsupportedWalFormat` 并保留文件证据。
+- `PICO_WAL` identifies a Pico WAL file quickly.
+- `format_version` is currently **1**. Breaking changes to frame layout, record-type encoding, or checksum algorithm increment it.
+- Open validates magic + version; mismatch returns `error.UnsupportedWalFormat` and preserves the file as evidence.
 
-### 帧布局
+### Frame Layout
 
-WAL 由一系列变长帧组成，紧跟在文件头之后：
+WAL consists of variable-length frames immediately after the file header:
 
 ```
 Offset  Size  Field      Description
 ──────────────────────────────────────
-0       4     len        Payload 字节数（u32 LE）
+0       4     len        Payload bytes (u32 LE)
 4       4     crc32      CRC32(len_bytes ‖ payload)
-8       len   payload    记录类型 + 记录数据
+8       len   payload    Record type + record data
 ──────────────────────────────────────
         8+len            Total frame size = frame_header_len + payload_len
 ```
 
-- **CRC 覆盖**：`crc32c` 计算 `payload_len` 的 4 字节 LE 表示拼接 `payload`。覆盖长度字段防止翻转长度后被接受为不同的完整帧。
-- **单次位置写**：帧头部与 payload 在同一 `writeAtAll` 调用中写入，确保崩溃时要么写入完整帧，要么写入"截断末尾"——不会出现头部写入而 body 未写入的中间态。
-- **最大 payload 大小**：`8 MiB`（`frame_payload_len_max`），防止单帧过大导致恢复内存问题。
+- **CRC coverage**: `crc32c` computes the four-byte LE representation of `payload_len` concatenated with `payload`. Covering the length prevents a flipped length from being accepted as a different complete frame.
+- **One positioned write**: header and payload are written in one `writeAtAll` call. A crash therefore produces either a complete frame or an incomplete tail, not a header-only intermediate state.
+- **Maximum payload**: `8 MiB` (`frame_payload_len_max`) prevents a single frame from causing excessive recovery memory use.
 
-### 记录类型
+### Record Types
 
-| 类型 | 值 | 描述 |
-|------|-----|------|
-| `create_table` | 1 | 创建表（表名 + 列定义列表） |
-| `insert` | 2 | 插入一行（表名 + 值列表） |
-| `update` | 3 | 更新一行（表名 + 主键值 + 新值列表） |
-| `delete` | 4 | 删除一行（表名 + 主键值） |
-| `add_column` | 5 | 增加列（表名 + 列定义） |
-| `drop_column` | 6 | 删除列（表名 + 列名） |
-| `set_default` | 7 | 设置 DEFAULT 表达式（表名 + 列名 + 表达式） |
-| `set_not_null` | 8 | 设置 NOT NULL（表名 + 列名 + 启用/禁用） |
-| `txn_batch` | 9 | 事务批提交——嵌套多个操作的原子帧 |
+| Type | Value | Description |
+|------|-----:|-------------|
+| `create_table` | 1 | Create a table (table name + column-definition list) |
+| `insert` | 2 | Insert one row (table name + value list) |
+| `update` | 3 | Update one row (table name + primary-key value + new value list) |
+| `delete` | 4 | Delete one row (table name + primary-key value) |
+| `add_column` | 5 | Add a column (table name + column definition) |
+| `drop_column` | 6 | Drop a column (table name + column name) |
+| `set_default` | 7 | Set a DEFAULT expression (table name + column name + expression) |
+| `set_not_null` | 8 | Set NOT NULL (table name + column name + enable/disable) |
+| `txn_batch` | 9 | Transaction batch commit: an atomic frame containing nested operations |
 
-### 记录编码细节
+### Record Encoding Details
 
-**基础类型编码：**
+**Primitive encoding:**
 
-| 类型 | 编码 |
-|------|------|
-| `u16` | 2 字节 LE |
-| `u32` | 4 字节 LE |
-| `i64` | 8 字节 LE |
-| 字符串 | `u16(len) + len bytes`（最大长度 65535） |
+| Type | Encoding |
+|------|----------|
+| `u16` | 2-byte LE |
+| `u32` | 4-byte LE |
+| `i64` | 8-byte LE |
+| String | `u16(len) + len bytes` (maximum length 65535) |
 | Value (null) | `0x00` |
 | Value (int) | `0x01 + i64(8 bytes LE)` |
 | Value (text) | `0x02 + u16(len) + len bytes` |
 | Value (bool) | `0x03 + 0x00/0x01` |
-| DefaultExpr | `0x00`（none）/ `0x01`（now）/ `0x02 + Value`（literal） |
+| DefaultExpr | `0x00` (none) / `0x01` (now) / `0x02 + Value` (literal) |
 | Column | `str(name) + u8(type_tag) + u8(flags) + DefaultExpr` |
-| 列 flags | `bit0: pk, bit1: not_null, bit2: unique, bit3: serial` |
+| Column flags | `bit0: pk, bit1: not_null, bit2: unique, bit3: serial` |
 
-**`create_table` payload 编码：**
+**`create_table` payload encoding:**
 
 ```
 type_byte: u8 = 1
@@ -97,7 +97,7 @@ repeated(n_columns):
   Column
 ```
 
-**`insert` payload 编码：**
+**`insert` payload encoding:**
 
 ```
 type_byte: u8 = 2
@@ -107,18 +107,18 @@ repeated(n_values):
   Value
 ```
 
-**`update` payload 编码：**
+**`update` payload encoding:**
 
 ```
 type_byte: u8 = 3
 str(table_name)
-Value(pk)  — 主键值，用于定位行
+Value(pk)  — primary-key value used to locate the row
 u16(n_values)
 repeated(n_values):
   Value
 ```
 
-**`delete` payload 编码：**
+**`delete` payload encoding:**
 
 ```
 type_byte: u8 = 4
@@ -126,7 +126,7 @@ str(table_name)
 Value(pk)
 ```
 
-**`txn_batch` payload 编码：**
+**`txn_batch` payload encoding:**
 
 ```
 type_byte: u8 = 9
@@ -136,127 +136,118 @@ repeated(n_ops):
   op_payload: [type_byte + encoded_op_data]
 ```
 
-`txn_batch` 帧内部嵌套的操作可以是 `insert`、`update`、`delete` 的编码（不含外层帧头）。整个 batch 共享一个 CRC：一个帧要么完整且校验正确，要么整批丢弃。
+Nested operations in a `txn_batch` frame may use the `insert`, `update`, and `delete`
+encodings without the outer frame header. The entire batch shares one CRC: a frame is either
+complete and valid or the entire batch is discarded.
 
----
+## WAL Lifecycle
 
-## WAL 生命周期
+### Creation
 
-### 创建
+1. `Engine.open()` -> `Wal.open()` opens the `wal` file in `CREATE` mode.
+2. If the file is empty, write and sync the header (`magic + version`).
+3. Otherwise validate the header.
 
-1. `Engine.open()` → `Wal.open()` 打开 `wal` 文件（`CREATE` 模式）。
-2. 若文件长度为零，写入文件头（magic + version）并同步。
-3. 若文件非空，验证文件头有效。
+### Writing
 
-### 写入
+1. `Engine` calls `wal.appendInsert()`, `wal.appendUpdate()`, `wal.appendTxnBatch()`, and so on.
+2. `appendPayload()` constructs header + payload and writes them at the current offset with one `writeAtAll`.
+3. If `sync_on_append == true` (the default durability level), immediately `fsync` to confirm persistence.
 
-1. `Engine` 调用 `wal.appendInsert()` / `wal.appendUpdate()` / `wal.appendTxnBatch()` 等。
-2. `appendPayload()` 构造帧头部 + payload → 一次 `writeAtAll` 写入当前偏移。
-3. 若 `sync_on_append == true`（默认耐久级别），立即 `fsync` 确认持久化。
+### Recovery
 
-### 恢复（详见下文）
+See the next section.
 
-### 回收（目标状态）
+### Reclamation (Target)
 
-- 检查点推进后，已覆盖的 WAL 部分可回收。
-- 当前（Phase 0）WAL 为单文件，无限增长。检查点实现后引入 WAL 替换/回收机制。
+- After a checkpoint advances, covered WAL portions may be reclaimed.
+- In Phase 0, WAL is one unbounded file. WAL replacement/reclamation will be added with checkpoints.
 
----
+## Crash Recovery
 
-## 崩溃恢复
-
-### 恢复流程
+### Recovery Flow
 
 ```mermaid
 flowchart TD
-    A["打开数据目录"] --> B["打开 WAL 文件\n并验证文件头"]
-    B --> C{"文件大小 > 文件头?"}
-    C -->|否| D["无 WAL 重放\n空数据库"]
-    C -->|是| E["逐帧扫描\noff = file_header_len"]
-    E --> F{"剩余字节\n< frame_header_len?"}
-    F -->|是| G["截断末尾\npersistEnd()"]
-    F -->|否| H["读取帧头\n(payload_len + crc32)"]
-    H --> I{"payload_len == 0\n或 > max 或\nframe 超文件?"}
-    I -->|是| J["截断末尾\npersistEnd()"]
-    I -->|否| K["读取 payload\n校验 CRC32"]
-    K --> L{"CRC 匹配?"}
-    L -->|否| M["返回 CorruptWal\n保留证据"]
-    L -->|是| N["解析 RecordView\napply(ctx, view)"]
-    N --> O["off += frame_len\n继续循环"]
+    A["Open data directory"] --> B["Open WAL\nand validate header"]
+    B --> C{"file size > header?"}
+    C -->|no| D["No WAL replay\nempty database"]
+    C -->|yes| E["Scan frames\noff = file_header_len"]
+    E --> F{"remaining bytes\n< frame_header_len?"}
+    F -->|yes| G["Truncate tail\npersistEnd()"]
+    F -->|no| H["Read frame header\n(payload_len + crc32)"]
+    H --> I{"payload_len == 0\nor > max or\nframe past file?"}
+    I -->|yes| J["Truncate tail\npersistEnd()"]
+    I -->|no| K["Read payload\nvalidate CRC32"]
+    K --> L{"CRC matches?"}
+    L -->|no| M["Return CorruptWal\npreserve evidence"]
+    L -->|yes| N["Parse RecordView\napply(ctx, view)"]
+    N --> O["off += frame_len\ncontinue"]
     O --> E
-    J --> P["恢复完成"]
+    J --> P["Recovery complete"]
     D --> P
     G --> P
-    M --> Q["拒绝恢复"]
+    M --> Q["Reject recovery"]
 ```
 
-### 恢复不变量
+### Recovery Invariants
 
-1. **已确认提交不丢失**：WAL 中每个校验通过的完整帧都代表一个已确认的操作。恢复时必须精确重放。
-2. **未知/损坏帧导致拒绝**：CRC 校验失败、未知记录类型、无法解析的格式 → `error.CorruptWal`。不猜测修复。
-3. **末尾截断可容忍**：文件末尾不完整的帧（头部缺失或 payload 不完整）被静默截断，已确认的前缀帧完整保留。
-4. **截断后持久化**：截断操作通过 `persistEnd()`（`fsync`）持久化新 EOF，确保后续追加不会再见到垃圾尾部。
+1. **Confirmed commits are not lost**: every complete, validated frame represents a confirmed operation and must be replayed exactly.
+2. **Unknown or corrupt frames reject recovery**: CRC failure, an unknown record type, or an unparseable format returns `error.CorruptWal`; recovery does not guess at a repair.
+3. **Incomplete tails are tolerated**: an incomplete final frame (missing header or payload) is silently truncated while the confirmed prefix remains intact.
+4. **Truncation is persisted**: `persistEnd()` (`fsync`) persists the new EOF so later appends do not encounter the garbage tail.
 
-### CRC 校验的重要性
+### Why CRC Matters
 
-Pico 的 WAL 帧 CRC 覆盖 `payload_len` 与 `payload` 两者：
+Pico's WAL CRC covers both `payload_len` and `payload`. A payload-only CRC would allow damage,
+or an attacker, to change the length and reinterpret a valid payload as a different record size
+or type. Covering the length detects this corruption immediately.
 
-- 单独 CRC payload 不足：攻击者或损坏可以翻转长度字段，使校验通过的 payload 被解释为不同类型/大小的记录。
-- 同时覆盖长度：任何长度字段损坏都会导致 CRC 不匹配，立即被检测。
+### Recovery Modes
 
-### 恢复模式
+| Mode (planned) | Behavior | Use case |
+|-----------------|----------|----------|
+| Strict (default) | Stop at the first corrupt frame and reject recovery | Production, integrity first |
+| Tolerate truncation | Truncate an incomplete final frame (current behavior) | Standard crash recovery |
+| Skip corruption | Skip corrupt frames and continue | Emergency data salvage |
 
-| 模式（计划实现） | 行为 | 适用场景 |
-|-----------------|------|----------|
-| 严格模式（默认） | 首个损坏帧处停止并拒绝恢复 | 生产环境，数据完整性优先 |
-| 容忍截断 | 允许末尾不完整帧被截断（当前行为） | 标准崩溃恢复，宕机后常见 |
-| 跳过损坏 | 跳过损坏帧并继续 | 紧急恢复，数据抢救 |
+The current implementation tolerates truncation; strict mode will be added as an option.
 
-当前实现为容忍截断模式，未来将引入严格模式作为可选项。
+### `txn_batch` Recovery
 
----
+An explicit transaction's write set is stored in a `txn_batch` frame:
 
-### `txn_batch` 恢复
+- `replayWal` reads the frame; `applyRecord()` identifies `txn_batch`; `forEachTxnBatchOp()` iterates its nested operations.
+- The entire batch is applied only when the frame is complete and its CRC is valid; a corrupt or truncated frame is discarded in full.
+- This preserves transaction atomicity: recovery cannot expose a partially committed transaction.
 
-显式事务的写集保存在 `txn_batch` 帧中：
+### Failure Model
 
-- 恢复时，`replayWal` 读取 `txn_batch` 帧 → `applyRecord()` 识别为 `txn_batch` → `forEachTxnBatchOp()` 遍历所有内嵌操作。
-- 整个 batch 要么全部应用（帧完整、CRC 正确），要么全部丢弃（帧损坏或末尾截断）。
-- 这保证了事务的原子性：恢复后不会出现"部分已提交"的事务。
+| Failure | Recovery behavior | Guarantee |
+|---------|-------------------|-----------|
+| Process crashes during WAL write | Truncate the tail and discard the incomplete frame | Complete confirmed frames are not lost |
+| Crash during WAL `fsync` | Same | Same |
+| WAL header corruption | `UnsupportedWalFormat`, reject recovery | No guessed repair |
+| CRC corruption in the middle of WAL | `CorruptWal`, preserve evidence | Recovery rejected |
+| Silent filesystem corruption (bit flip) | CRC detects it -> `CorruptWal` | Recovery rejected |
+| Complete frame length flips | CRC detects it -> `CorruptWal` | Recovery rejected |
 
----
+## Current Implementation vs Target
 
-### 故障模型
-
-| 故障场景 | 恢复行为 | 保证 |
-|---------|---------|------|
-| WAL 写入时进程崩溃 | 末尾截断，丢弃不完整帧 | 已确认的完整帧不丢失 |
-| WAL fsync 时崩溃 | 同上 | 同上 |
-| WAL 文件头部损坏 | `UnsupportedWalFormat`，拒绝恢复 | 不猜测修复 |
-| WAL 中部帧 CRC 损坏 | `CorruptWal`，保留证据 | 拒绝恢复 |
-| 文件系统静默损坏（bit flip） | CRC 检测 → `CorruptWal` | 拒绝恢复 |
-| 完整帧长度字段翻转 | CRC 检测 → `CorruptWal` | 拒绝恢复 |
-
----
-
-## 当前实现 vs 目标
-
-| 特性 | 当前（Phase 0） | 目标 |
+| Feature | Current (Phase 0) | Target |
 |------|----------------|------|
-| 文件布局 | 单文件 WAL | WAL 替换/轮换 + 检查点 |
-| Group Commit | 每次`appendPayload`写入一帧 + 可选同步 | 有界队列 + 批次写入 + 共享 fsync |
-| 恢复模式 | 容忍截断（隐式） | 严格 + 容忍截断 + 跳过损坏（可配置） |
-| CRC 算法 | CRC32 | 可升级为 CRC32C |
-| WAL 压缩 | 无 | 可选压缩（zstd） |
-| WAL 追踪 | 无 | Manifest 中记录已关闭 WAL 的大小与位置 |
-| WAL 校验链 | 无 | 每个新 WAL 记录前驱 WAL 的校验和（链式验证） |
+| File layout | Single WAL file | WAL replacement/rotation + checkpoints |
+| Group Commit | One frame per `appendPayload` + optional sync | Bounded queue + batched writes + shared `fsync` |
+| Recovery modes | Tolerate truncation (implicit) | Strict + tolerant + skip-corruption (configurable) |
+| CRC algorithm | CRC32 | Upgradeable to CRC32C |
+| WAL compression | None | Optional compression (zstd) |
+| WAL tracking | None | Manifest records size and position of closed WALs |
+| WAL checksum chain | None | Each new WAL record includes the previous WAL checksum |
 
----
+## References
 
-## 参考
-
-- RocksDB [Write-Ahead Log](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/03_wal.md)：32 KB 块结构、碎片化、CRC 优化、WAL 回收。
-- RocksDB [Crash Recovery](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/09_crash_recovery.md)：恢复流程、WAL 恢复模式、截断策略。
-- [ADR-0006 WAL 耐久性决策](../adr/0006-wal-durability-defaults.md)：同步策略与耐久级别选择。
-- [写入路径与 WriteBatch](write-path.md)：txn_batch 与写集的提交路径。
-- [VFS 设计](vfs.md)：数据目录围栏与位置 I/O（WAL 依赖的底层抽象）。
+- RocksDB [Write-Ahead Log](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/03_wal.md): 32 KB blocks, fragmentation, CRC optimization, and WAL reclamation.
+- RocksDB [Crash Recovery](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/09_crash_recovery.md): recovery flow, WAL recovery modes, and truncation.
+- [ADR-0006 WAL durability defaults](../adr/0006-wal-durability-defaults.md): sync policy and durability-level selection.
+- [Write path and WriteBatch](write-path.md): `txn_batch` and write-set commit path.
+- [VFS design](vfs.md): data-directory fencing and positioned I/O, the lower-level abstraction used by WAL.

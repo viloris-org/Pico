@@ -1,18 +1,18 @@
-# 主存储采用 LSM 风格写优化结构
+# Use an LSM-Style Write-Optimized Structure for Primary Storage
 
-用户表数据的持久化主路径采用 **LSM 风格**（内存表 → 刷盘有序文件 → 分层压缩），写路径以追加为主，而不是默认的原地更新 B-Tree 页修改。
+The primary persistence path for user table data uses an **LSM-style** structure (memtable → flushed sorted files → leveled compaction). The write path is primarily append-oriented rather than based on in-place B-Tree page updates.
 
-关系模型仍是用户视角（表、行、主键、二级索引）；LSM 是表与索引的物理组织方式。
+The relational model remains the user-facing model (tables, rows, primary keys, and secondary indexes); LSM is the physical organization for tables and indexes.
 
 ## Considered Options
 
-- **原地 B-Tree（SQLite/PG 经典路径）**：点读友好，但热点页锁与随机写在高争用写入下容易恶化。
-- **纯 WAL + 内存（重启靠重放）**：实现简单，无法支撑超内存数据集与可接受启动时间。
-- **LSM / 写优化结构（采纳）**：顺序写与版本追加更契合「写性能好、高争用不崩」；用块缓存、Bloom 等补偿读放大。
-- **Bε-tree 等混合结构**：读放大更可控，但实现与论文细节更重，留作 LSM 不足时的演进选项。
+- **In-place B-Tree (the classic SQLite/PostgreSQL path)**: Friendly to point reads, but hot-page locks and random writes can deteriorate under high-contention workloads.
+- **WAL + memory only (replay on restart)**: Simple to implement, but cannot support datasets larger than memory with an acceptable startup time.
+- **LSM / write-optimized structure (adopted)**: Sequential writes and appended versions better support good write performance without collapsing under contention; block caches, Bloom filters, and similar techniques offset read amplification.
+- **Hybrid structures such as Bε-trees**: More controllable read amplification, but heavier implementation and paper-specific details; retained as an evolution option if LSM proves insufficient.
 
 ## Consequences
 
-- 必须从第一天设计 compaction、读放大与空间放大的可观测性，不能当事后优化。
-- 二级索引与主键索引均为 LSM（或等价有序集合）上的独立结构，事务提交需保持索引与表一致。
-- 若未来切换物理结构，应维持「有序集合 + WAL + MVCC」的逻辑边界，避免执行层绑死文件格式细节。
+- Observability for compaction, read amplification, and space amplification must be designed from day one, not treated as a later optimization.
+- Secondary and primary indexes are independent LSM structures (or equivalent ordered sets); transaction commits must keep indexes and tables consistent.
+- If the physical structure changes in the future, preserve the logical boundary of “ordered set + WAL + MVCC” so the execution layer does not become coupled to file-format details.

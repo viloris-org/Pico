@@ -1,16 +1,16 @@
-# 产品定位：单机轻量网络 OLTP，而非嵌入式或分布式
+# Product Positioning: Lightweight Single-Node Network OLTP, Not Embedded or Distributed
 
-Pico 定位为**单机服务端**数据库：单二进制部署、低资源、快启动、可多客户端网络访问，并优先写路径在高争用下的可预期行为。
+Pico is positioned as a **single-node server** database: a single-binary deployment with low resource usage, fast startup, network access for multiple clients, and predictable write-path behavior under high contention.
 
-**明确非目标（至少在引入新 ADR 之前）**：纯嵌入式库形态、多机共识集群、完整分析型（OLAP）引擎、与 PostgreSQL 服务器对等的功能广度。
+**Explicit non-goals (at least until a new ADR is introduced)**: a purely embedded library form, a multi-node consensus cluster, a full analytical (OLAP) engine, and feature breadth equivalent to the PostgreSQL server.
 
 ## Considered Options
 
-- **嵌入式优先（SQLite 路线）**：极轻，但默认不是网络服务，多写者模型与「可网络访问」产品叙事冲突。
-- **分布式 SQL**：生态故事强，但部署与运维复杂度直接违反「轻」。
-- **单机网络 OLTP（采纳）**：满足轻与可网络访问；复制/只读副本可在单机引擎稳固后再议。
+- **Embedded-first (SQLite path)**: Extremely lightweight, but not a network service by default; its multiple-writer model conflicts with the network-accessible product story.
+- **Distributed SQL**: A strong ecosystem story, but its deployment and operations complexity directly violates the lightweight goal.
+- **Single-node network OLTP (adopted)**: Satisfies both lightweight operation and network access; replication and read-only replicas can be considered after the single-node engine is solid.
 
 ## Consequences
 
-- 所有「集群 / 分片 / 自动故障转移」需求默认拒绝或单独立项，不得渗入 v1 存储与事务语义。
-- 嵌入式链接形态若未来需要，应复用同一引擎，而不是把服务端做成库的薄包装反过来主导设计。
+- All “cluster / sharding / automatic failover” requests are rejected by default or handled as separate initiatives; they must not enter the v1 storage or transaction semantics.
+- If an embedded linking form is needed in the future, it should reuse the same engine rather than allowing a thin library wrapper around the server to drive the design.

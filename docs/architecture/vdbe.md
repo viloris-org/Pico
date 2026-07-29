@@ -1,204 +1,200 @@
-# 执行引擎（VDBE 风格）
+# Execution Engine (VDBE Style)
 
-## 状态与范围
+## Status and Scope
 
-本文定义 Pico **语句执行层**的目标形态，对照 SQLite 的 Virtual Database Engine
-（[`vdbe.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbe.h)、
-[`vdbe.c`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbe.c)、
-[`vdbeaux.c`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbeaux.c)）。
+This document defines the target shape of Pico's **statement execution layer**, using
+SQLite's Virtual Database Engine as a reference ([`vdbe.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbe.h), [`vdbe.c`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbe.c), [`vdbeaux.c`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbeaux.c)).
 
-当前 Phase 0/1 实现是 `src/sql/exec.zig` 上的**直接解释**：解析 AST 后立即调用
-`storage/engine` 的表操作，没有独立字节码、寄存器文件或可暂停的程序计数器。
-`BEGIN` / `COMMIT` / `ROLLBACK` 仍是兼容标签，尚无跨语句写集（见
-[并发控制契约](concurrency-control.md)）。
+The current Phase 0/1 implementation is **direct interpretation** in `src/sql/exec.zig`:
+it calls `storage/engine` table operations immediately after parsing the AST, with no
+bytecode, register file, or pausable program counter. `BEGIN` / `COMMIT` / `ROLLBACK` are
+still compatibility tags and there is no cross-statement write set yet (see the
+[concurrency control contract](concurrency-control.md)).
 
-本文不要求字节码格式与 SQLite 操作码编号兼容，也不把 VDBE 当作对外 API。它要
-固定的是：**SQL 子集 → 可检查的执行程序 → 通过事务/存储边界产生效果**，以便
-计划、执行、取消、解释与测试能够分层，而不是继续把语义堆进单个 `execStmt`。
+This does not require a bytecode format or opcode numbering compatible with SQLite, and VDBE
+is not a public API. The fixed boundary is **SQL subset -> inspectable execution program ->
+effects through transaction/storage boundaries**, so planning, execution, cancellation,
+explanation, and testing remain layered instead of accumulating in one `execStmt`.
 
-## 外部参考及适用性
+## External References and Applicability
 
-| 参考 | 已核对的机制 | Pico 的采用方式 | 明确不采用 |
+| Reference | Mechanisms reviewed | Pico's approach | Explicitly not adopted |
 | --- | --- | --- | --- |
-| SQLite `Vdbe` / `VdbeOp` | 语句编译为操作码序列；P1–P5 操作数；寄存器 `Mem`；游标表 | 目标：每条已绑定语句对应一份**执行程序**（操作序列 + 有界工作区） | 与 SQLite 操作码稳定 ABI 兼容；触发器子程序全盘复制 |
-| `OP_Transaction` / `OP_Halt` / `OP_Goto` | 显式事务边界与控制流 | 事务进入/退出是程序中的显式步骤，最终效果仍经 `txn`/`commit` | 在操作码里直接抢 B-Tree 写锁或开始 rollback journal |
-| `OP_OpenRead` / `OP_Column` / `OP_Next` / `OP_ResultRow` | 游标扫描与投影、逐行产出 | 游标抽象在 **LSM/memtable 有序迭代 + 快照可见性** 上 | `OP_Open*` 绑定 sqlite B-Tree 页游标 |
-| `OP_Insert` / `OP_Delete` 等 | 在 VM 内直接改存储 | 写操作只构造/合并**写集**或发出提交请求，不绕过单写者 | 执行线程直接 `fsync` 库文件或发布 manifest |
-| VDBE 可中断步进 | 进度回调、`isInterrupted`、按操作码边界响应 | 与连接**取消**和语句代次对齐：在操作码/有界批次边界采样取消 | 取消已进入 WAL 耐久边界的提交 |
-| `EXPLAIN` / 扫描状态 | 操作码与计划可观测 | 目标支持解释执行程序与基本计数器 | 承诺 PG `EXPLAIN ANALYZE` 全语义 |
+| SQLite `Vdbe` / `VdbeOp` | Statements compile to opcode sequences; P1-P5 operands; `Mem` registers; cursors | Target: each bound statement has an **execution program** (operation sequence plus bounded workspace) | Stable SQLite opcode ABI compatibility; wholesale trigger-subprogram copying |
+| `OP_Transaction` / `OP_Halt` / `OP_Goto` | Explicit transaction boundaries and control flow | Transaction entry/exit are explicit program steps; effects still pass through `txn`/`commit` | Taking B-Tree write locks or starting a rollback journal directly in opcodes |
+| `OP_OpenRead` / `OP_Column` / `OP_Next` / `OP_ResultRow` | Cursor scans, projection, and row-at-a-time output | Cursor abstraction over **ordered LSM/memtable iteration plus snapshot visibility** | Binding `OP_Open*` to SQLite B-Tree page cursors |
+| `OP_Insert` / `OP_Delete`, etc. | Direct storage changes inside the VM | Writes construct/merge a **write set** or issue a commit request without bypassing the single writer | Execution threads directly `fsync`ing database files or publishing manifests |
+| Interruptible VDBE stepping | Progress callbacks, `isInterrupted`, and opcode-boundary response | Aligned with connection **cancellation** and statement generations; sample cancellation at opcode/bounded-batch boundaries | Cancelling a commit that has entered the WAL durability boundary |
+| `EXPLAIN` / scan status | Observable opcodes and plans | Target supports explaining the execution program and basic counters | Promising the full semantics of PostgreSQL `EXPLAIN ANALYZE` |
 
-SQLite 的力量在于：解析器很大，但运行时主循环相对规则——所有语句都化成对
-存储游标与寄存器的操作。Pico 需要同样的**深度接口**，但存储游标的背后是
-MVCC + LSM + 单写者，而不是 pager 保护下的 B-Tree 页改。
+SQLite's strength is that its parser is large but its runtime loop is regular: every
+statement becomes a sequence of operations on storage cursors and registers. Pico needs the
+same **strong abstraction**, but its cursors sit over MVCC + LSM + a single writer rather than pager-protected
+B-Tree pages.
 
-## 在整体中的位置
+## Position in the System
 
 ```mermaid
 flowchart LR
-  net["net 连接 / 扩展查询"] --> prep["sql 解析与绑定"]
-  prep --> prog["执行程序\n(VDBE 风格)"]
-  prog --> txn["txn 快照与写集"]
-  prog --> read["读路径：快照 + 游标"]
-  txn --> commit["commit 单写者"]
+  net["net connection / extended queries"] --> prep["sql parse and bind"]
+  prep --> prog["execution program\n(VDBE style)"]
+  prog --> txn["txn snapshot and write set"]
+  prog --> read["read path: snapshot + cursor"]
+  txn --> commit["commit single writer"]
   read --> lsm["LSM / memtable"]
   commit --> wal["WAL"]
   commit --> lsm
 ```
 
-| 阶段 | 所有者 | 产出 | 禁止 |
+| Stage | Owner | Output | Forbidden |
 | --- | --- | --- | --- |
-| 词法/解析 | `sql` | AST 或等价结构化语句 | 执行副作用 |
-| 绑定 | `sql` | 类型检查后的常量/参数 | 写存储 |
-| 编译（目标） | `sql` | 执行程序 + 所需寄存器/游标数 | 打开网络或 WAL |
-| 执行 | `sql` 驱动，经 `txn`/`read` | 行流、写集、命令标签 | 直接改 `published_commit_seq` |
-| 提交 | `commit` | WAL + 发布 | 解析 SQL |
+| Lexing/parsing | `sql` | AST or equivalent structured statement | Execution side effects |
+| Binding | `sql` | Type-checked constants/parameters | Storage writes |
+| Compilation (target) | `sql` | Execution program plus required register/cursor counts | Opening the network or WAL |
+| Execution | `sql`, through `txn`/`read` | Row stream, write set, command tag | Directly changing `published_commit_seq` |
+| Commit | `commit` | WAL plus publication | Parsing SQL |
 
-`net` 只看到：准备好的语句、执行请求、行/标签、错误与 `ReadyForQuery` 所需的
-事务状态位。它不得解释操作码。
+`net` sees only prepared statements, execution requests, rows/tags, errors, and the
+transaction status bits required by `ReadyForQuery`. It must not interpret opcodes.
 
-## 执行程序模型
+## Execution Program Model
 
-### 程序与工作区
+### Program and Workspace
 
-目标对象（名称可在实现时调整，语义固定）：
+Target objects (names may change during implementation; semantics are fixed):
 
-- **Program**：只读操作序列；可对同连接上的重复执行复用（扩展查询的 plan 缓存
-  前提）。
-- **Instance**（一次执行）：程序计数器、寄存器文件、游标槽、结果暂存、错误码、
-  与连接语句代次的关联。
-- **Opcode**：操作码 + 固定小数目的整数/引用操作数（类比 P1–P5），禁止在操作码
-  里藏无界侧信道状态。
+- **Program**: a read-only operation sequence reusable for repeated execution on one connection (the basis for extended-query plan caching).
+- **Instance**: one execution containing a program counter, register file, cursor slots, result staging, an error code, and the connection's statement-generation association.
+- **Opcode**: an opcode plus a fixed small number of integer/reference operands (similar to P1-P5); opcodes must not hide unbounded side-channel state.
 
-寄存器保存标量、短生命周期引用和空值；大对象与行缓冲的所有权规则必须写清：
-要么由 Instance 竞技场分配并在执行结束释放，要么引用 pin 住的存储页/块并在
-`release` 前不可驱逐（若读路径经过 Pager）。
+Registers hold scalars, short-lived references, and nulls. Ownership rules for large objects
+and row buffers must be explicit: either an Instance arena owns them until execution ends, or
+references pin storage pages/blocks until `release` (when the read path uses Pager).
 
-### 操作码分组（目标最小集）
+### Opcode Groups (Target Minimum)
 
-不追求 SQLite 数百操作码的全集。按 SQL 子集分期引入：
+Pico does not seek SQLite's hundreds of opcodes. Groups are introduced in stages according to
+the SQL subset:
 
-| 组 | 例子（概念名） | 作用 |
+| Group | Examples (conceptual names) | Purpose |
 | --- | --- | --- |
-| 控制 | `Goto`、`Halt`、`HaltIf`、`Gosub`/`Return`（若需要） | 分支与结束；错误码进入 `Halt` |
-| 事务 | `TxBegin`、`TxCommit`、`TxRollback`、`SnapshotOpen` | 只调用 `txn` API；Commit 只入队 |
-| 常量/表达式 | `Integer`、`Text`、`Null`、`Copy`、`Function` | 寄存器计算；函数集由 SQL 子集规定 |
-| 游标 | `OpenScan`、`OpenSeek`、`Next`、`Rewind`、`Close` | 基于快照的有序扫描/点查 |
-| 行 | `Column`、`ResultRow`、`MakeRecord` | 投影与协议行产出 |
-| 写集 | `WriteInsert`、`WriteUpdate`、`WriteDelete` | 变更进入私有写集，含约束候选 |
-| 元数据 | `OpenCatalog`、`CreateTable`… | 目录变更同样进写集/提交，不直写文件 |
+| Control | `Goto`, `Halt`, `HaltIf`, `Gosub`/`Return` (if needed) | Branching and termination; errors enter `Halt` |
+| Transactions | `TxBegin`, `TxCommit`, `TxRollback`, `SnapshotOpen` | Call only `txn` APIs; `Commit` only enqueues |
+| Constants/expressions | `Integer`, `Text`, `Null`, `Copy`, `Function` | Register computation; functions are defined by the SQL subset |
+| Cursors | `OpenScan`, `OpenSeek`, `Next`, `Rewind`, `Close` | Snapshot-based ordered scans and point lookups |
+| Rows | `Column`, `ResultRow`, `MakeRecord` | Projection and protocol row output |
+| Write set | `WriteInsert`, `WriteUpdate`, `WriteDelete` | Put changes in the private write set, including constraint candidates |
+| Metadata | `OpenCatalog`, `CreateTable`, ... | Catalog changes also enter the write set/commit and do not write files directly |
 
-每个操作码的文档必须声明：是否 I/O、是否可取消点、是否可能入提交队列、失败时
-事务状态如何变化。这对应 SQLite 在 `vdbe.c` 里用注释描述 Opcode/Synopsis 的
-做法，但 Pico 的权威说明落在本架构与代码旁注释，而不是生成一套对外操作码手册。
+Each opcode document must state whether it performs I/O, is a cancellation point, may enter
+the commit queue, and how transaction state changes on failure. This mirrors SQLite's
+Opcode/Synopsis comments in `vdbe.c`, but Pico's authoritative description is this
+architecture and adjacent code comments, not a public opcode manual.
 
-### 主循环不变量
+### Main-Loop Invariants
 
-1. **一次只推进有界工作**：单次 `step` 执行有限操作码或有限行，然后把控制交回
-   连接调度，以便公平与取消（见 [运行时](runtime-and-concurrency.md)）。
-2. **取消采样点**：至少在 `Next`、表达式批、等待提交、以及任何可能阻塞的 I/O
-   申请之前检查语句代次取消标记。
-3. **读不阻塞写**：游标只解释快照水位 + 本事务写集；不取全局表锁。
-4. **写不发布**：写操作码不得调用 VFS 写 WAL/LSM 最终状态；只有 `commit` 单写者
-   在验证后发布。
-5. **错误范围**：表达式/约束/子集拒绝 → 语句失败；存储损坏/WAL 关键失败 → 不得
-   被包装成普通 SQL 错误而继续服务写请求（上交实例故障路径）。
-6. **可解释**：同一 Program 在 `EXPLAIN` 模式下可打印操作序列，不执行副作用
-  （或只执行无副作用的分析路径）。
+1. **Advance only bounded work**: each `step` executes a bounded number of opcodes or rows, then returns control to connection scheduling for fairness and cancellation (see [runtime](runtime-and-concurrency.md)).
+2. **Cancellation sampling**: check the statement-generation cancellation flag before `Next`, expression batches, commit waits, and any potentially blocking I/O request.
+3. **Reads do not block writes**: cursors interpret only the snapshot watermark and the transaction's write set; they do not take a global table lock.
+4. **Writes do not publish**: write opcodes must not use VFS to write final WAL/LSM state; only the `commit` single writer publishes after validation.
+5. **Error scope**: expression/constraint/subset rejection fails the statement; storage corruption or a critical WAL failure must not be wrapped as an ordinary SQL error while writes continue (enter the instance-failure path).
+6. **Explainability**: the same Program can print its operation sequence in `EXPLAIN` mode without side effects (or through a side-effect-free analysis path).
 
 ```mermaid
 sequenceDiagram
-  participant C as 连接
-  participant V as 执行实例
+  participant C as connection
+  participant V as execution instance
   participant T as txn
   participant W as commit
-
-  C->>V: step（有界）
-  V->>V: 操作码：打开快照游标、投影行
-  V-->>C: ResultRow 或 Waiting
+  C->>V: bounded step
+  V->>V: opcode: open snapshot cursor, project rows
+  V-->>C: ResultRow or Waiting
   C->>V: step
-  V->>T: 写集插入/更新
-  V->>T: 请求提交
-  T->>W: 入队
-  W->>W: 校验、WAL、发布
-  W-->>V: 成功或冲突
+  V->>T: insert/update write set
+  V->>T: request commit
+  T->>W: enqueue
+  W->>W: validate, WAL, publish
+  W-->>V: success or conflict
   V-->>C: CommandComplete
 ```
 
-## 与当前 `exec.zig` 的迁移关系
+## Migration from `exec.zig`
 
-| 现在 | 目标 |
+| Current | Target |
 | --- | --- |
-| `execStmt` 大 switch 直接调 engine | 编译器生成 Program；`step` 解释 |
-| `Engine.insert/update/delete` 立即改内存表并写 WAL | 写集缓冲；单写者批量发布 |
-| SELECT 一次物化所有行 | 游标 + `ResultRow` 流式产出，受连接输出背压 |
-| 取消几乎无 | 操作码边界采样取消 |
-| 计划不可见 | `EXPLAIN` 打印 Program |
+| Large `execStmt` switch calls engine directly | Compiler generates a Program; `step` interprets it |
+| `Engine.insert/update/delete` immediately change the in-memory table and write WAL | Buffer a write set; publish in single-writer batches |
+| SELECT materializes all rows at once | Cursor plus streamed `ResultRow`, subject to connection output backpressure |
+| Almost no cancellation | Cancellation sampled at opcode boundaries |
+| Plans are invisible | `EXPLAIN` prints the Program |
 
-迁移应保持 SQL 子集语义黄金测试不变：先引入 Program 表示与同等语义的解释器，
-再切开写集与提交，最后再扩展操作码覆盖 JOIN 等（须先更新支持矩阵与 ADR 若
-触及产品边界）。
+Migration must keep SQL-subset golden tests unchanged: introduce the Program representation
+and an equivalent interpreter first, then separate write sets from commit, and only later add
+opcode coverage such as JOIN (after updating the support matrix and an ADR if the product
+boundary changes).
 
-## 游标与存储的接缝
+## Cursor/Storage Seam
 
-执行层可见的游标接口应是深的、小的：
+The cursor interface exposed to execution should be narrow and expressive:
 
-- 在快照 `s` 下打开某表或二级索引的点查/范围扫；
-- `next` / `seek` / `column`；
-- 关闭并释放 pin/缓冲。
+- Open a point lookup or range scan over a table or secondary index at snapshot `s`.
+- `next` / `seek` / `column`.
+- Close and release pins/buffers.
 
-其下可以是 memtable 跳跃、SST 块迭代、或（若元数据在页文件上）Pager 页 pin。
-执行层**不得**依赖 SSTable 文件名、页号或 WAL 偏移来解释 SQL 可见性。
+The implementation underneath may use memtable skipping, SST block iteration, or Pager page
+pins when metadata is stored in page files. The execution layer **must not** depend on
+SSTable file names, page numbers, or WAL offsets to interpret SQL visibility.
 
-写路径接缝同样小：
+The write-path seam is equally small:
 
-- `write_set.insert/update/delete`；
-- `commit_request`；
-- 冲突与约束错误码。
+- `write_set.insert/update/delete`;
+- `commit_request`;
+- conflict and constraint error codes.
 
-这落实 ADR-0004 的逻辑边界：「有序集合 + WAL + MVCC」，执行层只依赖该边界。
+This implements ADR-0004's logical boundary: “ordered set + WAL + MVCC.” Execution depends
+only on that boundary.
 
-## 资源与静态上限
+## Resource and Static Limits
 
-与静态页缓存、I/O 容量同一哲学：
+The philosophy is the same as for static page caches and I/O capacity:
 
-| 资源 | 上限来源 | 饱和行为 |
+| Resource | Limit source | Saturation behavior |
 | --- | --- | --- |
-| 寄存器数 / 游标数 | 编译期由语句形状决定，受配置硬顶 | 编译失败，而不是执行中扩表 |
-| 单次 step 操作码或行数 | 运行时配置 | 返回 `Pending`，连接改调度其他工作 |
-| 结果输出 | 连接 `foreground_write` 预算 | 暂停 `ResultRow`，不丢已产生行序 |
-| 写集大小 | 配置 | 语句失败或提前不入队；不静默落盘 |
+| Register/cursor count | Statement shape at compile time, capped by configuration | Compilation fails rather than growing during execution |
+| Opcodes or rows per step | Runtime configuration | Return `Pending`; let the connection schedule other work |
+| Result output | Connection `foreground_write` budget | Pause `ResultRow` without losing row order |
+| Write-set size | Configuration | Fail the statement or refuse enqueueing early; never spill silently |
 
-禁止在操作码实现里为「临时表」无限 `malloc` 而不计入写集/临时预算。若引入
-排序/哈希聚合溢出，必须有显式临时文件路径（经 VFS）与限制。
+Opcode implementations must not `malloc` an unlimited “temporary table” outside the
+write-set/temporary budget. Sort or hash-aggregate spill requires an explicit temporary-file
+path through VFS and explicit limits.
 
-## 观测、故障与验收
+## Observability, Faults, and Acceptance
 
-指标：每语句操作码步数、行产出数、游标打开数、写集条目、提交等待、取消命中、
-程序缓存命中（若有）、各操作码组耗时。调试可提供「当前 pc + 操作码」但不对
-用户连接默认倾倒寄存器内容。
+Metrics include opcode steps per statement, rows produced, cursors opened, write-set entries,
+commit wait, cancellation hits, Program-cache hits (if any), and time by opcode group. Debug
+interfaces may expose the current pc and opcode, but connections must not receive register
+contents by default.
 
-最低验收（执行程序落地后）：
+Minimum acceptance after the execution program lands:
 
-1. 现有 `exec.zig` SQL 子集用例在 Program 解释下黄金结果一致。
-2. 大 `SELECT` 在输出背压下可分步；慢读者不阻塞其他连接提交。
-3. 执行中取消：未入队写丢弃；已分配提交序号未写 WAL 的请求确定终止；WAL 耐久
-   后取消不撤销提交。
-4. 编译不支持的 SQL 在生成 Program 前失败，不产生半程序副作用。
-5. 故障注入：游标 I/O 失败、提交冲突、约束失败的错误码稳定且事务状态机符合
-   并发控制契约。
+1. Existing `exec.zig` SQL-subset cases produce identical golden results under Program interpretation.
+2. Large `SELECT` statements yield incrementally under output backpressure; slow readers do not block other connection commits.
+3. Cancellation during execution discards unqueued writes; requests with an assigned sequence but no WAL write terminate deterministically; cancellation after WAL durability does not undo a commit.
+4. Unsupported SQL fails before Program generation and produces no partial side effects.
+5. Fault injection keeps cursor-I/O, commit-conflict, and constraint-failure error codes stable and keeps the transaction state machine within the concurrency control contract.
 
-## 实施边界
+## Implementation Boundaries
 
-1. **现在**：AST 直接执行；文档与测试定义语义基线。
-2. **下一步**：引入只读 Program（控制 + 游标 + `ResultRow`），SELECT 先迁移。
-3. **再下一步**：写集操作码 + 与单写者对接；`Tx*` 操作码替换标签式 BEGIN/COMMIT。
-4. **随后**：扩展查询下的 Program 缓存、`EXPLAIN`、基本计数器。
-5. **需要新 ADR**：用户可见的字节码 ABI、存储过程/触发器语言、与 PostgreSQL
-   执行器节点一对一兼容、在 VM 内实现完整查询优化器规则集的产品承诺。
+1. **Now**: execute the AST directly; documents and tests define the semantic baseline.
+2. **Next**: introduce a read-only Program (control, cursors, and `ResultRow`) and migrate SELECT first.
+3. **After that**: add write-set opcodes and connect them to the single writer; replace tag-style BEGIN/COMMIT with `Tx*` opcodes.
+4. **Then**: add Program caching under extended queries, `EXPLAIN`, and basic counters.
+5. **Requires a new ADR**: user-visible bytecode ABI, stored-procedure/trigger language, one-to-one compatibility with PostgreSQL executor nodes, or a product promise for a complete VM query-optimizer rule set.
 
-## 命名说明
+## Naming
 
-文档与内部模块可称 **VDBE**、**执行程序** 或 **bytecode VM**。对外产品叙述用
-「SQL 子集的执行」，避免让用户以为可加载 SQLite 字节码或兼容 `EXPLAIN` 的
-SQLite 格式。代码标识符保持英语；领域讨论在中文里优先用**执行程序**／**操作码**，
-在与 SQLite 对照时再写 VDBE。
+Documents and internal modules may call this **VDBE**, **execution program**, or **bytecode
+VM**. External product language should say “SQL subset execution” so users do not assume
+that SQLite bytecode can be loaded or that SQLite's `EXPLAIN` format is compatible. Code
+identifiers remain English.

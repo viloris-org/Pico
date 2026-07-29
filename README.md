@@ -1,6 +1,6 @@
 # Pico Server
 
-[中文](README.zh-CN.md) | English
+English
 
 Pico Server is a lightweight, single-node OLTP database written in Zig. It
 runs as a standalone network service. It is one of two independently released

@@ -1,284 +1,284 @@
-# LSM 存储引擎设计
+# LSM Storage Engine Design
 
-## 概述
+## Overview
 
-Pico 采用 **LSM 风格**（Log-Structured Merge-Tree）作为表与索引的主存储组织方式。LSM 以追加写为主，将随机写转化为顺序写，与 Pico 的"写性能好、高争用不崩"目标一致（见 ADR-0004）。关系模型（表、行、主键、二级索引）是用户视角；LSM 是物理组织方式。
+Pico uses an **LSM-style** (Log-Structured Merge-Tree) organization as the primary storage layout for tables and indexes. LSM favors append-only writes and turns random writes into sequential writes, matching Pico's goal of strong write performance without collapsing under contention (see ADR-0004). The relational model (tables, rows, primary keys, and secondary indexes) is the user-facing view; LSM is the physical organization.
 
-本文件记录 LSM 存储引擎的目标设计与演进路径。当前实现状态见 [README](../README.md)。
-
----
-
-## 设计原则
-
-- **有序集合 + WAL + MVCC** 是逻辑边界：执行层不绑定文件格式细节。
-- 所有写走 WAL → 内存表管道；SST 文件一旦写入即不可变（仅压缩可改写）。
-- 二级索引与主表共享同一 LSM 结构；事务提交易失性产出跨表/索引的 WAL 记录。
-- 压缩与读放大/空间放大的可观测性是第一天设计约束，不是事后补充。
+This document records the target design and evolution path for the LSM storage engine. See [README](../../README.md) for the current implementation status.
 
 ---
 
-## 架构总览
+## Design Principles
+
+- **Ordered set + WAL + MVCC** is the logical boundary: the execution layer does not depend on file format details.
+- All writes follow the WAL -> memtable pipeline; once written, SST files are immutable (only compaction may rewrite them).
+- Secondary indexes and primary tables share the same LSM structure; transaction commit produces a volatile WAL record spanning the affected tables/indexes.
+- Observability for compaction, read amplification, and space amplification is a day-one design constraint, not a later add-on.
+
+---
+
+## Architecture Overview
 
 ```mermaid
 flowchart TB
-    writer["写入（单写者路径）"] --> wal["WAL 追加"]
-    wal --> mem["Active MemTable\n（活跃内存表）"]
-    mem --> imm["Immutable MemTable\n（不可变内存表）"]
-    imm --> flush["Flush\n刷盘"]
-    flush --> l0["L0 SST 文件\n（无序/弱有序）"]
-    l0 --> compact["Compaction\n压缩合并"]
-    compact --> l1["L1..L{N} SST 文件\n（层级有序）"]
-    reader["读取路径"] --> mem
+    writer["Write (single-writer path)"] --> wal["WAL append"]
+    wal --> mem["Active MemTable\n(active in-memory table)"]
+    mem --> imm["Immutable MemTable\n(immutable in-memory table)"]
+    imm --> flush["Flush"]
+    flush --> l0["L0 SST files\n(unordered/loosely ordered)"]
+    l0 --> compact["Compaction"]
+    compact --> l1["L1..L{N} SST files\n(level-ordered)"]
+    reader["Read path"] --> mem
     reader --> imm
     reader --> l0
     reader --> l1
-    manifest["Manifest\n版本元数据"] --> l0
+    manifest["Manifest\n(version metadata)"] --> l0
     manifest --> l1
 ```
 
-### 组件职责
+### Component Responsibilities
 
-| 组件 | 职责 |
+| Component | Responsibility |
 |------|------|
-| **Active MemTable** | 接收当前写入的可变内存有序集合。写满后冻结为 Immutable。 |
-| **Immutable MemTable** | 只读内存有序集合，等待刷盘为 L0 SST。允许多个并存。 |
-| **L0 SST** | 直接由 flush 产生的不可变有序文件。L0 内文件区间可重叠。 |
-| **L1..L{N} SST** | 层级有序的不可变有序文件。层级内区间不重叠，覆盖全局键空间。 |
-| **Manifest** | 记录所有 SST 文件的层级归属、键区间、文件号和版本号。WAL 的保护对象之一。 |
-| **WAL** | 恢复的事实来源（见 [WAL 与崩溃恢复](wal-and-recovery.md)）。 |
+| **Active MemTable** | Holds the current mutable in-memory ordered set. Freezes into an Immutable when full. |
+| **Immutable MemTable** | Read-only in-memory ordered set waiting to be flushed to an L0 SST. Multiple Immutable MemTables may coexist. |
+| **L0 SST** | Immutable ordered file produced directly by flush. File ranges may overlap within L0. |
+| **L1..L{N} SST** | Immutable, level-ordered files. Ranges do not overlap within a level, and together cover the key space. |
+| **Manifest** | Records the level, key range, file number, and version number for every SST file. One of the objects protected by the WAL. |
+| **WAL** | Source of truth for recovery (see [WAL and Crash Recovery](wal-and-recovery.md)). |
 
 ---
 
-## MemTable（内存表）
+## MemTable (In-Memory Table)
 
-### 数据结构
+### Data Structure
 
-Active MemTable 是一个支持并发读（写者串行插入）的有序数据结构：
+An Active MemTable is an ordered data structure supporting concurrent reads while writes are serialized:
 
-- **默认实现**：跳表（skiplist），O(log n) 期望插入/查找。
-- **可选实现**：有序向量 + 二分查找（适用于小数据量或批构造）。
-- **布隆过滤器**：可选的前缀/整键布隆过滤，减少不存在的键对 SST 的读取。
+- **Default implementation**: skiplist, with expected O(log n) insertion and lookup.
+- **Optional implementation**: sorted vector plus binary search, suitable for small data sets or batch construction.
+- **Bloom filter**: optional prefix/full-key Bloom filter to reduce reads of SSTs that cannot contain a key.
 
-### 内部键编码
+### Internal Key Encoding
 
-每笔 MemTable 条目编码为连续字节序列：
+Each MemTable entry is encoded as a contiguous byte sequence:
 
-| 字段 | 编码 | 描述 |
+| Field | Encoding | Description |
 |------|------|------|
-| key_size | varint | 用户键长度 |
-| user_key | bytes | 用户键 |
+| key_size | varint | User-key length |
+| user_key | bytes | User key |
 | seq | fixed64 | `(commit_seq << 8) \| value_type` |
-| value_size | varint | 值长度 |
-| value | bytes | 值数据 |
+| value_size | varint | Value length |
+| value | bytes | Value data |
 
-相同 user_key 的条目按 commit_seq **降序**排列（最新在前），保证点查立即返回最新版本。
+Entries for the same user key are ordered by `commit_seq` in **descending** order (newest first), so a point lookup can immediately return the newest version.
 
-### 内存管理
+### Memory Management
 
-- MemTable 使用 arena 分配器进行批量内存分配，降低碎片和记账开销。
-- 刷盘后整个 MemTable 的 arena 一次性释放，不逐条回收。
-- 全局 `WriteBufferManager` 协调所有内存表的总内存上限，超过阈值触发写入停滞（write stall）。
+- MemTables use an arena allocator for bulk allocation, reducing fragmentation and accounting overhead.
+- After flush, the entire MemTable arena is released at once rather than reclaimed entry by entry.
+- A global `WriteBufferManager` coordinates the total memory limit across all memtables; exceeding the threshold triggers a write stall.
 
-### 切换条件
+### Switching Conditions
 
-当活跃 MemTable 满足以下任一条件时切换为 Immutable：
+The active MemTable switches to Immutable when any of the following is true:
 
-1. 内存使用量超过 `write_buffer_size`（编译期或启动时配置）。
-2. 活跃 MemTable 关联的 WAL 文件达到大小上限。
-3. 显式 `FLUSH` 命令触发。
+1. Memory usage exceeds `write_buffer_size` (configured at compile time or startup).
+2. The WAL file associated with the active MemTable reaches its size limit.
+3. An explicit `FLUSH` command is issued.
 
-切换过程：
+Switching proceeds as follows:
 
-1. 当前 MemTable 标记为 Immutable。
-2. 创建新的 Active MemTable 与新的 WAL 文件。
-3. 后台线程将 Immutable MemTable 刷盘为 L0 SST。
+1. Mark the current MemTable Immutable.
+2. Create a new Active MemTable and a new WAL file.
+3. A background thread flushes the Immutable MemTable to an L0 SST.
 
 ---
 
-## SST 文件格式
+## SST File Format
 
-SST 文件是 LSM 的持久化有序存储单元。每个 SST 文件包含数据块、索引块和元数据。
+An SST file is the persistent ordered-storage unit of the LSM. Each SST file contains data blocks, index blocks, and metadata.
 
 ```
-[Footer] ← 指向元数据索引块的指针
-[元数据过滤器] ← 布隆过滤器、统计信息等
-[元数据索引] ← 各元数据块的位置与大小
-[数据索引] ← 每个数据块的最后一个键（用于二分查找）
-[数据块 N] ← 压缩的有序键值对
+[Footer] <- pointer to the metadata index block
+[Metadata filter] <- Bloom filter, statistics, and so on
+[Metadata index] <- location and size of each metadata block
+[Data index] <- last key of each data block (for binary search)
+[Data block N] <- compressed ordered key-value pairs
 ...
-[数据块 1] ← 压缩的有序键值对
-[Header] ← 文件 Magic、格式版本、键比较器名
+[Data block 1] <- compressed ordered key-value pairs
+[Header] <- file magic, format version, key-comparator name
 ```
 
-### 数据块
+### Data Blocks
 
-- 贪心打包：扫描键值对直到累计大小超过 `block_size`，或者当前键与前一个键共享的前缀长度超过 `block_restart_interval`（前缀压缩）。
-- 前缀压缩（delta encoding）：每个重启点记录完整键，后续记录只记录与前一个键的差异。
-- 可选压缩（Snappy/Zstd）：对整个数据块进行。
+- Greedy packing: scan key-value pairs until the accumulated size exceeds `block_size`, or the shared prefix of the current and previous keys exceeds `block_restart_interval` (prefix compression).
+- Prefix compression (delta encoding): each restart point records a complete key; subsequent records store only the difference from the previous key.
+- Optional compression (Snappy/Zstd): applied to the entire data block.
 
-### 数据索引
+### Data Index
 
-- 每个数据块的最后一个键（或分隔键）作为索引条目。
-- 读取时通过二分查找定位目标键所在的数据块。
+- The last key (or separator key) of each data block is an index entry.
+- Reads locate the data block containing a target key through binary search.
 
-### 元数据过滤器
+### Metadata Filters
 
-- 整键或前缀布隆过滤器。
-- 点查时先检查布隆过滤器，若提示不存在则跳过 SST 文件，避免不必要的 I/O。
+- Full-key or prefix Bloom filters.
+- Point lookups check the Bloom filter first; if it says the key is absent, the SST is skipped to avoid unnecessary I/O.
 
 ---
 
-## 写入路径
+## Write Path
 
 ```mermaid
 sequenceDiagram
-    participant C as 客户端
+    participant C as Client
     participant E as Engine
     participant W as WAL
     participant M as MemTable
 
     C->>E: DML / COMMIT
-    E->>E: 验证约束、构造写集
-    E->>W: 追加 WAL 记录
-    W-->>E: 确认（耐久级别决定同步与否）
-    E->>M: 插入 MemTable
-    E-->>C: 成功响应
+    E->>E: Validate constraints, build write set
+    E->>W: Append WAL record
+    W-->>E: Acknowledge (durability level determines sync)
+    E->>M: Insert into MemTable
+    E-->>C: Success response
 ```
 
-关键约束：
+Key constraints:
 
-- **WAL 先于 MemTable**：WAL 写入成功后，才插入 MemTable。这是崩溃恢复正确性的核心不变式。
-- **单写者序列化**：所有提交通过单写者路径串行化，MemTable 插入不需要加锁。
-- **写集原子性**：显式事务的所有操作在一个 `txn_batch` WAL 帧中写入；memtable 插入在 WAL 确认后顺序应用。
+- **WAL before MemTable**: insert into the MemTable only after the WAL write succeeds. This is the core crash-recovery invariant.
+- **Single-writer serialization**: all commits are serialized through the single-writer path, so MemTable insertion needs no lock.
+- **Write-set atomicity**: all operations in an explicit transaction are written in one `txn_batch` WAL frame; MemTable insertion is applied in order after WAL acknowledgment.
 
-见 [写入路径与 WriteBatch](write-path.md) 的详细设计。
-
----
-
-## 读取路径
-
-### 点查（Point Lookup）
-
-按键精确查找的路径（谓词为主键等值）：
-
-1. **Active MemTable**：查跳表（布隆过滤）。找到则返回最新版本。
-2. **Immutable MemTables**：按从新到旧顺序依次查找。找到则返回。
-3. **L0 SST**：按从新到旧顺序依次查找（L0 内区间可能重叠）。先检查布隆过滤器。
-4. **L1..L{N} SST**：二分查找定位可能包含该键的 SST 文件（层级内区间不重叠），然后读对应数据块。
-
-找到第一个可见版本后返回；若所有层级均返回墓碑（tombstone），则键不存在。
-
-### 范围扫描（Range Scan）
-
-按有序迭代器遍历键范围：
-
-1. 合并所有层级（MemTable + Immutable + L0 + L1..L{N}）的有序迭代器。
-2. 执行归并排序（merge sort），按 commit_seq 降序去重（最新版本优先）。
-3. 对用户返回每个键的最新可见版本。
+See [Write Path and WriteBatch](write-path.md) for the detailed design.
 
 ---
 
-## Compaction（压缩）
+## Read Path
 
-### 目标
+### Point Lookup
 
-- **限制 L0 文件数**：将 L0 的多个重叠文件合并为 L1 的无重叠文件。
-- **控制读放大**：减少点查和范围扫描需要检查的文件数。
-- **回收空间**：清除已覆盖的旧版本和被删除的墓碑。
-- **控制写放大**：避免过深的压缩层级导致过多写放大。
+The exact-key lookup path (for a primary-key equality predicate) is:
 
-### 触发条件
+1. **Active MemTable**: query the skiplist (and Bloom filter). If found, return the newest version.
+2. **Immutable MemTables**: search from newest to oldest. Return on the first match.
+3. **L0 SST**: search from newest to oldest (L0 ranges may overlap). Check the Bloom filter first.
+4. **L1..L{N} SST**: use binary search to locate SST files that may contain the key (ranges do not overlap within a level), then read the relevant data block.
 
-| 条件 | 操作 |
+Return the first visible version found; if every level returns a tombstone, treat the key as nonexistent.
+
+### Range Scan
+
+Traverse the key range with ordered iterators:
+
+1. Merge ordered iterators from every level (MemTable + Immutable + L0 + L1..L{N}).
+2. Run a merge sort and deduplicate by descending `commit_seq` (newest version first).
+3. Return the newest visible version of each key to the user.
+
+---
+
+## Compaction
+
+### Goals
+
+- **Limit L0 file count**: merge overlapping L0 files into non-overlapping L1 files.
+- **Control read amplification**: reduce the number of files checked by point lookups and range scans.
+- **Reclaim space**: remove superseded old versions and deletion tombstones.
+- **Control write amplification**: avoid excessive write amplification from overly deep compaction levels.
+
+### Triggers
+
+| Condition | Action |
 |------|------|
-| L0 文件数超过 `level0_file_num_compaction_trigger` | 选定一批 L0 文件合并到 L1 |
-| 某层级的总大小超过目标阈值 | 选择该层级中与下一层级重叠区间最大的一个 SST 文件进行合并 |
-| 手动 `COMPACT` 命令 | 按用户指定的键区间压缩 |
+| L0 file count exceeds `level0_file_num_compaction_trigger` | Select a batch of L0 files and merge them into L1 |
+| Total size of a level exceeds its target | Select the SST with the largest overlap into the next level and merge it |
+| Manual `COMPACT` command | Compact the key range specified by the user |
 
-### 压缩策略
+### Compaction Strategy
 
-**Size-Tiered Compaction（按层级）**：
+**Size-Tiered Compaction (by level)**:
 
-- L1 及以上层级内部键区间不重叠，每个层级有固定的大小目标（逐层放大 10 倍）。
-- 选择层级中与下一层级重叠比例最高的文件进行压缩。
-- 压缩输入：该文件及其与下一层级的所有重叠文件。
-- 压缩输出：一组新的 L{N+1} SST 文件，键区间不重叠。
+- Key ranges do not overlap within L1 and above; each level has a fixed size target, increasing by 10x per level.
+- Select the file with the highest overlap ratio with the next level.
+- Compaction input: that file and every overlapping file in the next level.
+- Compaction output: a set of new L{N+1} SST files with non-overlapping key ranges.
 
-### 压缩过程
+### Compaction Process
 
-1. 选定的 SST 文件集合 → 归并排序读取所有条目。
-2. 按 commit_seq 判断版本可见性，丢弃被覆盖的旧版本。
-3. 按新层级的目标 SST 大小打包输出文件。
-4. 所有输出文件写完后进行 fsync。
-5. 原子更新 Manifest：移除输入文件，添加输出文件，递增版本号。
-6. 旧文件在所有引用其可见区间的快照释放后回收。
+1. Read all entries from the selected SST files with a merge sort.
+2. Determine version visibility by `commit_seq` and discard superseded old versions.
+3. Pack output files to the target SST size for the new level.
+4. `fsync` after all output files are written.
+5. Atomically update the Manifest: remove input files, add output files, and increment the version number.
+6. Reclaim old files after all snapshots referring to their visibility intervals are released.
 
 ---
 
-## Manifest（版本清单）
+## Manifest (Version Set)
 
-Manifest 是 LSM 版本的持久化记录。每次版本变更（flush、compaction）写入一条 manifest 记录。
+The Manifest is the persistent record of an LSM version. Each version change (flush or compaction) writes one Manifest record.
 
-### 记录类型
+### Record Types
 
-| 类型 | 内容 |
+| Type | Contents |
 |------|------|
-| `version_edit` | 新增 SST 文件（文件号、层级、键区间、大小、时间戳） |
-| `version_edit` | 删除 SST 文件（文件号、层级） |
-| `snapshot` | 当前快照列表（GC 安全边界） |
-| `wal_closed` | 已关闭的 WAL 文件及其大小 |
+| `version_edit` | Add an SST file (file number, level, key range, size, timestamp) |
+| `version_edit` | Remove an SST file (file number, level) |
+| `snapshot` | Current snapshot list (GC safety boundary) |
+| `wal_closed` | Closed WAL file and its size |
 
-### 生命周期
+### Lifecycle
 
-1. Flush/Compaction 完成后，构建 `VersionEdit`。
-2. 追加到 Manifest 文件（带 CRC 校验）。
-3. fsync Manifest（默认耐久级别下）。
-4. 更新内存中的 LSM 版本引用。
-5. 清除不再引用的文件的读缓存。
+1. Build a `VersionEdit` after flush or compaction completes.
+2. Append it to the Manifest file (with CRC validation).
+3. `fsync` the Manifest (at the default durability level).
+4. Update in-memory references to the LSM version.
+5. Clear the read cache for files that are no longer referenced.
 
-启动恢复时：
+During startup recovery:
 
-1. 打开并验证 Manifest（magic + CRC）。
-2. 按顺序重放所有 `VersionEdit` 重建 LSM 文件集合。
-3. 从最后一个 Manifest 记录之后的位置开始重放 WAL。
-
----
-
-## 快照与 GC
-
-### 快照编号
-
-- 每个提交获得单调递增的提交序号（`commit_seq`）。
-- 快照记录创建时的 `commit_seq`。
-- 可见性：只看到 `commit_seq ≤ snapshot_seq` 且未经删除的版本。
-
-### 空间回收
-
-- 压缩过程中，丢弃所有 `commit_seq < oldest_snapshot_seq` 的旧版本和被墓碑标记的已删除条目。
-- 只有当某 SST 文件中的全部条目对所有存活快照都不可见时，该文件才在压缩中被完全排除。
-- `oldest_snapshot_seq` 是最早活跃快照的序号，或当前分配的最新序号（无活跃快照时）。
+1. Open and validate the Manifest (magic + CRC).
+2. Replay all `VersionEdit` records in order to rebuild the LSM file set.
+3. Replay the WAL starting after the last Manifest record.
 
 ---
 
-## 当前实现状态 vs 目标
+## Snapshots and GC
 
-| 特性 | Phase 0（当前） | Phase 1 目标 | Phase 2+ 目标 |
+### Snapshot Numbers
+
+- Each commit receives a monotonically increasing commit sequence number (`commit_seq`).
+- A snapshot records the `commit_seq` at its creation.
+- Visibility: only versions with `commit_seq ≤ snapshot_seq` that have not been deleted are visible.
+
+### Space Reclamation
+
+- During compaction, discard old versions with `commit_seq < oldest_snapshot_seq` and deleted entries represented by tombstones.
+- An SST file is completely excluded from compaction only when all of its entries are invisible to every live snapshot.
+- `oldest_snapshot_seq` is the sequence number of the oldest active snapshot, or the latest allocated sequence number when no snapshot is active.
+
+---
+
+## Current Implementation vs. Target
+
+| Feature | Phase 0 (current) | Phase 1 target | Phase 2+ target |
 |------|----------------|-------------|--------------|
-| 内存表 | `ArrayList(Row)` + `HashMap` 主键索引 | 有序内存表（跳表或有序向量） | 带布隆过滤器的跳表 |
-| 持久化 | 纯内存（WAL 重放恢复） | L0 SST 刷盘 | 全层级 SST |
-| SST 格式 | 无 | 有格式的 SST 文件 | 前缀压缩 + 可选块压缩 |
-| Compaction | 无 | L0 → L1 合并 | 全层级 |
-| Manifest | 引擎内 `StringHashMap(Table)` | 持久化 Manifest 文件 | 带版本号与快照追踪的 Manifest |
-| 布隆过滤器 | 无 | 可选整键布隆 | 前缀布隆 |
-| 内存上限控制 | 无 | WriteBufferManager | 写停滞 |
-| 二级索引 | `CREATE INDEX` → `NotImplemented` | 作为独立 LSM 结构实现 | 覆盖索引（Index-Only Scan） |
+| MemTable | `ArrayList(Row)` + `HashMap` primary-key index | Ordered in-memory table (skiplist or sorted vector) | Skiplist with Bloom filter |
+| Persistence | In-memory only (WAL replay recovery) | Flush to L0 SST | Full SST levels |
+| SST format | None | Formatted SST files | Prefix compression + optional block compression |
+| Compaction | None | L0 -> L1 merge | All levels |
+| Manifest | In-engine `StringHashMap(Table)` | Persistent Manifest file | Manifest with version numbers and snapshot tracking |
+| Bloom filter | None | Optional full-key Bloom filter | Prefix Bloom filter |
+| Memory limit control | None | WriteBufferManager | Write stall |
+| Secondary indexes | `CREATE INDEX` -> `NotImplemented` | Implemented as independent LSM structures | Covering indexes (Index-Only Scan) |
 
 ---
 
-## 参考
+## References
 
-- RocksDB [MemTable Insertion](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/04_memtable_insert.md)：M-Table 内部键编码、arena 分配、并发插入。
-- RocksDB [Tombstone Lifecycle](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/08_tombstone_lifecycle.md)：墓碑在写路径、读路径和压缩中的生命周期。
-- [ADR-0004 LSM 存储引擎决策](../adr/0004-lsm-storage-engine.md)：选择 LSM 而非 B-Tree 的取舍分析。
-- [Pager 与静态页缓存](pager-and-static-cache.md)：SST 文件可选的页缓存层。
-- [并发控制契约](concurrency-control.md)：MVCC 快照与版本可见性。
+- RocksDB [MemTable Insertion](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/04_memtable_insert.md): internal key encoding, arena allocation, and concurrent insertion in the MemTable.
+- RocksDB [Tombstone Lifecycle](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/08_tombstone_lifecycle.md): the lifecycle of tombstones in the write path, read path, and compaction.
+- [ADR-0004 LSM Storage Engine Decision](../adr/0004-lsm-storage-engine.md): tradeoffs behind choosing LSM over B-Tree.
+- [Pager and Static Page Cache](pager-and-static-cache.md): optional page-cache layer for SST files.
+- [Concurrency Control Contract](concurrency-control.md): MVCC snapshots and version visibility.

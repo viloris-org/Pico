@@ -1,18 +1,18 @@
-# 并发模型：单写者提交排序 + MVCC 读
+# Concurrency Model: Single-Writer Commit Ordering + MVCC Reads
 
-变更的**提交排序与应用**由**单写者**路径串行化（允许内部批处理/队列合并）；读请求可并行，基于 **MVCC 快照**，使读默认不阻塞写。
+Changes are **ordered and applied** through a **single-writer** path (internal batching and queue merging are allowed); reads may run in parallel against **MVCC snapshots**, so they do not block writes by default.
 
-v1 隔离目标以 **Read Committed** 与可选快照读为主；完整可串行化、间隙锁等推后。
+The v1 isolation targets are primarily **Read Committed** and optional snapshot reads; full serializability, gap locks, and similar features are deferred.
 
 ## Considered Options
 
-- **粗粒度库/表写锁（SQLite 默认心智）**：实现简单，高并发写易互相堵住，违反争用目标。
-- **细粒度页锁/行锁 B-Tree（经典 RDBMS）**：成熟但实现与死锁处理成本高，和 LSM 主路径也不匹配。
-- **shard-per-core**：多核写扩展好，但跨分片事务与「轻」初期复杂度不划算。
-- **单写者 + MVCC + 批提交（采纳）**：消除写写锁风暴，吞吐在高 QPS 下可通过 group commit 摊薄 fsync；写上限受单写者路径约束，可接受为 v1 显式权衡。
+- **Coarse-grained database/table write locks (the default SQLite model)**: Simple to implement, but concurrent writes readily block one another and undermine the contention goal.
+- **Fine-grained page/row-locked B-Tree (classic RDBMS)**: Mature, but expensive to implement and handle deadlocks, and mismatched with the LSM primary path.
+- **shard-per-core**: Scales writes well across cores, but cross-shard transactions and the initial complexity are not worthwhile for a lightweight product.
+- **Single writer + MVCC + batched commits (adopted)**: Eliminates write contention; at high QPS, group commit amortizes `fsync`. The single-writer path imposes a write ceiling, an explicit and acceptable v1 tradeoff.
 
 ## Consequences
 
-- 写延迟的尾部由批处理窗口与 fsync 策略主导，需可配置且可观测。
-- 单写者是**语义与调度**约束，不禁止多线程做网络、压缩、盘 IO；禁止多条路径并发提交乱序写集。
-- 多核写扩展若成为瓶颈，另立 ADR 评估分片，而不是在单写者路径上堆复杂细锁。
+- Tail write latency is dominated by the batching window and `fsync` policy, which must be configurable and observable.
+- Single-writer is a **semantic and scheduling** constraint; it does not prohibit multiple threads from handling networking, compaction, or disk I/O. It does prohibit multiple paths from concurrently committing write sets out of order.
+- If multi-core write scaling becomes a bottleneck, evaluate sharding in a separate ADR rather than adding complex fine-grained locks to the single-writer path.

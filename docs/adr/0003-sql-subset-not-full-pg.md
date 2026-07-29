@@ -1,17 +1,17 @@
-# SQL 采用 OLTP 子集，不承诺完整 PostgreSQL 方言
+# Use an OLTP SQL Subset; Do Not Promise the Full PostgreSQL Dialect
 
-Pico 对外叙事为：**PostgreSQL 线协议 + 常用 OLTP SQL 子集**。解析器与执行器只实现已承诺的语句与类型；其余明确报错。
+Pico’s external offering is **the PostgreSQL wire protocol plus a common OLTP SQL subset**. The parser and executor implement only the promised statements and types; all others fail explicitly.
 
-v1 意图覆盖的能力方向：多表、主键与二级索引、`INSERT` / `UPDATE` / `DELETE` / `SELECT`（含基础 `WHERE`）、事务块、有限的类型集。存储过程、触发器、扩展、完整优化器与分析型语法不在初期范围。
+The intended v1 capabilities include multiple tables, primary and secondary indexes, `INSERT` / `UPDATE` / `DELETE` / `SELECT` (including basic `WHERE`), transaction blocks, and a limited type set. Stored procedures, triggers, extensions, a full optimizer, and analytical syntax are outside the initial scope.
 
 ## Considered Options
 
-- **完整 PG 兼容**：生态最大，但会吞噬数年工程，且与「轻」冲突。
-- **仅 KV / 非 SQL**：实现快，但放弃大量现有工具与心智模型。
-- **OLTP SQL 子集（采纳）**：保留驱动与 `psql` 工作流，同时锁住范围。
+- **Full PostgreSQL compatibility**: Offers the largest ecosystem, but would consume years of engineering effort and conflict with the lightweight goal.
+- **KV-only / non-SQL**: Fast to implement, but gives up many existing tools and mental models.
+- **OLTP SQL subset (adopted)**: Preserves driver and `psql` workflows while keeping the scope bounded.
 
 ## Consequences
 
-- 必须维护公开的「支持矩阵」（语句、类型、隔离级别），并随版本更新。
-- 目录与类型系统按子集设计，禁止为「以后可能兼容」过早引入沉重 catalog 形状。
-- 产品文案禁止单独使用「兼容 PostgreSQL」而不加「协议 / 子集」限定。
+- A public “support matrix” (statements, types, and isolation levels) must be maintained and updated with each release.
+- The catalog and type system are designed for the subset; heavy catalog shapes must not be introduced early for “possible future compatibility.”
+- Product copy must not say “PostgreSQL compatible” without specifying “protocol” or “subset.”

@@ -1,73 +1,59 @@
 # Pico Server
 
-中文 | [English](README.md)
+Pico Server is a lightweight, single-node OLTP database built in Zig. It runs as a standalone network service. Pico Client is a separate, independently released Pico product that provides the CLI, drivers, and developer tools.
 
-Pico Server 是一个使用 Zig 编写的轻量级单节点 OLTP 数据库。它以独立网络服务
-运行；Pico Client 则作为另一项独立发布的 Pico 产品，提供 CLI、驱动和开发者工具。
+Pico intentionally implements an OLTP-oriented SQL subset. It is not PostgreSQL-compatible: Pico defines the wire protocol, SQL dialect, types, errors, drivers, and tools as its own contracts. SQL outside the published support matrix fails with an explicit error.
 
-Pico 有意实现面向 OLTP 的 SQL 子集。它不兼容 PostgreSQL：线协议、SQL 方言、
-类型、错误、驱动和工具均是 Pico 自己定义的契约。超出公开支持矩阵范围的 SQL 会
-返回明确错误。
+Pico Server and Pico Client communicate only through the versioned Pico Wire Protocol, Pico SQL, and the public error model. This repository contains Pico Server alone. See [product boundaries](docs/products.md).
 
-Pico Server 与 Pico Client 只通过版本化 Pico 线协议、Pico SQL 和公开错误模型协作。
-本仓库只包含 Pico Server。产品边界见[产品边界](docs/products.md)。
+## Current Status
 
-## 当前状态
+Pico Server is still under active development. The current implementation provides:
 
-Pico Server 仍在积极开发中。目前已提供：
+- A TCP server. The current implementation still includes a temporary PostgreSQL Frontend/Backend Protocol adapter, but this does not constitute a product compatibility commitment
+- Single-node, single-instance operation with a local data directory
+- `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
+- Single-column primary keys, column-level unique constraints, defaults, and current SQL type aliases
+- `WHERE` predicates using `=`, `!=`/`<>`, `<`, `>`, `<=`, `>=`, `AND`, parenthesized `OR` groups, and `IS [NOT] NULL`, as well as `LIMIT` and `OFFSET`
+- Autocommit and explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
+- WAL-backed persistence and crash recovery
+- WAL frame versioning and CRC32 validation
+- Text primary keys, multi-statement scripts, and serial-style generated IDs
 
-- TCP 服务；当前实现仍带有临时 PostgreSQL Frontend/Backend Protocol 适配层，
-  但它不是产品兼容承诺
-- 带本地数据目录的单机单实例运行模式
-- `CREATE TABLE`、`ALTER TABLE`、`INSERT`、`SELECT`、`UPDATE` 和 `DELETE`
-- 单列主键、列级唯一约束、默认值和当前 SQL 类型别名
-- 支持 `=`、`!=`/`<>`、`<`、`>`、`<=`、`>=`、`AND`、括号 `OR` 分组和 `IS [NOT] NULL` 的 `WHERE` 条件，以及 `LIMIT` 和 `OFFSET`
-- 自动提交以及显式 `BEGIN` / `COMMIT` / `ROLLBACK` 事务
-- 基于 WAL 的持久化与崩溃恢复
-- WAL 帧版本控制与 CRC32 校验
-- 文本主键、多语句脚本和类似 serial 的自动生成 ID
+The persistence format and execution architecture are still evolving. Persistent LSM tables, secondary indexes, MVCC isolation, group commit, and the extended query protocol are part of the target architecture; this does not imply that all of them are currently implemented.
 
-持久化格式和执行架构仍在演进。持久化 LSM 表、二级索引、MVCC 隔离、
-group commit 和扩展查询协议属于目标架构，并不代表当前都已经实现。
+The following capabilities are currently rejected explicitly: `CREATE INDEX`, foreign keys, table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`, multi-row `INSERT`, `ON CONFLICT`, `ORDER BY`, `OR` (which requires parenthesized grouping), `NOT`, `IN`, `LIKE`, aggregation, grouping, and the extended query messages `Parse`, `Bind`, `Describe`, and `Execute`.
 
-以下能力当前会被明确拒绝：`CREATE INDEX`、外键、表级唯一约束、复合主键、
-`CHECK`、`RETURNING`、多行 `INSERT`、`ON CONFLICT`、`ORDER BY`、`OR`（需括号分组）、`NOT`、
-`IN`、`LIKE`、聚合、分组，以及扩展查询消息
-`Parse`、`Bind`、`Describe` 和 `Execute`。
+See the [SQL subset support matrix](docs/sql-subset.md) for the complete Pico SQL boundary. The target protocol and ecosystem decision are recorded in [ADR-0009](docs/adr/0009-pico-native-ecosystem.md).
 
-Pico SQL 的完整边界请参阅 [SQL 子集支持矩阵](docs/sql-subset.md)。目标协议和
-生态的决策见 [ADR-0009](docs/adr/0009-pico-native-ecosystem.md)。
+## Build
 
-## 构建
-
-Pico 当前需要 Zig 0.16 或更高版本。
+Pico currently requires Zig 0.16 or newer.
 
 ```bash
 zig build
 zig build test
 ```
 
-## 基准测试
+## Benchmark
 
-使用优化构建运行 SQL 路径基准测试：
+Run the SQL-path benchmark in an optimized build:
 
 ```bash
 zig build bench -Doptimize=ReleaseFast -- --rows 100000
 ```
 
-该命令会报告自动提交 `INSERT`、主键 `SELECT`、显式事务中的 `INSERT` 加
-`COMMIT` 的吞吐量。默认使用临时数据目录并关闭 WAL 同步，以便衡量当前 SQL、
-表和 WAL 追加路径的性能。传入 `--sync-wal` 可将 WAL 同步的耐久性开销纳入测量。
+The command reports throughput for autocommit `INSERT`, primary-key `SELECT`, and `INSERT` followed by `COMMIT` within an explicit transaction. By default, it uses a temporary data directory and disables WAL synchronization to measure the current SQL, table, and WAL-append paths. Pass `--sync-wal` to include the durability cost of WAL synchronization in the measurement.
 
-## 运行
+## Run
 
-使用默认回环地址、端口和数据目录启动服务：
+Start the server with the default loopback address, port, and data directory:
 
 ```bash
 zig build run
 ```
 
-也可以通过命令行参数配置服务：
+You can also configure the server with command-line options:
 
 ```bash
 zig build run -- \
@@ -76,23 +62,22 @@ zig build run -- \
   --data-dir ./data
 ```
 
-可用参数：
+Available options:
 
-| 参数 | 默认值 | 说明 |
+| Option | Default | Description |
 | --- | --- | --- |
-| `--host <address>` | `127.0.0.1` | 监听地址 |
-| `--port <port>` | `5433` | 监听端口 |
-| `--data-dir <path>` | `./data` | 实例数据目录 |
-| `--no-sync` | 禁用 | 禁止 WAL 同步，仅用于开发 |
+| `--host <address>` | `127.0.0.1` | Listen address |
+| `--port <port>` | `5433` | Listen port |
+| `--data-dir <path>` | `./data` | Instance data directory |
+| `--no-sync` | disabled | Disable WAL synchronization; development only |
 
-当前开发适配层可使用 `psql` 验证，但它不是 Pico 客户端兼容承诺，后续将由 Pico
-线协议替代：
+You can test the current development adapter with `psql`, but this does not constitute a Pico client compatibility commitment. It will eventually be replaced by the Pico Wire Protocol:
 
 ```bash
 psql -h 127.0.0.1 -p 5433 -U pico -d pico
 ```
 
-SQL 示例：
+Example SQL:
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -113,38 +98,33 @@ UPDATE users SET role = 'admin' WHERE email = 'alice@example.com';
 DELETE FROM users WHERE id = 1;
 ```
 
-## 耐久性与恢复
+## Durability and Recovery
 
-Pico 会先将变更写入预写式日志（WAL），再应用到表状态。默认启用 WAL
-同步；`--no-sync` 会降低这一保证，仅应在开发环境使用。
+Pico writes changes to a write-ahead log (WAL) before applying them to table state. WAL synchronization is enabled by default. `--no-sync` weakens this guarantee and should be used only in development environments.
 
-恢复过程中，Pico 只重放完整、受支持且校验通过的 WAL 帧。不完整的末尾帧
-会被截断，并在接受新写入前持久化 WAL 的逻辑末尾。完整帧损坏、未知 WAL
-格式或中间部分无效时，实例会拒绝启动，而不是静默丢弃证据。
+During recovery, Pico replays only complete, supported, checksum-valid WAL frames. It truncates an incomplete final frame and persists the logical end of the WAL before accepting new writes. If a complete frame is corrupt, the WAL format is unknown, or a middle section is invalid, the instance refuses to start rather than silently discarding evidence.
 
-## 架构
+## Architecture
 
-Pico 的设计基于单节点、单写者提交路径、WAL 优先的耐久性、MVCC 快照和
-LSM 风格有序存储。实现按明确的所有权边界拆分为小模块：
+Pico is designed around a single-node, single-writer commit path, WAL-first durability, MVCC snapshots, and LSM-style ordered storage. The implementation is divided into small modules with explicit ownership boundaries:
 
-| 目录 | 职责 |
+| Directory | Responsibility |
 | --- | --- |
-| `src/net/` | TCP 连接与 Pico 线协议（当前 PG 适配层仅作过渡） |
-| `src/sql/` | SQL 子集的词法分析、解析和执行 |
-| `src/storage/` | 表、WAL、VFS、页管理器、值类型和恢复 |
-| `src/txn/` | 事务边界与连接状态 |
-| `src/util/` | 通用编码和工具代码 |
+| `src/net/` | TCP connections and the Pico Wire Protocol (the current PG adapter is transitional) |
+| `src/sql/` | Tokenization, parsing, and execution for the SQL subset |
+| `src/storage/` | Tables, WAL, VFS, pager, value types, and recovery |
+| `src/txn/` | Transaction boundaries and connection state |
+| `src/util/` | Shared encoding and utility code |
 
-目标边界和不变量请参阅 [架构文档](docs/ARCHITECTURE.md)。该文档区分了
-目标中的 LSM/MVCC 架构与当前已经实现的组件。
+See the [architecture document](docs/ARCHITECTURE.md) for the target boundaries and invariants. It distinguishes the target LSM/MVCC architecture from the components currently implemented.
 
-## 文档
+## Documentation
 
-- [SQL 子集支持矩阵](docs/sql-subset.md)
-- [架构文档](docs/ARCHITECTURE.md)
-- [架构决策记录](docs/adr/)
-- [领域术语与产品约束](CONTEXT.md)
+- [SQL subset support matrix](docs/sql-subset.md)
+- [Architecture document](docs/ARCHITECTURE.md)
+- [Architecture decision records](docs/adr/)
+- [Domain terminology and product constraints](CONTEXT.md)
 
-## 许可证
+## License
 
 [MIT](LICENSE)

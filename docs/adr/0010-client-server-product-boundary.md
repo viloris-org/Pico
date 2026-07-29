@@ -1,45 +1,32 @@
-# Pico Client 与 Pico Server 是独立产品
+# Pico Client and Pico Server Are Independent Products
 
-Pico 是一个数据库产品生态，由两个独立产品组成：**Pico Server** 与
-**Pico Client**。本仓库是 Pico Server 的实现与文档仓库；Pico Client 的 CLI、驱动、
-迁移工具和其他开发者工具不属于服务端实现模块，也不得进入其运行时、存储或发布产物。
+Pico is a database product ecosystem composed of two independent products: **Pico Server** and **Pico Client**. The repository contains the server implementation and documentation; the client CLI, drivers, migration tools, and other developer tools are not server implementation modules and must not enter its runtime, storage, or release artifacts.
 
-两项产品只通过版本化的 **Pico 线协议**、**Pico SQL** 和公开错误模型协作。它们可以
-独立构建、发布、升级和回滚。服务端持有数据、事务、耐久性和恢复的唯一权威；客户端
-持有本地交互、连接配置、协议编码和开发者体验的唯一权威。
+The products cooperate only through the versioned **Pico wire protocol**, **Pico SQL**, and public error model. They can build, release, upgrade, and roll back independently. The server is authoritative for data, transactions, durability, and recovery; the client is authoritative for local interaction, connection configuration, protocol encoding, and developer experience.
 
-## Drivers
+## Decision Drivers
 
-1. 服务端的正确性、资源占用和恢复边界不能被 CLI 或语言驱动的发布节奏拖动。
-2. 客户端需要独立演进语言覆盖、安装方式和人机交互，不应依赖服务端二进制交付。
-3. 跨产品兼容性必须是明确、可测试的协议契约，而不是同仓库内部调用的偶然结果。
+1. Server correctness, resource usage, and recovery boundaries must not follow CLI or language-driver release schedules.
+2. Clients need independent language coverage, installation, and interaction design.
+3. Cross-product compatibility must be an explicit, testable protocol contract rather than an accidental result of same-repository calls.
 
 ## Considered Options
 
-- **单一产品、同一发布物**：初始交付简单，但客户端依赖会进入服务端发布与运行时；
-  不采纳。
-- **服务端内置 CLI，驱动独立**：可保留一个快速入口，但会形成两个不同的产品边界与
-  版本规则；不采纳。
-- **两个独立产品（采纳）**：Pico Server 与 Pico Client 分别发布，以协议版本和支持
-  矩阵维持兼容性。
+- **One product and one release artifact**: rejected because client dependencies would enter server releases and runtime.
+- **Server-embedded CLI with independent drivers**: rejected because it creates two product boundaries and version rules.
+- **Two independent products (adopted)**: Pico Server and Pico Client release separately, with protocol versions and support matrices maintaining compatibility.
 
 ## Consequences
 
-- Pico Server 只发布服务进程、服务端配置、数据目录工具和服务端观测能力；它不捆绑
-  CLI、语言驱动、ORM 适配器或交互式管理工具。
-- Pico Client 发布官方 CLI、语言驱动和开发者工具；它不得读取数据目录、链接服务端
-  存储代码，或重述事务和耐久语义。
-- 每个发布版本必须声明支持的 Pico 线协议版本和 Pico SQL 能力矩阵。兼容性以
-  `client version x server version` 的契约测试证明，而不是同一版本号的隐含要求。
-- 协议或 SQL 的破坏性变更必须定义协商、拒绝和升级行为；客户端不得为旧服务端模拟
-  未声明的服务端语义。
-- 当前仓库没有 Pico Client 实现。`psql` 使用的是 PostgreSQL 迁移适配层的开发验证，
-  不是 Pico Client 产品的一部分。
+- Pico Server publishes only the server process, server configuration, storage format, and server documentation.
+- Pico Client publishes the CLI, drivers, SDKs, and migration tooling.
+- Shared source definitions are limited to `clint/proto/`; there are no direct imports across client and server implementation code.
+- Each product may have its own CI, release cadence, and version, even when hosted in one repository.
+- Integration tests must exercise the public protocol boundary.
 
 ## Delivery
 
-1. 发布 Pico 线协议规范、版本协商和错误模型，并建立跨产品兼容性矩阵。
-2. 在独立的 Pico Client 项目中实现最小 CLI；用它完成连接、单语句、事务和错误处理的
-   端到端契约测试。
-3. 分别建立 Pico Server 与 Pico Client 的构建、版本、发布说明和支持生命周期。
-4. 在 Pico Client 覆盖核心工作流后，移除 PostgreSQL 迁移适配层及其文档和测试依赖。
+1. Define the versioned Pico wire protocol and Pico SQL support matrix.
+2. Build the minimum Pico Client CLI and use it for end-to-end protocol tests.
+3. Keep the server and client as separate build targets with no cross-boundary implementation imports.
+4. Publish independent release artifacts and compatibility documentation.

@@ -1,21 +1,25 @@
-# SQL 子集支持矩阵
+# SQL Subset Support Matrix
 
-本矩阵是 ADR-0008 的可执行范围清单。只有“支持并验证”的语句可作为 Pico 的 SQL
-子集承诺；“明确拒绝”表示 Pico 线协议返回错误，而不是接受后忽略效果。当前实现的
-PostgreSQL 适配层只是迁移状态，不改变此契约。
+This matrix is the executable scope list for ADR-0008. Only statements marked
+“Supported and tested” are part of Pico's SQL subset commitment. “Explicitly
+rejected” means that the Pico wire protocol returns an error instead of accepting
+the statement and ignoring its effects. The current PostgreSQL adapter is only a
+migration aid and does not change this contract.
 
-| 类别 | 语句或能力 | 当前状态 | 回归位置 |
+| Category | Statement or capability | Current status | Regression location |
 | --- | --- | --- | --- |
-| DDL | `CREATE TABLE [IF NOT EXISTS]`，单列主键和列级唯一约束 | 支持并验证 | `sql/exec.zig` |
-| DDL | `ALTER TABLE` 的 `ADD/DROP COLUMN`、`SET/DROP DEFAULT`、`SET/DROP NOT NULL` | 支持并验证 | `sql/exec.zig`、`storage/engine.zig` |
-| DML | 多行 `INSERT`、`SELECT`、`UPDATE`、`DELETE` | 支持并验证 | `sql/exec.zig` |
-| 查询 | `WHERE` 中 `=`、`!=`/`<>`、`<`、`>`、`<=`、`>=`、`AND`、`OR`（括号分组）、`IS [NOT] NULL`，单列 `ORDER BY [ASC|DESC]`，`LIMIT` / `OFFSET` | 支持并验证 | `sql/parse.zig`、`sql/exec.zig` |
-| 事务 | 自动提交与 `BEGIN` / `COMMIT` / `ROLLBACK`（写集、失败态、WAL `txn_batch`） | 支持并验证 | `txn/session.zig`、`sql/exec.zig`、`storage/wal.zig` |
-| 索引 | `CREATE [UNIQUE] INDEX` / `DROP INDEX` | 明确拒绝 | `sql/exec.zig` |
-| 约束 | 外键、表级唯一约束、复合主键、`CHECK` | 明确拒绝 | `sql/parse.zig` |
-| DML | `RETURNING`、`ON CONFLICT` | 明确拒绝 | `sql/parse.zig` |
-| 查询 | 多列 `ORDER BY`、`NOT`、`IN`、`LIKE`、聚合和分组 | 明确拒绝 | `sql/parse.zig` |
-| 迁移适配层 | PostgreSQL 扩展查询 `Parse` / `Bind` / `Describe` / `Execute` | 明确拒绝 | `net/pg.zig` |
+| DDL | `CREATE TABLE [IF NOT EXISTS]`, single-column primary keys, and column-level unique constraints | Supported and tested | `sql/exec.zig` |
+| DDL | `ALTER TABLE` `ADD/DROP COLUMN`, `SET/DROP DEFAULT`, and `SET/DROP NOT NULL` | Supported and tested | `sql/exec.zig`, `storage/engine.zig` |
+| DML | Multi-row `INSERT`, `SELECT`, `UPDATE`, and `DELETE` | Supported and tested | `sql/exec.zig` |
+| Query | `=`, `!=`/`<>`, `<`, `>`, `<=`, `>=`, `AND`, `OR` (parenthesized), and `IS [NOT] NULL` in `WHERE`; single-column `ORDER BY [ASC|DESC]`; `LIMIT` / `OFFSET` | Supported and tested | `sql/parse.zig`, `sql/exec.zig` |
+| Transactions | Autocommit and `BEGIN` / `COMMIT` / `ROLLBACK` (write sets, failed state, WAL `txn_batch`) | Supported and tested | `txn/session.zig`, `sql/exec.zig`, `storage/wal.zig` |
+| Indexes | `CREATE [UNIQUE] INDEX` / `DROP INDEX` | Explicitly rejected | `sql/exec.zig` |
+| Constraints | Foreign keys, table-level unique constraints, composite primary keys, and `CHECK` | Explicitly rejected | `sql/parse.zig` |
+| DML | `RETURNING`, `ON CONFLICT` | Explicitly rejected | `sql/parse.zig` |
+| Query | Multi-column `ORDER BY`, `NOT`, `IN`, `LIKE`, aggregates, and grouping | Explicitly rejected | `sql/parse.zig` |
+| Migration adapter | PostgreSQL extended-query messages `Parse` / `Bind` / `Describe` / `Execute` | Explicitly rejected | `net/pg.zig` |
 
-每次状态从“明确拒绝”切换为“支持并验证”时，必须同时加入解析、执行、恢复和 Pico
-官方客户端回归；涉及提交时还必须覆盖 WAL 先行与单写者发布。
+Whenever a capability changes from “Explicitly rejected” to “Supported and tested,”
+add parser, execution, recovery, and official Pico client regressions at the same time.
+Changes involving commit must also cover WAL-first persistence and
+single-writer publication.

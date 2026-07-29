@@ -1,15 +1,15 @@
-# 实现语言：Zig
+# Implementation Language: Zig
 
-Pico 服务端与存储引擎用 **Zig** 实现，以单一静态（或少依赖）二进制交付，便于控制内存、IO 与启动路径，契合「轻」与自管运行时的目标。
+The Pico server and storage engine are implemented in **Zig** and delivered as a single static (or minimally dependent) binary. This provides control over memory, I/O, and startup, matching the goals of a lightweight product with a self-managed runtime.
 
 ## Considered Options
 
-- **Rust**：生态与安全模型强，但本项目已选定 Zig 工具链与风格偏好。
-- **C/C++**：控制力足够，历史包袱与构建复杂度更高。
-- **Zig（采纳）**：显式分配、可交叉编译、适合从零做存储与网络运行时；生态较年轻的代价用自建测试与故障注入补齐。
+- **Rust**: Strong ecosystem and safety model, but this project has already selected the Zig toolchain and style preferences.
+- **C/C++**: Sufficient control, with greater historical baggage and build complexity.
+- **Zig (adopted)**: Explicit allocation, cross-compilation, and suitability for building storage and network runtimes from scratch; the cost of a younger ecosystem is addressed with in-house tests and fault injection.
 
 ## Consequences
 
-- 关键路径避免引入重型托管运行时；需要的 C 库通过显式 FFI 接入。
-- 正确性更多依赖决定性测试、故障注入与模糊测试，而不是「语言保证一切」。
-- 对外驱动生态不绑定 Zig：客户端走 PostgreSQL 协议即可。
+- Avoid heavy managed runtimes on critical paths; integrate required C libraries through explicit FFI.
+- Correctness relies more on deterministic tests, fault injection, and fuzzing than on “the language guarantees everything.”
+- The external driver ecosystem is not tied to Zig: clients can use the PostgreSQL protocol.

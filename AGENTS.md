@@ -28,10 +28,10 @@ Out of scope until a new ADR: multi-node consensus, PostgreSQL compatibility, OL
 
 ## Language & terminology
 
-- Prefer Chinese domain terms from `CONTEXT.md` in product/docs discussion when the user does; code identifiers stay English.
-- Say **Pico 线协议** or **Pico SQL**; do not describe Pico as PostgreSQL-compatible.
-- **连接** not Session for client sessions; **争用** not “lock storm” as the product concept; **耐久级别** not raw “fsync switch” in user-facing text.
-- “安全” in product talk means crash/durability guarantees, not auth/crypto, unless explicitly about access control.
+- Prefer domain terms from `CONTEXT.md` in product/docs discussion when the user does; code identifiers stay English.
+- Say **Pico Wire Protocol** or **Pico SQL**; do not describe Pico as PostgreSQL-compatible.
+- Use **Connection**, not Session, for client sessions; **contention**, not “lock storm,” as the product concept; **durability level**, not a raw “fsync switch,” in user-facing text.
+- “Safety” in product discussions means crash/durability guarantees, not authentication/cryptography, unless access control is explicitly intended.
 
 ## Implementation norms
 

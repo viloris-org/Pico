@@ -1,60 +1,45 @@
-# Pico Client 与 Pico Server 同仓维护
+# Co-Locate Pico Client and Pico Server in One Repository
 
 ## Status
 
-Accepted (supersedes ADR-0010 §"Separate repositories" layout decision)
+Accepted (supersedes ADR-0010 §“Separate repositories” layout decision)
 
 ## Context
 
-ADR-0010 确立了 Pico Client 和 Pico Server 是两个**独立产品**——通过版本化的 Pico 线
-协议和 Pico SQL 协作，各自拥有独立构建产物、独立版本和独立发布生命周期。该决策正确，
-本 ADR **保留这一产品边界原则**。
+ADR-0010 establishes Pico Client and Pico Server as two **independent products** with versioned Pico protocol and Pico SQL contracts, separate build artifacts, versions, and release lifecycles. This ADR **retains that product-boundary principle**.
 
-但在实际操作中，独立仓库带来了以下维护成本：
+Separate repositories nevertheless create maintenance costs:
 
-1. **协议变更需要跨仓库协调**：线协议定义（消息格式、编解码、错误码）同时被服务端和
-   客户端引用，分布在两个仓库中容易产生分歧。
-2. **集成测试门槛高**：端到端契约测试需要同时检出两个仓库并协调构建。
-3. **早期开发阶段迭代速度慢**：产品和协议仍在快速演进中，跨仓库 PR 链增加上下文切换
-   成本。
+1. **Cross-repository protocol coordination**: wire definitions, codecs, and error codes are consumed by both sides and can diverge.
+2. **High integration-test barrier**: end-to-end contract tests require checking out and coordinating two repositories.
+3. **Slow early iteration**: rapid product and protocol evolution makes cross-repository PR chains expensive.
 
 ## Decision
 
-将 Pico Client 的源码**存放于 Pico Server 仓库内**（`clint/` 目录），但维持以下产品
-边界：
+Store Pico Client source **inside the Pico Server repository** under `clint/`, while retaining these boundaries:
 
-- **独立构建产物**：`pico`（服务端）和 `pico-cli`（客户端 CLI）是不同的二进制，互不
-  依赖运行时链接。
-- **独立版本号**：服务端和客户端各自拥有独立版本（可在同一仓库中分别声明）。
-- **协议契约**：两端只通过 `clint/proto/` 中定义的共享协议消息交互；服务端不得直接
-  调用客户端内部函数，客户端不得直接调用服务端存储/事务代码。
-- **独立发布**：服务端和客户端可以独立选版、发布和回滚。
-- **独立演进**：客户端可独立选择语言覆盖范围（当前为 Zig，未来可增加其他语言），其
-  发布节奏不受服务端约束。
+- **Independent artifacts**: `pico` and `pico-cli` are separate binaries with no runtime-link dependency.
+- **Independent versions**: server and client may declare separate versions in the same repository.
+- **Protocol contract**: both sides interact only through shared messages defined in `clint/proto/`; neither side calls the other’s internal code.
+- **Independent releases**: server and client can be chosen, released, and rolled back independently.
+- **Independent evolution**: the client may expand language coverage without following server release cadence.
 
-## Drivers
+## Decision Drivers
 
-1. ADR-0010 的 drivers 仍然有效：服务端正确性不被客户端发布节奏拖动；兼容性是协议
-   契约，不是同仓库内部调用的偶然结果。
-2. 同仓维护简化了协议定义的单一来源和端到端测试。
-3. `clint/` 目录有清晰的物理边界，未来的多语言 SDK 也可按子目录（`clint/zig/`、
-   `clint/go/` 等）组织。
+1. ADR-0010’s drivers remain valid: server correctness must not follow client releases, and compatibility is a protocol contract.
+2. Co-location provides a single source of truth for protocol definitions and simplifies end-to-end testing.
+3. The clear physical `clint/` boundary supports future SDKs such as `clint/zig/` and `clint/go/`.
 
 ## Consequences
 
-- ADR-0010 的「独立产品」原则不变，仅仓库布局从「分离仓库」改为「同仓独立目录」。
-- ADR-0010 的 Delivery 步骤 2 改为：在 `clint/` 中实现最小 CLI，并用它完成端到端
-  协议测试。
-- 后续多语言 SDK 也放在 `clint/` 下各自的子目录中维护。
-- 协议定义（`clint/proto/`）是服务端和客户端共享的唯一源码依赖。
-- 服务端主入口（`src/`）和客户端主入口（`clint/`）不得有非协议跨目录引用。
+- The independent-product principle is unchanged; only the layout changes from separate repositories to separate directories.
+- ADR-0010 Delivery step 2 becomes: implement the minimum CLI in `clint/` and use it for end-to-end protocol tests.
+- Future language SDKs also live in subdirectories under `clint/`.
+- `clint/proto/` is the only shared source dependency.
+- Server entry points under `src/` and client entry points under `clint/` must not have non-protocol cross-directory references.
 
 ## Delivery
 
-1. 在 `clint/` 下创建目录结构：
-   - `clint/proto/` — Pico 线协议消息定义
-   - `clint/zig/` — Zig 客户端库
-   - `clint/main.zig` — CLI REPL 入口
-2. 用最小 CLI 完成连接、单语句、事务和错误处理的端到端契约测试。
-3. 在 Pico Client 覆盖核心工作流后，移除 PostgreSQL 迁移适配层及其文档和测试依赖
-   （与 ADR-0010 Delivery 步骤 4 一致）。
+1. Create `clint/proto/`, `clint/zig/`, and `clint/main.zig`.
+2. Use the minimum CLI for end-to-end tests covering connection, one statement, transactions, and errors.
+3. Remove the PostgreSQL migration adapter and its documentation/test dependencies after core Pico Client workflows are covered.
