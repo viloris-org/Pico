@@ -210,6 +210,57 @@ test "exec comparison operators filter results correctly" {
     }
 }
 
+test "exec in and like predicates filter rows" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-exec-in-like";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    var session = Session.init(gpa);
+    defer session.deinit();
+
+    var create = try execute(gpa, &eng, &session, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)");
+    defer create.deinit();
+    var insert = try execute(gpa, &eng, &session, "INSERT INTO t VALUES (1, 'alice'), (2, 'al_ice'), (3, 'bob'), (4, NULL)");
+    defer insert.deinit();
+
+    {
+        var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE id IN (1, 3) ORDER BY id");
+        defer res.deinit();
+        try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+        try std.testing.expectEqualStrings("1", res.rows.cells[0][0].?);
+        try std.testing.expectEqualStrings("3", res.rows.cells[1][0].?);
+    }
+    {
+        var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE id NOT IN (1, 3, NULL) ORDER BY id");
+        defer res.deinit();
+        // A NULL list item yields unknown for otherwise unmatched rows.
+        try std.testing.expectEqual(@as(usize, 0), res.rows.cells.len);
+    }
+    {
+        var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE name LIKE 'a%' ORDER BY id");
+        defer res.deinit();
+        try std.testing.expectEqual(@as(usize, 2), res.rows.cells.len);
+        try std.testing.expectEqualStrings("1", res.rows.cells[0][0].?);
+        try std.testing.expectEqualStrings("2", res.rows.cells[1][0].?);
+    }
+    {
+        var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE name LIKE 'al\\_%'");
+        defer res.deinit();
+        try std.testing.expectEqual(@as(usize, 1), res.rows.cells.len);
+        try std.testing.expectEqualStrings("2", res.rows.cells[0][0].?);
+    }
+    {
+        var res = try execute(gpa, &eng, &session, "SELECT id FROM t WHERE NOT name LIKE 'a%' ORDER BY id");
+        defer res.deinit();
+        try std.testing.expectEqual(@as(usize, 1), res.rows.cells.len);
+        try std.testing.expectEqualStrings("3", res.rows.cells[0][0].?);
+    }
+}
+
 test "exec or_group in where clause" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

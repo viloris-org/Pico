@@ -111,6 +111,66 @@ pub const Value = union(enum) {
     }
 };
 
+/// WHERE predicates only retain rows for a true result. NULL operands therefore
+/// do not match, including for NOT IN and NOT LIKE.
+pub fn matchesIn(candidate: Value, values: []const Value, negated: bool) bool {
+    if (candidate == .null) return false;
+    var has_null = false;
+    for (values) |item| {
+        if (item == .null) {
+            has_null = true;
+        } else if (Value.eql(candidate, item)) {
+            return !negated;
+        }
+    }
+    return if (negated) !has_null else false;
+}
+
+pub fn matchesLike(candidate: Value, pattern: Value, negated: bool) bool {
+    const matched = switch (candidate) {
+        .text => |text| switch (pattern) {
+            .text => |pat| likeMatches(text, pat),
+            else => false,
+        },
+        else => false,
+    };
+    return if (negated) !matched and candidate != .null else matched;
+}
+
+/// Match SQL LIKE's percent and underscore wildcards. A backslash escapes the
+/// following pattern byte; text values are compared as their stored UTF-8 bytes.
+fn likeMatches(text: []const u8, pattern: []const u8) bool {
+    var ti: usize = 0;
+    var pi: usize = 0;
+    var star: ?usize = null;
+    var restart: usize = 0;
+    while (ti < text.len) {
+        if (pi < pattern.len and pattern[pi] == '\\') {
+            if (pi + 1 < pattern.len and pattern[pi + 1] == text[ti]) {
+                pi += 2;
+                ti += 1;
+                continue;
+            }
+        } else if (pi < pattern.len and (pattern[pi] == '_' or pattern[pi] == text[ti])) {
+            pi += 1;
+            ti += 1;
+            continue;
+        } else if (pi < pattern.len and pattern[pi] == '%') {
+            star = pi;
+            pi += 1;
+            restart = ti;
+            continue;
+        }
+        if (star) |star_pos| {
+            pi = star_pos + 1;
+            restart += 1;
+            ti = restart;
+        } else return false;
+    }
+    while (pi < pattern.len and pattern[pi] == '%') : (pi += 1) {}
+    return pi == pattern.len;
+}
+
 pub const Column = struct {
     name: []u8,
     type_tag: TypeTag,

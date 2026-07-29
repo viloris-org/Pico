@@ -462,6 +462,16 @@ pub const Pred = union(enum) {
         op: CmpOp,
         value: value.Value, // borrowed during match
     },
+    in_list: struct {
+        col_index: usize,
+        values: []const value.Value, // borrowed during match
+        negated: bool,
+    },
+    like: struct {
+        col_index: usize,
+        pattern: value.Value, // borrowed during match
+        negated: bool,
+    },
     /// OR of AND-groups: true if any group fully matches
     or_group: struct {
         groups: [][]Pred, // owned; each inner slice AND-combined
@@ -500,6 +510,12 @@ fn rowMatches(row: Row, preds: []const Pred) bool {
                     .gte => ord != .lt,
                 };
                 if (!pass) return false;
+            },
+            .in_list => |list| {
+                if (!value.matchesIn(row.values[list.col_index], list.values, list.negated)) return false;
+            },
+            .like => |like| {
+                if (!value.matchesLike(row.values[like.col_index], like.pattern, like.negated)) return false;
             },
             .or_group => |o| {
                 var any_match = false;

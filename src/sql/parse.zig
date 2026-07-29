@@ -769,6 +769,18 @@ pub const Parser = struct {
                         .negated = !n.negated,
                     },
                 },
+                .in_list => |list| Predicate{ .in_list = .{
+                    .column = list.column,
+                    .column_owned = list.column_owned,
+                    .values = list.values,
+                    .negated = !list.negated,
+                } },
+                .like => |like| Predicate{ .like = .{
+                    .column = like.column,
+                    .column_owned = like.column_owned,
+                    .pattern = like.pattern,
+                    .negated = !like.negated,
+                } },
                 .or_group => error.UnsupportedSyntax,
             };
         }
@@ -783,6 +795,34 @@ pub const Parser = struct {
             _ = try self.expect(.kw_null);
             return .{ .is_null = .{ .column = col, .negated = negated } };
         }
+        var negated = false;
+        if (self.cur.kind == .kw_not) {
+            try self.advance();
+            negated = true;
+        }
+        if (self.cur.kind == .kw_in) {
+            try self.advance();
+            _ = try self.expect(.lparen);
+            var values: std.ArrayList(value.Value) = .empty;
+            errdefer {
+                for (values.items) |*v| v.deinit(self.gpa);
+                values.deinit(self.gpa);
+            }
+            while (true) {
+                try values.append(self.gpa, try self.parseValue());
+                if (self.cur.kind != .comma) break;
+                try self.advance();
+            }
+            _ = try self.expect(.rparen);
+            return .{ .in_list = .{ .column = col, .values = try values.toOwnedSlice(self.gpa), .negated = negated } };
+        }
+        if (self.cur.kind == .kw_like) {
+            try self.advance();
+            if (self.cur.kind != .string) return error.UnexpectedToken;
+            const pattern = try self.parseValue();
+            return .{ .like = .{ .column = col, .pattern = pattern, .negated = negated } };
+        }
+        if (negated) return error.UnexpectedToken;
         // comparison
         const op = self.cur.kind;
         if (op != .eq and op != .neq and op != .lt and op != .gt and op != .lte and op != .gte) {
@@ -968,12 +1008,10 @@ fn isIdentLike(k: token.TokenKind) bool {
     return switch (k) {
         .ident => true,
         // Keywords usable as identifiers in identifier position.
-        .kw_create, .kw_table, .kw_insert, .kw_into, .kw_values, .kw_select, .kw_from, .kw_where, .kw_update, .kw_set, .kw_delete, .kw_primary, .kw_key, .kw_int, .kw_integer, .kw_bigint, .kw_smallint, .kw_serial, .kw_bigserial, .kw_text, .kw_varchar, .kw_char, .kw_bool, .kw_boolean, .kw_decimal, .kw_numeric, .kw_timestamp, .kw_timestamptz, .kw_date, .kw_json, .kw_jsonb, .kw_if, .kw_not, .kw_exists, .kw_null, .kw_default, .kw_unique, .kw_index, .kw_on, .kw_and, .kw_or, .kw_is, .kw_references, .kw_limit, .kw_offset, .kw_order, .kw_by, .kw_asc, .kw_desc, .kw_alter, .kw_add, .kw_column, .kw_begin, .kw_commit, .kw_rollback, .kw_now, .kw_true, .kw_false, .kw_as, .kw_cascade, .kw_restrict, .kw_drop, .kw_check => true,
+        .kw_create, .kw_table, .kw_insert, .kw_into, .kw_values, .kw_select, .kw_from, .kw_where, .kw_update, .kw_set, .kw_delete, .kw_primary, .kw_key, .kw_int, .kw_integer, .kw_bigint, .kw_smallint, .kw_serial, .kw_bigserial, .kw_text, .kw_varchar, .kw_char, .kw_bool, .kw_boolean, .kw_decimal, .kw_numeric, .kw_timestamp, .kw_timestamptz, .kw_date, .kw_json, .kw_jsonb, .kw_if, .kw_not, .kw_exists, .kw_null, .kw_default, .kw_unique, .kw_index, .kw_on, .kw_and, .kw_or, .kw_is, .kw_references, .kw_limit, .kw_offset, .kw_order, .kw_by, .kw_asc, .kw_desc, .kw_alter, .kw_add, .kw_column, .kw_begin, .kw_commit, .kw_rollback, .kw_now, .kw_true, .kw_false, .kw_as, .kw_cascade, .kw_restrict, .kw_drop, .kw_check, .kw_in, .kw_like => true,
         else => false,
     };
 }
-
-
 
 test "parse create insert select" {
     const gpa = std.testing.allocator;
@@ -1137,6 +1175,39 @@ test "parse comparison predicates" {
         defer freeStmt(gpa, &stmt);
         try std.testing.expect(stmt.select.where_preds[0] == .cmp);
         try std.testing.expect(stmt.select.where_preds[0].cmp.op == .gte);
+    }
+}
+
+test "parse in and like predicates" {
+    const gpa = std.testing.allocator;
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE id IN (1, 2, NULL)");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds[0] == .in_list);
+        try std.testing.expectEqual(@as(usize, 3), stmt.select.where_preds[0].in_list.values.len);
+        try std.testing.expect(!stmt.select.where_preds[0].in_list.negated);
+    }
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE name NOT LIKE 'a\\_%'");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds[0] == .like);
+        try std.testing.expect(stmt.select.where_preds[0].like.negated);
+    }
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE NOT id IN (1, 2)");
+        defer p.deinit();
+        var stmt = try p.parseStatement();
+        defer freeStmt(gpa, &stmt);
+        try std.testing.expect(stmt.select.where_preds[0].in_list.negated);
+    }
+    {
+        var p = try Parser.init(gpa, "SELECT * FROM t WHERE name LIKE 1");
+        defer p.deinit();
+        try std.testing.expectError(error.UnexpectedToken, p.parseStatement());
     }
 }
 

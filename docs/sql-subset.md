@@ -11,12 +11,12 @@ migration aid and does not change this contract.
 | DDL | `CREATE TABLE [IF NOT EXISTS]`, single-column primary keys, and column-level unique constraints | Supported and tested | `sql/exec.zig` |
 | DDL | `ALTER TABLE` `ADD/DROP COLUMN`, `SET/DROP DEFAULT`, and `SET/DROP NOT NULL` | Supported and tested | `sql/exec.zig`, `storage/engine.zig` |
 | DML | Multi-row `INSERT`, `SELECT`, `UPDATE`, and `DELETE` | Supported and tested | `sql/exec.zig` |
-| Query | `=`, `!=`/`<>`, `<`, `>`, `<=`, `>=`, `AND`, `OR` (parenthesized), and `IS [NOT] NULL` in `WHERE`; single-column `ORDER BY [ASC|DESC]`; `LIMIT` / `OFFSET` | Supported and tested | `sql/parse.zig`, `sql/exec.zig` |
+| Query | `=`, `!=`/`<>`, `<`, `>`, `<=`, `>=`, `AND`, `OR` (parenthesized), `NOT`, `IS [NOT] NULL`, `[NOT] IN` literal lists, and `[NOT] LIKE` (`%`, `_`, and `\\` escape) in `WHERE`; single-column `ORDER BY [ASC|DESC]`; `LIMIT` / `OFFSET` | Supported and tested | `sql/parse.zig`, `sql/exec.zig` |
 | Transactions | Autocommit and `BEGIN` / `COMMIT` / `ROLLBACK` (write sets, failed state, WAL `txn_batch`) | Supported and tested | `txn/session.zig`, `sql/exec.zig`, `storage/wal.zig` |
 | Indexes | `CREATE [UNIQUE] INDEX` / `DROP INDEX` | Explicitly rejected | `sql/exec.zig` |
 | Constraints | Foreign keys, table-level unique constraints, composite primary keys, and `CHECK` | Explicitly rejected | `sql/parse.zig` |
 | DML | `RETURNING`, `ON CONFLICT` | Explicitly rejected | `sql/parse.zig` |
-| Query | Multi-column `ORDER BY`, `NOT`, `IN`, `LIKE`, aggregates, and grouping | Explicitly rejected | `sql/parse.zig` |
+| Query | Multi-column `ORDER BY`, aggregates, and grouping | Explicitly rejected | `sql/parse.zig` |
 | Migration adapter | PostgreSQL extended-query messages `Parse` / `Bind` / `Describe` / `Execute` | Explicitly rejected | `net/pg.zig` |
 
 Whenever a capability changes from “Explicitly rejected” to “Supported and tested,”

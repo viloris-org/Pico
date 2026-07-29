@@ -72,6 +72,20 @@ pub const Predicate = union(enum) {
         op: CmpOp,
         value: value.Value, // owned
     },
+    /// col [NOT] IN (value, ...)
+    in_list: struct {
+        column: []const u8,
+        column_owned: bool = false,
+        values: []value.Value, // owned
+        negated: bool,
+    },
+    /// col [NOT] LIKE pattern. The pattern is a SQL string literal.
+    like: struct {
+        column: []const u8,
+        column_owned: bool = false,
+        pattern: value.Value, // owned
+        negated: bool,
+    },
     /// expr1 OR expr2 — each group is AND-combined
     or_group: struct {
         groups: [][]Predicate, // owned; each inner slice is AND-combined
@@ -97,6 +111,15 @@ pub const Predicate = union(enum) {
             .cmp => |*c| {
                 if (c.column_owned) gpa.free(c.column);
                 c.value.deinit(gpa);
+            },
+            .in_list => |*list| {
+                if (list.column_owned) gpa.free(list.column);
+                for (list.values) |*v| v.deinit(gpa);
+                gpa.free(list.values);
+            },
+            .like => |*like| {
+                if (like.column_owned) gpa.free(like.column);
+                like.pattern.deinit(gpa);
             },
             .or_group => |*o| {
                 for (o.groups) |group| {

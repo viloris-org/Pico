@@ -35,6 +35,14 @@ pub fn bindPreds(gpa: Allocator, table: *engine_mod.Table, preds: []const parse.
                     .gte => .gte,
                 }, .value = c.value } };
             },
+            .in_list => |list| blk: {
+                const idx = findColumn(table, list.column) orelse return error.ColumnNotFound;
+                break :blk .{ .in_list = .{ .col_index = idx, .values = list.values, .negated = list.negated } };
+            },
+            .like => |like| blk: {
+                const idx = findColumn(table, like.column) orelse return error.ColumnNotFound;
+                break :blk .{ .like = .{ .col_index = idx, .pattern = like.pattern, .negated = like.negated } };
+            },
             .or_group => |o| blk: {
                 const groups = try gpa.alloc([]engine_mod.Pred, o.groups.len);
                 errdefer gpa.free(groups);
@@ -84,6 +92,12 @@ pub fn rowMatchesPreds(row_values: []const value.Value, preds: []const engine_mo
                     .gte => ord != .lt,
                 };
                 if (!pass) return false;
+            },
+            .in_list => |list| {
+                if (!value.matchesIn(row_values[list.col_index], list.values, list.negated)) return false;
+            },
+            .like => |like| {
+                if (!value.matchesLike(row_values[like.col_index], like.pattern, like.negated)) return false;
             },
             .or_group => |o| {
                 var any_match = false;
