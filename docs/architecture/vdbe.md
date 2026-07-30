@@ -2,8 +2,7 @@
 
 ## Status and Scope
 
-This document defines the target shape of Pico's **statement execution layer**, using
-SQLite's Virtual Database Engine as a reference ([`vdbe.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbe.h), [`vdbe.c`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbe.c), [`vdbeaux.c`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbeaux.c)).
+This document defines the target shape of Pico's **statement execution layer**.
 
 The current Phase 0/1 implementation is **direct interpretation** in `src/sql/exec.zig`:
 it calls `storage/engine` table operations immediately after parsing the AST, with no
@@ -11,26 +10,13 @@ bytecode, register file, or pausable program counter. `BEGIN` / `COMMIT` / `ROLL
 still compatibility tags and there is no cross-statement write set yet (see the
 [concurrency control contract](concurrency-control.md)).
 
-This does not require a bytecode format or opcode numbering compatible with SQLite, and VDBE
-is not a public API. The fixed boundary is **SQL subset -> inspectable execution program ->
-effects through transaction/storage boundaries**, so planning, execution, cancellation,
-explanation, and testing remain layered instead of accumulating in one `execStmt`.
+VDBE is an internal shorthand, not a public API. The fixed boundary is **Pico SQL -> inspectable execution program -> effects through transaction/storage boundaries**, so planning, execution, cancellation, explanation, and testing remain layered instead of accumulating in one `execStmt`. Pico does not expose a bytecode format, opcode numbering, or an executor-node compatibility promise.
 
-## External References and Applicability
+## Pico Execution Boundary
 
-| Reference | Mechanisms reviewed | Pico's approach | Explicitly not adopted |
-| --- | --- | --- | --- |
-| SQLite `Vdbe` / `VdbeOp` | Statements compile to opcode sequences; P1-P5 operands; `Mem` registers; cursors | Target: each bound statement has an **execution program** (operation sequence plus bounded workspace) | Stable SQLite opcode ABI compatibility; wholesale trigger-subprogram copying |
-| `OP_Transaction` / `OP_Halt` / `OP_Goto` | Explicit transaction boundaries and control flow | Transaction entry/exit are explicit program steps; effects still pass through `txn`/`commit` | Taking B-Tree write locks or starting a rollback journal directly in opcodes |
-| `OP_OpenRead` / `OP_Column` / `OP_Next` / `OP_ResultRow` | Cursor scans, projection, and row-at-a-time output | Cursor abstraction over **ordered LSM/memtable iteration plus snapshot visibility** | Binding `OP_Open*` to SQLite B-Tree page cursors |
-| `OP_Insert` / `OP_Delete`, etc. | Direct storage changes inside the VM | Writes construct/merge a **write set** or issue a commit request without bypassing the single writer | Execution threads directly `fsync`ing database files or publishing manifests |
-| Interruptible VDBE stepping | Progress callbacks, `isInterrupted`, and opcode-boundary response | Aligned with connection **cancellation** and statement generations; sample cancellation at opcode/bounded-batch boundaries | Cancelling a commit that has entered the WAL durability boundary |
-| `EXPLAIN` / scan status | Observable opcodes and plans | Target supports explaining the execution program and basic counters | Promising the full semantics of PostgreSQL `EXPLAIN ANALYZE` |
+Each bound statement produces an **execution program**: an inspectable operation sequence with bounded registers and cursor workspace. Transaction entry/exit, control flow, scans, projections, result rows, write-set construction, and cancellation points are explicit operations. Cursors sit over ordered LSM or memtable iteration and snapshot visibility. Writes form a write set or issue a commit request; execution code never publishes a manifest, changes `published_commit_seq`, or makes WAL durability decisions directly.
 
-SQLite's strength is that its parser is large but its runtime loop is regular: every
-statement becomes a sequence of operations on storage cursors and registers. Pico needs the
-same **strong abstraction**, but its cursors sit over MVCC + LSM + a single writer rather than pager-protected
-B-Tree pages.
+This gives Pico one place to explain a statement's effects. A read program can yield rows incrementally while preserving its snapshot. A write program can validate values, construct a private write set, and stop at a cancellation point before commit without exposing partial table state. A commit program can hand work to the single writer, after which cancellation changes only response delivery—not the already ordered durable effect. The program boundary therefore makes backpressure, cancellation, observability, and recovery testable at statement granularity.
 
 ## Position in the System
 
@@ -73,7 +59,7 @@ references pin storage pages/blocks until `release` (when the read path uses Pag
 
 ### Opcode Groups (Target Minimum)
 
-Pico does not seek SQLite's hundreds of opcodes. Groups are introduced in stages according to
+Pico introduces only the opcode groups needed by the supported SQL subset, in stages according to
 the SQL subset:
 
 | Group | Examples (conceptual names) | Purpose |
@@ -87,9 +73,8 @@ the SQL subset:
 | Metadata | `OpenCatalog`, `CreateTable`, ... | Catalog changes also enter the write set/commit and do not write files directly |
 
 Each opcode document must state whether it performs I/O, is a cancellation point, may enter
-the commit queue, and how transaction state changes on failure. This mirrors SQLite's
-Opcode/Synopsis comments in `vdbe.c`, but Pico's authoritative description is this
-architecture and adjacent code comments, not a public opcode manual.
+the commit queue, and how transaction state changes on failure. Pico's authoritative
+description is this architecture and adjacent code comments, not a public opcode manual.
 
 ### Main-Loop Invariants
 
@@ -190,11 +175,11 @@ Minimum acceptance after the execution program lands:
 2. **Next**: introduce a read-only Program (control, cursors, and `ResultRow`) and migrate SELECT first.
 3. **After that**: add write-set opcodes and connect them to the single writer; replace tag-style BEGIN/COMMIT with `Tx*` opcodes.
 4. **Then**: add Program caching under extended queries, `EXPLAIN`, and basic counters.
-5. **Requires a new ADR**: user-visible bytecode ABI, stored-procedure/trigger language, one-to-one compatibility with PostgreSQL executor nodes, or a product promise for a complete VM query-optimizer rule set.
+5. **Requires a new ADR**: user-visible bytecode ABI, stored-procedure/trigger language, external executor-node compatibility, or a product promise for a complete VM query-optimizer rule set.
 
 ## Naming
 
 Documents and internal modules may call this **VDBE**, **execution program**, or **bytecode
 VM**. External product language should say “SQL subset execution” so users do not assume
-that SQLite bytecode can be loaded or that SQLite's `EXPLAIN` format is compatible. Code
+that external bytecode can be loaded or that another product's `EXPLAIN` format is compatible. Code
 identifiers remain English.

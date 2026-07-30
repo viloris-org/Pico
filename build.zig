@@ -76,6 +76,21 @@ pub fn build(b: *std.Build) void {
         run_bench.addArgs(args);
     }
 
+    const wal_bench_exe = b.addExecutable(.{
+        .name = "pico-wal-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wal_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pico", .module = mod },
+            },
+        }),
+    });
+    const wal_bench_step = b.step("wal-bench", "Run WAL microbenchmarks");
+    const run_wal_bench = b.addRunArtifact(wal_bench_exe);
+    wal_bench_step.dependOn(&run_wal_bench.step);
+
     // ── CLI binary ──
 
     const cli_exe = b.addExecutable(.{

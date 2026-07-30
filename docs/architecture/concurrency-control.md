@@ -12,7 +12,7 @@ This document constrains concurrency within a single Pico **instance**. It does 
 
 Pico uses MVCC so readers see only stable versions without waiting on the write path. A write transaction first operates on the connection's private write set, then is revalidated and published at the sole commit-ordering point. A single writer prevents multiple committers from changing committed state simultaneously, but it does **not** automatically eliminate contention between write sets formed from old snapshots. Pre-commit validation is therefore a correctness boundary; serially queueing requests is not enough.
 
-Pico borrows from PostgreSQL its snapshot-consistency requirement, not its multi-backend lock management: if one published commit depends on another published commit, no snapshot may see the former without seeing the latter. PostgreSQL coordinates snapshot acquisition and transaction exit with `ProcArrayLock`; Pico avoids an active-transaction array and heavyweight locks by publishing a commit watermark through the single writer while preserving the same visibility closure.
+Pico's snapshot-consistency requirement is local: if one published commit depends on another published commit, no snapshot may see the former without seeing the latter. Pico publishes a commit watermark through the single writer, avoiding an active-transaction array and heavyweight locks while preserving that visibility closure.
 
 ## Time and Version Model
 
@@ -84,6 +84,67 @@ Neither Read Committed nor future snapshot reads prevent write skew from multi-r
 
 DDL and catalog changes also enter the same single-writer queue. Each statement is bound to the catalog version used during parsing/binding; if the catalog changes before commit so that object identity, column definitions, or constraint interpretation becomes ambiguous, the statement fails and must be reparsed. Background compaction may change physical layout, but must not create a new `commit_seq` or change logical conflict outcomes.
 
+## Deferred: Strictly Consistent OCC
+
+Strict serializability is not a Pico v1 isolation promise. This section records the design to adopt only after a new ADR, a Pico SQL support-matrix entry, and wire-protocol error mapping make that promise explicit. It defines optimistic conflict validation for Pico's single-instance commit path; it does not introduce distributed transaction roles, resolver sharding, replication, or a fixed transaction lifetime.
+
+### Read and Write Ranges
+
+At the first consistent read (or before committing a write-only transaction), a transaction captures `read_seq = published_commit_seq`. It records logical ranges, never physical LSM files or pages:
+
+| SQL operation | Read conflict range | Write conflict range |
+| --- | --- | --- |
+| Primary-key point lookup | That table and primary-key point | None |
+| Primary-key insert/update/delete | Any row or index key inspected for constraints and the target's observed row | The changed primary key and every changed secondary-index or unique key |
+| Index range scan | The qualifying interval in that index, plus primary rows dereferenced by the plan | None unless modified |
+| Table scan or predicate without a usable ordered access path | The table's complete logical key range | None unless modified |
+| Catalog lookup or DDL | The affected catalog-object range | The changed catalog-object range |
+
+Ranges use a canonical ordered encoding that includes database, table, index, and key boundaries. A half-open range `[begin, end)` is required so equality, prefixes, and empty ranges are unambiguous. The optimizer must not narrow a range unless the chosen access path proves the narrower range contains every row or index entry whose change could alter the statement result. A conservative wider range is correct, although it creates more retryable contention.
+
+The transaction's private write set remains read-your-writes: reads satisfied solely by an earlier private write add no read conflict range. Every mutation adds its write conflict ranges even when it is a blind write. Constraint validation may add read ranges; this preserves SQL primary-key and unique semantics rather than treating a blind write as automatically conflict-free.
+
+### Commit-Time Validation
+
+The single writer keeps an in-memory, commit-sequence-ordered history of published write ranges. For a transaction with `read_seq`, validation in FIFO commit-queue order is:
+
+1. Reject the transaction when a write range from any commit in `(read_seq, next_commit_seq)` intersects one of its read ranges.
+2. Validate primary-key, unique-key, foreign-key, and catalog invariants against the state produced by all earlier accepted requests in the same group-commit round.
+3. On success, allocate `commit_seq`, append the complete WAL record, publish its versions, and add its write ranges to the history before validating a later queued request.
+
+The first rule detects read-write and predicate conflicts, including phantoms. The second is still necessary: SQL constraints and modifications derived from observed rows cannot be weakened to unconditional blind-write behavior. A rejected transaction creates no WAL record, publishes nothing, and returns a distinct retryable serialization-conflict outcome. A constraint violation remains a non-retryable constraint error. The client must rerun the full transaction against a new snapshot; Pico Server does not rerun SQL statements, repeat external side effects, or silently change the transaction's isolation.
+
+The history is retained until no active strict transaction can have a `read_seq` that needs it. Before admitting or validating a transaction, Pico may reject it with a distinct retryable "transaction too old" outcome when its snapshot falls behind the retained history horizon or its age/resource limits. The future Pico Wire Protocol error code remains to be designed. This bounds memory and avoids turning long-running snapshots into unbounded conflict metadata retention. The exact maximum age, range count, and range-byte limits are configuration and observability concerns, not SQL semantics.
+
+### Strictness Boundary
+
+The read watermark must be issued from the same publication order as commits. Therefore, if Pico has responded successfully to commit A before connection B starts a strict transaction, B's `read_seq` is at least A's `commit_seq`; B cannot read a state preceding A. Commit responses remain ordered after WAL durability and publication. Together with range validation, this supplies a single-instance strict serial order without locks on ordinary reads or writes.
+
+Snapshot or explicitly non-conflicting reads would weaken this guarantee. They must be a separately named, explicitly documented future Pico SQL feature; the normal strict mode cannot quietly omit their conflict ranges.
+
+### Why Pico Uses Logical Ranges
+
+SQL dependencies are logical, not physical. A predicate may be satisfied by a memtable today and an immutable table after compaction, but it is still a dependency on the same table/index keys. Recording physical files, page numbers, or a selected access path would make the isolation result change when compaction changes layout. A canonical logical range keeps the result stable across recovery, checkpoints, and query-plan changes.
+
+The conservative rule is intentional. If Pico cannot prove that an index interval covers every row that could change a predicate result, it records the whole table's logical range. This can cause an avoidable retry under high contention, but it cannot admit a phantom-dependent commit. Improving the optimizer may narrow a range only when it preserves that proof; it may never make a transaction silently less isolated.
+
+### Contention and Workload Shape
+
+The single writer orders commits; it does not make a repeatedly modified logical key inexpensive. A hot primary key, unique key, or strict read range can create conflicts even when WAL and CPU capacity are available. Pico must report those outcomes separately from commit-queue saturation and device latency, because the remedies differ.
+
+For application work that permits it, distribute independently accumulated values across separate rows and combine them in a later read, or append independent work records and apply their order-sensitive effects in a controlled transaction. These are data-model choices, not a hidden weakening of Pico SQL. A future atomic-update operation, snapshot read, or range-conflict exception requires a Pico SQL definition, logical conflict ranges, WAL representation, recovery rules, metrics, and an ADR before it becomes available.
+
+### Required Strict-OCC Tests
+
+When this mode is implemented, extend the required tests with:
+
+1. Two transactions that read the same predicate and update different rows: the later commit conflicts when either update changes the predicate result.
+2. An index range scan and a concurrent insert into that interval: the scan transaction conflicts rather than committing a phantom-dependent write.
+3. A full-table predicate without an ordered access path: concurrent row insertion conflicts, proving conservative range collection.
+4. Two blind writes to distinct keys: both may commit; two SQL writes whose constraint checks overlap retain the constraint result.
+5. A transaction beyond the conflict-history horizon fails retryably and leaves no WAL record or visible version.
+6. Repeated runs with the same queue order, ranges, and writes produce the same commit/conflict decisions.
+
 ## WAL, Recovery, and Reclamation
 
 For every successful commit, the WAL must first contain a complete commit record sufficient to reconstruct all logical changes in the transaction; only then may data files or the manifest depend on those changes. At the default durability level, the WAL must cross the durability boundary before the response. A looser durability level may change whether a responded commit survives power loss, but must not change commit ordering, visibility, or conflict validation.
@@ -106,8 +167,8 @@ Before implementing concurrency control, at least the following deterministic te
 
 At minimum record commit-queue wait, commit batch size, WAL durability latency, conflict type, active snapshot count, oldest snapshot watermark, unreclaimable version count, and compaction wait time. Group metrics by durability level so latency under different crash guarantees is not combined into one percentile.
 
-## References
+## Pico Decisions
 
-- PostgreSQL's [MVCC documentation](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/doc/src/sgml/mvcc.sgml) describes statement snapshots, Read Committed behavior, and the boundary of stronger isolation; Pico does not adopt its unsupported locking, SSI, or complete SQL semantics.
-- PostgreSQL's [transaction README](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/src/backend/access/transam/README) states the correctness condition for consistent ordering between snapshots and transaction exit; Pico implements that condition with the single writer's published watermark.
-- [ADR-0005](../adr/0005-single-writer-mvcc.md) is the adoption decision for this design; [Runtime, Connections, and Concurrency Control](runtime-and-concurrency.md) defines the runtime boundaries for the commit queue, cancellation, and I/O.
+- [ADR-0005](../adr/0005-single-writer-mvcc.md) is the adoption decision for this design.
+- [Runtime, Connections, and Concurrency Control](runtime-and-concurrency.md) defines the runtime boundaries for the commit queue, cancellation, and I/O.
+- [Write Path and WriteBatch](write-path.md) defines bounded admission and WAL durability rounds.

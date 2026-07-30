@@ -275,10 +275,8 @@ During startup recovery:
 
 ---
 
-## References
+## Pico Decisions
 
-- RocksDB [MemTable Insertion](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/04_memtable_insert.md): internal key encoding, arena allocation, and concurrent insertion in the MemTable.
-- RocksDB [Tombstone Lifecycle](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/08_tombstone_lifecycle.md): the lifecycle of tombstones in the write path, read path, and compaction.
 - [ADR-0004 LSM Storage Engine Decision](../adr/0004-lsm-storage-engine.md): tradeoffs behind choosing LSM over B-Tree.
 - [Pager and Static Page Cache](pager-and-static-cache.md): optional page-cache layer for SST files.
 - [Concurrency Control Contract](concurrency-control.md): MVCC snapshots and version visibility.

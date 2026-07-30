@@ -3,6 +3,7 @@
 //! Storage code addresses logical file names only.  The VFS owns path
 //! resolution and the lifetime of the underlying data-directory handle.
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Io = std.Io;
 
@@ -122,6 +123,17 @@ pub const File = struct {
 
     pub fn sync(self: *File) !void {
         try self.handle.sync(self.io);
+    }
+
+    /// Persist file contents without forcing unrelated inode metadata. WAL
+    /// frames are append-only, and fdatasync also persists the size change
+    /// needed to recover a newly appended frame on Linux.
+    pub fn syncData(self: *File) !void {
+        if (comptime builtin.os.tag == .linux) {
+            try std.posix.fdatasync(self.handle.handle);
+        } else {
+            try self.handle.sync(self.io);
+        }
     }
 
     pub fn size(self: *File) !u64 {

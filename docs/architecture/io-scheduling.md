@@ -6,11 +6,13 @@ This document refines the I/O scheduling rules in [Runtime, Connections, and Con
 
 This document makes no platform commitment to `io_uring`, `epoll`, kqueue, IOCP, or a thread pool. Any platform backend is acceptable if it observes the submission, completion, and callback boundaries defined here. It does not change ADR-0005's single-writer commit ordering or ADR-0006's WAL-first, default-durable commit.
 
-## Evidence and Adoption Boundary
+## Pico Scheduling Boundary
 
-This design checked TigerBeetle commit [`97c7a8ef`](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/src/io/linux.zig) from the same workspace: its Linux I/O layer copies kernel completion events into a separate completion queue before running callbacks, and batches submissions produced by callbacks at the end of the tick. When the submission queue is full, it advances submissions instead of recursively executing callbacks. Its message pool also derives fixed capacity from the maximum concurrency of each queue, preserving forward progress when resources are saturated ([`message_pool.zig`](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/src/message_pool.zig)).
+Pico separates platform completion from callback execution so completion handling cannot re-enter SQL, storage, or protocol code while it holds scheduler state. It derives fixed capacity from admitted connections, commit batches, recovery, manifest publication, and shutdown rather than growing queues under load. This is a single-instance service contract: no platform backend, replication queue, or external runtime model is part of the Pico product surface.
 
-Pico adopts these scheduling and capacity-derivation principles, but not TigerBeetle's single-threaded runtime, fixed-size replicated message pool, VSR replication queues, data repair, or IOPS constants. Pico is a single-node, single-instance OLTP database; the connection's PostgreSQL wire protocol, WAL durability boundary, and LSM background work define different request classes and starvation limits.
+The scheduler's job is to preserve the meaning of Pico's other boundaries while work is concurrent. A completed socket write is not permission to reorder a connection's responses. A completed file write is not a commit until the single writer publishes it. A cancelled statement cannot revoke WAL work that has crossed the irreversible point. Separating completion from callbacks makes these decisions occur at owned state transitions rather than incidentally inside a platform event loop.
+
+Capacity is an admission decision, not a hint. Every operation reserves a slot, bytes, and an owner before it enters the platform. When the reservation is unavailable, the owner pauses or rejects new work at the earliest safe boundary. This protects the WAL and recovery paths from a slow result consumer, and it lets operators distinguish a saturated resource from logical **contention** on the write path.
 
 ## Goals and Invariants
 
@@ -39,7 +41,7 @@ WAL sync and recovery reads within `critical` are not cancellable. An already-st
 
 Each class tracks queued count, kernel in-flight count, completed-but-not-callbacked count, bytes, and age from enqueue to completion. Capacity must be declared centrally and constrain operation slots, buffer bytes, and per-file/per-connection in-flight limits at the same time; limiting only one creates an implicit unbounded queue in the other two.
 
-At startup, validate the capacity relationships. Reserve at least one read or close slot for every open connection, enough slots for every admitted commit batch to complete its WAL append and sync, and `critical` slots for recovery, manifest finalization, and shutdown. The implementation must not assume that every slot can be occupied by compaction. As with TigerBeetle's message pool, derive configuration from the worst-case number of simultaneous in-flight operations and enforce it with assertions and tests rather than discovering deadlock through runtime allocation failure.
+At startup, validate the capacity relationships. Reserve at least one read or close slot for every open connection, enough slots for every admitted commit batch to complete its WAL append and sync, and `critical` slots for recovery, manifest finalization, and shutdown. The implementation must not assume that every slot can be occupied by compaction. Derive configuration from the worst-case number of simultaneous in-flight operations and enforce it with assertions and tests rather than discovering deadlock through runtime allocation failure.
 
 ## Tick and Dispatch Rules
 
@@ -53,7 +55,7 @@ One tick performs only bounded work, in this order:
 
 Round-robin operates at connection granularity, not request granularity: each runnable connection receives only the configured number of operations and bytes per round, preventing a large result set or one batch scan from monopolizing the foreground budget. `net/connection` still preserves message and response order within a connection. The scheduler must not reorder responses from one connection for fairness or send multiple commit requests through a path that bypasses `commit`.
 
-When the callback budget is exhausted, unprocessed completion events remain for the next tick. If their age exceeds the alert threshold, the runtime must record their class, queue depth, and maximum age; it must not "catch up" by invoking callbacks directly during kernel completion traversal. This directly follows the separation between CQEs and callback queues in TigerBeetle, which avoids recursion and opaque call stacks.
+When the callback budget is exhausted, unprocessed completion events remain for the next tick. If their age exceeds the alert threshold, the runtime must record their class, queue depth, and maximum age; it must not "catch up" by invoking callbacks directly during kernel completion traversal. This preserves bounded call stacks and makes queue delay observable.
 
 ## Backpressure and Admission
 

@@ -152,7 +152,10 @@ complete and valid or the entire batch is discarded.
 
 1. `Engine` calls `wal.appendInsert()`, `wal.appendUpdate()`, `wal.appendTxnBatch()`, and so on.
 2. `appendPayload()` constructs header + payload and writes them at the current offset with one `writeAtAll`.
-3. If `sync_on_append == true` (the default durability level), immediately `fsync` to confirm persistence.
+3. If `sync_on_append == true` (the default durability level), `syncThrough()` joins or leads a
+   group-commit durability round: concurrent appenders that land while a data-sync is in flight
+   share that sync. On Linux the durability call is `fdatasync` (file data + size, not unrelated
+   inode metadata).
 
 ### Recovery
 
@@ -195,7 +198,7 @@ flowchart TD
 1. **Confirmed commits are not lost**: every complete, validated frame represents a confirmed operation and must be replayed exactly.
 2. **Unknown or corrupt frames reject recovery**: CRC failure, an unknown record type, or an unparseable format returns `error.CorruptWal`; recovery does not guess at a repair.
 3. **Incomplete tails are tolerated**: an incomplete final frame (missing header or payload) is silently truncated while the confirmed prefix remains intact.
-4. **Truncation is persisted**: `persistEnd()` (`fsync`) persists the new EOF so later appends do not encounter the garbage tail.
+4. **Truncation is persisted**: `persistEnd()` data-syncs the new EOF so later appends do not encounter the garbage tail.
 
 ### Why CRC Matters
 
@@ -237,17 +240,15 @@ An explicit transaction's write set is stored in a `txn_batch` frame:
 | Feature | Current (Phase 0) | Target |
 |------|----------------|------|
 | File layout | Single WAL file | WAL replacement/rotation + checkpoints |
-| Group Commit | One frame per `appendPayload` + optional sync | Bounded queue + batched writes + shared `fsync` |
+| Group Commit | WAL-layer shared `fdatasync` rounds among concurrent appenders | Engine commit queue + batched writes + shared durability |
 | Recovery modes | Tolerate truncation (implicit) | Strict + tolerant + skip-corruption (configurable) |
 | CRC algorithm | CRC32 | Upgradeable to CRC32C |
 | WAL compression | None | Optional compression (zstd) |
 | WAL tracking | None | Manifest records size and position of closed WALs |
 | WAL checksum chain | None | Each new WAL record includes the previous WAL checksum |
 
-## References
+## Pico Decisions
 
-- RocksDB [Write-Ahead Log](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/03_wal.md): 32 KB blocks, fragmentation, CRC optimization, and WAL reclamation.
-- RocksDB [Crash Recovery](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/09_crash_recovery.md): recovery flow, WAL recovery modes, and truncation.
 - [ADR-0006 WAL durability defaults](../adr/0006-wal-durability-defaults.md): sync policy and durability-level selection.
 - [Write path and WriteBatch](write-path.md): `txn_batch` and write-set commit path.
 - [VFS design](vfs.md): data-directory fencing and positioned I/O, the lower-level abstraction used by WAL.

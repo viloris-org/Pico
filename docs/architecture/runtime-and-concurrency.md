@@ -19,18 +19,13 @@ Version visibility, isolation levels, pre-commit conflict validation, and versio
 are defined by the [concurrency control contract](concurrency-control.md). This document
 defines their ownership and scheduling boundaries in the connection, queue, and I/O runtime.
 
-## External References and Applicability
+## Pico Runtime Boundary
 
-| Reference | Mechanisms reviewed | Pico's approach | Explicitly not adopted |
-| --- | --- | --- | --- |
-| [DuckDB `ClientContext`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/include/duckdb/main/client_context.hpp), [`ConnectionManager`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/include/duckdb/main/connection_manager.hpp), and [`connection_manager.cpp`](https://github.com/duckdb/duckdb/blob/8689b7b0561ac21e4cf8b8cadcb396a6c5c37e4/src/main/connection_manager.cpp) | Each client context owns short-lived execution state; the instance registers connections centrally; interrupt state is separate from execution locks; destruction ends transactions and queries before clearing context | Each Pico **connection** owns protocol, cancellation, session, and input/output quota state. The runtime owns registration and admission. Cancellation marks only the current statement and is observed at cancellation points | The checked DuckDB revision has no reusable database network-service layer. Pico does not treat its embedded API thread model, `Connection` API, or transaction policy as the Pico wire-protocol model |
-| [TigerBeetle Linux I/O](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/src/io/linux.zig) | Submission and completion extraction are separate; callbacks run outside the kernel queue; completions advance first when queues are full; kernel and callback time are measured | The I/O driver collects completions only; the runtime invokes callbacks at controlled scheduling points. Full bounded queues pause reads or reject admission and never grow without bound | io_uring, a single-threaded runtime, and TigerBeetle replication/consensus are not Pico product constraints; platform backends may differ |
-| [PostgreSQL transaction README](https://github.com/postgres/postgres/blob/0fd30e2119ede879080cef426abf4f9b304e3f51/src/backend/access/transam/README) | Snapshot creation and transaction exit need a consistent commit order or readers may see inconsistent version combinations | A single-writer commit sequence establishes total order for snapshot watermarks and publication; readers interpret MVCC visibility only at a stable watermark | Heavy row/table locks, deadlock detection, `ProcArrayLock`, SSI, and multi-process shared-memory lock management |
+Each Pico **connection** owns protocol, cancellation, session, and input/output quota state. The runtime owns connection registration, admission, bounded queues, and controlled callback execution. A cancellation mark applies only to the current statement and is observed at defined cancellation points. The single writer serializes commit publication and watermark advancement; snapshot and reclamation boundaries remain independently verifiable. Pico does not expose an embedded API threading model, a multi-process lock manager, or a platform-specific I/O runtime as product contracts.
 
-PostgreSQL concurrency control is a problem definition, not a code template: it protects an
-active-transaction array with locks during concurrent commits. Pico's single writer makes
-commit publication and watermark advancement serial, but snapshot and reclamation boundaries
-still require proof.
+The ownership split gives connection loss a deterministic meaning. Before the irreversible commit point, closing a connection abandons its statement and private write set. After that point, the single writer finishes the WAL and publication work even if there is no connection left to receive the result. This avoids both false success (a response without durable publication) and false rollback (claiming that a confirmed change was undone because the client disconnected).
+
+Connection quotas are likewise not transaction semantics. They decide how much input, output, and queued work a connection may hold; they never change its statement order, another connection's snapshot, or the global commit order. The runtime can therefore stop reading a slow connection without allowing it to monopolize memory or making an unrelated transaction observe a different database history.
 
 ## Responsibility Boundaries
 
@@ -160,10 +155,7 @@ share the same commit-sequence domain:
 3. Active snapshots register their minimum required sequence; compaction/reclamation deletes only versions/files strictly below that lower bound.
 4. Uncommitted write sets and connection state are discarded after a crash; recovery replays only complete, verified, committed WAL records.
 
-This is equivalent to PostgreSQL's requirement that a snapshot not fall between dependent
-transaction exits, but with a smaller implementation: Pico has no multi-process active-transaction
-array and no heavy-lock wait graph for ordinary DML. DDL, cancellation, isolation levels, and
-extended queries still need their own conflict and state-transition rules.
+No snapshot may fall between dependent commit publications. Pico achieves that with one published watermark, not a multi-process active-transaction array or a heavy-lock wait graph for ordinary DML. DDL, cancellation, isolation levels, and extended queries still need their own conflict and state-transition rules.
 
 ## Observability and Acceptance
 

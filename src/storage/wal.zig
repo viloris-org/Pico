@@ -38,6 +38,8 @@ const format_version: u32 = 1;
 const file_header_len = file_magic.len + @sizeOf(u32);
 const frame_header_len = @sizeOf(u32) + @sizeOf(u32);
 const frame_payload_len_max = 8 * 1024 * 1024;
+/// Most OLTP frames fit here; avoids a heap allocation on the sync path.
+const small_frame_cap = 1024;
 
 pub const CreateTableRecord = struct {
     name: []const u8,
@@ -75,6 +77,19 @@ pub const Wal = struct {
     /// Next write offset (end of file).
     offset: u64,
     sync_on_append: bool,
+    /// Serializes positional writes and allocation of WAL offsets.
+    append_mutex: Io.Mutex = .init,
+    /// Coordinates a durability round independently of WAL writes. This lets
+    /// appends that arrive while a sync is in flight share that sync.
+    sync_mutex: Io.Mutex = .init,
+    sync_cond: Io.Condition = .init,
+    durable_offset: u64,
+    requested_durable_offset: u64,
+    sync_in_progress: bool = false,
+    sync_failed: bool = false,
+    /// Number of `syncData` calls performed by group-commit leaders. Useful for
+    /// tests that assert concurrent appenders share durability rounds.
+    sync_rounds: u64 = 0,
 
     pub const OpenError = Allocator.Error || Io.Dir.OpenError || Io.Dir.CreateDirPathOpenError || Io.File.OpenError || Io.File.StatError || Io.File.LengthError || error{
         InvalidWal,
@@ -107,7 +122,7 @@ pub const Wal = struct {
             @memcpy(header[0..file_magic.len], file_magic);
             bytes.writeU32LE(header[file_magic.len..][0..4], format_version);
             try file.writeAtAll(&header, 0);
-            if (sync_on_append) try file.sync();
+            if (sync_on_append) try file.syncData();
             len = file_header_len;
         } else {
             try validateFileHeader(&file, len);
@@ -119,6 +134,8 @@ pub const Wal = struct {
             .file = file,
             .offset = len,
             .sync_on_append = sync_on_append,
+            .durable_offset = len,
+            .requested_durable_offset = len,
         };
     }
 
@@ -158,37 +175,39 @@ pub const Wal = struct {
     }
 
     pub fn appendInsert(self: *Wal, rec: InsertRecord) !void {
-        var list: std.ArrayList(u8) = .empty;
-        defer list.deinit(self.gpa);
-        try list.append(self.gpa, @intFromEnum(RecordType.insert));
-        try writeStr(&list, self.gpa, rec.table);
-        try writeU16(&list, self.gpa, @intCast(rec.values.len));
-        for (rec.values) |v| {
-            try writeValue(&list, self.gpa, v);
-        }
-        try self.appendPayload(list.items);
+        try self.appendEncoded(struct {
+            rec: InsertRecord,
+            fn encode(ctx: @This(), list: *std.ArrayList(u8), gpa: Allocator) !void {
+                try list.append(gpa, @intFromEnum(RecordType.insert));
+                try writeStr(list, gpa, ctx.rec.table);
+                try writeU16(list, gpa, @intCast(ctx.rec.values.len));
+                for (ctx.rec.values) |v| try writeValue(list, gpa, v);
+            }
+        }{ .rec = rec });
     }
 
     pub fn appendUpdate(self: *Wal, rec: UpdateRecord) !void {
-        var list: std.ArrayList(u8) = .empty;
-        defer list.deinit(self.gpa);
-        try list.append(self.gpa, @intFromEnum(RecordType.update));
-        try writeStr(&list, self.gpa, rec.table);
-        try writeValue(&list, self.gpa, rec.pk);
-        try writeU16(&list, self.gpa, @intCast(rec.values.len));
-        for (rec.values) |v| {
-            try writeValue(&list, self.gpa, v);
-        }
-        try self.appendPayload(list.items);
+        try self.appendEncoded(struct {
+            rec: UpdateRecord,
+            fn encode(ctx: @This(), list: *std.ArrayList(u8), gpa: Allocator) !void {
+                try list.append(gpa, @intFromEnum(RecordType.update));
+                try writeStr(list, gpa, ctx.rec.table);
+                try writeValue(list, gpa, ctx.rec.pk);
+                try writeU16(list, gpa, @intCast(ctx.rec.values.len));
+                for (ctx.rec.values) |v| try writeValue(list, gpa, v);
+            }
+        }{ .rec = rec });
     }
 
     pub fn appendDelete(self: *Wal, rec: DeleteRecord) !void {
-        var list: std.ArrayList(u8) = .empty;
-        defer list.deinit(self.gpa);
-        try list.append(self.gpa, @intFromEnum(RecordType.delete));
-        try writeStr(&list, self.gpa, rec.table);
-        try writeValue(&list, self.gpa, rec.pk);
-        try self.appendPayload(list.items);
+        try self.appendEncoded(struct {
+            rec: DeleteRecord,
+            fn encode(ctx: @This(), list: *std.ArrayList(u8), gpa: Allocator) !void {
+                try list.append(gpa, @intFromEnum(RecordType.delete));
+                try writeStr(list, gpa, ctx.rec.table);
+                try writeValue(list, gpa, ctx.rec.pk);
+            }
+        }{ .rec = rec });
     }
 
     pub fn appendAddColumn(self: *Wal, rec: AddColumnRecord) !void {
@@ -250,6 +269,29 @@ pub const Wal = struct {
         try self.appendPayload(list.items);
     }
 
+    /// Encode with a stack-backed list when the record fits; fall back to the
+    /// heap for large payloads. Keeps the common OLTP append path allocation-free
+    /// before the durability round.
+    fn appendEncoded(self: *Wal, ctx: anytype) !void {
+        const EncodeFn = fn (@TypeOf(ctx), *std.ArrayList(u8), Allocator) anyerror!void;
+        const encode: EncodeFn = @TypeOf(ctx).encode;
+
+        var stack: [small_frame_cap - frame_header_len]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&stack);
+        var stack_list: std.ArrayList(u8) = .empty;
+        encode(ctx, &stack_list, fba.allocator()) catch |err| switch (err) {
+            error.OutOfMemory => {
+                var list: std.ArrayList(u8) = .empty;
+                defer list.deinit(self.gpa);
+                try encode(ctx, &list, self.gpa);
+                try self.appendPayload(list.items);
+                return;
+            },
+            else => return err,
+        };
+        try self.appendPayload(stack_list.items);
+    }
+
     fn appendPayload(self: *Wal, payload: []const u8) !void {
         if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
 
@@ -257,26 +299,73 @@ pub const Wal = struct {
         // complete frame or a single torn tail — never a header without body
         // from two separate writes.
         const frame_len = frame_header_len + payload.len;
-        const frame = try self.gpa.alloc(u8, frame_len);
-        defer self.gpa.free(frame);
+        var stack_frame: [small_frame_cap]u8 = undefined;
+        const use_stack = frame_len <= small_frame_cap;
+        const frame = if (use_stack) stack_frame[0..frame_len] else try self.gpa.alloc(u8, frame_len);
+        defer if (!use_stack) self.gpa.free(frame);
 
         const payload_len: u32 = @intCast(payload.len);
         bytes.writeU32LE(frame[0..4], payload_len);
         bytes.writeU32LE(frame[4..8], frameChecksum(payload_len, payload));
         @memcpy(frame[frame_header_len..], payload);
 
-        try self.file.writeAtAll(frame, self.offset);
-        self.offset += frame_len;
+        const end_offset = blk: {
+            try self.append_mutex.lock(self.io);
+            defer self.append_mutex.unlock(self.io);
+
+            try self.file.writeAtAll(frame, self.offset);
+            self.offset += frame_len;
+            break :blk self.offset;
+        };
         if (self.sync_on_append) {
-            try self.file.sync();
+            try self.syncThrough(end_offset);
         }
+    }
+
+    /// Join or lead a group-commit round. A leader may need more than one
+    /// data-sync if new appenders arrive while its first sync is in flight;
+    /// no caller returns until its own end offset is covered.
+    fn syncThrough(self: *Wal, end_offset: u64) !void {
+        try self.sync_mutex.lock(self.io);
+        defer self.sync_mutex.unlock(self.io);
+
+        if (self.sync_failed) return error.InputOutput;
+        // A concurrent leader may already have covered this offset.
+        if (self.durable_offset >= end_offset) return;
+
+        self.requested_durable_offset = @max(self.requested_durable_offset, end_offset);
+        if (self.sync_in_progress) {
+            while (!self.sync_failed and self.durable_offset < end_offset) {
+                try self.sync_cond.wait(self.io, &self.sync_mutex);
+            }
+            if (self.sync_failed) return error.InputOutput;
+            return;
+        }
+
+        self.sync_in_progress = true;
+        while (self.durable_offset < self.requested_durable_offset) {
+            const target_offset = self.requested_durable_offset;
+            self.sync_mutex.unlock(self.io);
+            self.file.syncData() catch |err| {
+                self.sync_mutex.lockUncancelable(self.io);
+                self.sync_failed = true;
+                self.sync_in_progress = false;
+                self.sync_cond.broadcast(self.io);
+                return err;
+            };
+            self.sync_mutex.lockUncancelable(self.io);
+            self.sync_rounds += 1;
+            self.durable_offset = target_offset;
+        }
+        self.sync_in_progress = false;
+        self.sync_cond.broadcast(self.io);
     }
 
     /// Persist a recovered logical EOF. Required after torn-tail truncation so a
     /// later append cannot leave garbage past the new end if size metadata was
     /// not durable.
     fn persistEnd(self: *Wal) !void {
-        try self.file.sync();
+        try self.file.syncData();
     }
 };
 
@@ -551,6 +640,12 @@ pub fn replayWal(self: *Wal, ctx: anytype, comptime apply: fn (@TypeOf(ctx), Rec
     }
     if (truncated) {
         try self.persistEnd();
+        // `open` initializes these to the physical file length. After removing
+        // a torn tail, the synced logical EOF is the only durable boundary.
+        // Leaving the old value here could let the next synchronous append
+        // incorrectly conclude that its new frame was already durable.
+        self.durable_offset = self.offset;
+        self.requested_durable_offset = self.offset;
     }
 }
 
@@ -749,7 +844,49 @@ const TestSink = struct {
     }
 };
 
+const ConcurrentSink = struct {
+    inserts: u32 = 0,
+    seen: [256]bool = [_]bool{false} ** 256,
+
+    fn apply(self: *ConcurrentSink, view: RecordView) !void {
+        switch (view) {
+            .insert => |insert| {
+                if (insert.values.len != 1) return error.InvalidWal;
+                const id = switch (insert.values[0]) {
+                    .int => |v| std.math.cast(usize, v) orelse return error.InvalidWal,
+                    else => return error.InvalidWal,
+                };
+                if (id >= self.seen.len or self.seen[id]) return error.InvalidWal;
+                self.seen[id] = true;
+                self.inserts += 1;
+            },
+            else => return error.InvalidWal,
+        }
+    }
+};
+
 fn noopApply(_: void, _: RecordView) !void {}
+
+const ConcurrentAppend = struct {
+    wal: *Wal,
+    start: *std.atomic.Value(bool),
+    failed: *std.atomic.Value(bool),
+    first_id: u32,
+    count: u32,
+
+    fn run(self: ConcurrentAppend) void {
+        while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+        for (0..self.count) |i| {
+            self.wal.appendInsert(.{
+                .table = "concurrent",
+                .values = &.{.{ .int = @intCast(self.first_id + i) }},
+            }) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+        }
+    }
+};
 
 fn openCleanDir(comptime name: []const u8) ![]const u8 {
     const io = std.testing.io;
@@ -759,6 +896,51 @@ fn openCleanDir(comptime name: []const u8) ![]const u8 {
 
 fn removeDir(name: []const u8) void {
     Io.Dir.cwd().deleteTree(std.testing.io, name) catch {};
+}
+
+test "synchronous concurrent append group recovers every successful frame" {
+    const gpa = std.heap.page_allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-group-commit");
+    defer removeDir(dir_name);
+
+    const workers = 8;
+    const writes_per_worker = 32;
+    const total_writes = workers * writes_per_worker;
+    var start = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    var threads: [workers]std.Thread = undefined;
+    var sync_rounds: u64 = 0;
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, true);
+        defer wal.deinit();
+
+        for (&threads, 0..) |*thread, worker| {
+            thread.* = try std.Thread.spawn(.{}, ConcurrentAppend.run, .{ConcurrentAppend{
+                .wal = &wal,
+                .start = &start,
+                .failed = &failed,
+                .first_id = @intCast(worker * writes_per_worker),
+                .count = writes_per_worker,
+            }});
+        }
+        start.store(true, .release);
+        for (&threads) |thread| thread.join();
+        try std.testing.expect(!failed.load(.acquire));
+        sync_rounds = wal.sync_rounds;
+        // Concurrent appenders must share durability rounds; otherwise group
+        // commit is not engaging and each frame pays a full fdatasync.
+        try std.testing.expect(sync_rounds < total_writes);
+        try std.testing.expect(sync_rounds > 0);
+    }
+
+    var wal = try Wal.open(gpa, io, dir_name, false);
+    defer wal.deinit();
+    var sink: ConcurrentSink = .{};
+    try replayWal(&wal, &sink, ConcurrentSink.apply);
+    try std.testing.expectEqual(@as(u32, total_writes), sink.inserts);
+    for (sink.seen) |present| try std.testing.expect(present);
 }
 
 test "wal rejects a complete frame with a bad checksum" {

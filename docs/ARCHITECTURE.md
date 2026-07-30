@@ -22,9 +22,19 @@ Accepted ADR-0001 and ADR-0004 through ADR-0009 constrain this architecture. Pri
 4. Clear module boundaries and fault injection keep Zig storage code evolvable.
 5. Single-instance deployment, resource usage, and startup remain simple.
 
-SQLite's VFS, Pager invariants, static `PAGECACHE` pool, and VDBE execution loop provide methodological references for separating platform I/O, page-cache limits, crash-safety assumptions, and statement execution into verifiable layers. Its B-Tree page updates, multi-process lock/SHM, pluggable VFS registration, and rollback-journal main path do not apply to Pico's LSM and single-writer model. TigerBeetle demonstrates how WAL, checkpoints, immutable LSM files, and fault injection can form a verifiable persistence design; its replication, consensus, cross-replica repair, and single-threaded runtime are outside Pico v1.
+Pico keeps its correctness arguments local and explicit. VFS fences storage to one data directory; the Pager has a fixed resource budget and does not define transaction safety; the execution program creates effects only through transaction and commit boundaries; and WAL, checkpoints, immutable LSM files, and fault injection establish the recovery story. These boundaries are deliberately smaller than the product: Pico does not provide page-level multi-process coordination, replaceable storage backends, replication, consensus, cross-instance repair, or a second durability path.
 
 Explicit non-goals: multi-instance replication, sharding, failover, PostgreSQL compatibility, in-place B-Tree writes, and treating checkpoints as backups or PITR.
+
+## Pico's Operating Story
+
+An operator starts one **instance** against one **data directory**. A **connection** carries Pico Wire Protocol messages and Pico SQL statements into the server; it never receives a storage-file handle or relies on a server-internal module. A statement either produces rows from a stable **snapshot** or builds a private transaction write set. Neither path changes shared state by itself.
+
+At commit, the single writer gives accepted work one observable order. It validates the write set against that order, records the complete logical change in the WAL, reaches the selected **durability level**, publishes catalog/table/index visibility, advances the commit watermark, and only then confirms success. This order is Pico's answer to two different failures: a crash cannot leave a confirmed logical change without recovery evidence, and a reader cannot see part of a published transaction.
+
+The data files are an acceleration structure for the committed history, not a competing truth. Checkpoints and compaction make ordered LSM state efficient to read and bound WAL retention, but they may lag commits. On startup, recovery rebuilds a consistent state from the latest valid checkpoint plus the verified WAL prefix. If Pico cannot establish that prefix, it refuses to accept connections rather than inventing a repair.
+
+This story also sets the resource behavior. A slow connection is backpressured at its own output boundary; a full commit queue rejects new work explicitly; a cache without an evictable page returns `CacheFull`; and maintenance yields to recovery and confirmed commits. Pico chooses visible, bounded degradation over hidden queue growth, an unbounded allocation path, or a weaker default durability guarantee.
 
 ## System Context
 
@@ -132,7 +142,7 @@ On WAL sync failure, record-encoding failure, or constraint conflict, `commit` d
 
 A checkpoint persists the applied LSM/catalog state together with the WAL position it covers; only afterward may old WAL be reclaimed. Compaction creates new files from existing immutable tables, validates them, updates the manifest, and reclaims old files after every snapshot has moved past their visible range.
 
-At startup: open and validate data-directory metadata, select the newest valid checkpoint, scan the WAL after that position, replay complete records in commit order, and then accept connections. If only the WAL tail is truncated, remove the tail and recover (see [WAL and Crash Recovery](architecture/wal-and-recovery.md)); a checksum error in a complete record, unknown format, or inconsistent checkpoint must reject startup and preserve evidence rather than attempt speculative repair. A single instance has no replica for automatic repair, so checksums detect and isolate faults; Pico does not promise TigerBeetle-style cross-replica repair.
+At startup: open and validate data-directory metadata, select the newest valid checkpoint, scan the WAL after that position, replay complete records in commit order, and then accept connections. If only the WAL tail is truncated, remove the tail and recover (see [WAL and Crash Recovery](architecture/wal-and-recovery.md)); a checksum error in a complete record, unknown format, or inconsistent checkpoint must reject startup and preserve evidence rather than attempt speculative repair. A single instance has no peer from which it can repair data, so checksums detect and isolate faults rather than supplying repair.
 
 Detailed compaction and LSM flushing are in [LSM Storage Engine Design](architecture/lsm-storage.md). The write commit path and batching target are in [Write Path and WriteBatch](architecture/write-path.md).
 
@@ -161,18 +171,14 @@ Executable module boundaries, data-write ownership, and initial quality gates ar
 
 If the single writer becomes unacceptable under measured workloads, first use commit-queue, WAL-sync, and LSM/compaction metrics to locate the cause. Only after confirming that commit ordering itself is the limit should sharding be evaluated through a new ADR; do not insert fine-grained locks, cross-instance coordination, or implicit asynchronous durability into the existing path.
 
-## References
+## Pico Architecture Map
 
 - [ADRs](adr/): accepted Pico product, protocol, SQL, storage, concurrency, durability, and language decisions; ADR-0009 supersedes ADR-0002's external protocol choice.
-- [VFS](architecture/vfs.md): data-directory fencing, instance lock, positioned I/O, and atomic publication; narrowed from SQLite `sqlite3_vfs` to a single-instance storage boundary.
-- [Pager and Static Page Cache](architecture/pager-and-static-cache.md): fixed-size page pinning/eviction and compile-time cache hard limit; compared with SQLite Pager/PCache/`PAGECACHE`, without adopting the rollback-journal main path.
-- [Execution Engine (VDBE Style)](architecture/vdbe.md): target layering from SQL subset to a step-able executor; compared with SQLite VDBE, with cursors and write sets on MVCC+LSM+single writer.
-- [SQLite pager invariants](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/doc/pager-invariants.txt): reference for expressing crash consistency as checkable invariants.
-- [SQLite WAL locking](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/doc/wal-lock.md): counterexample reference for recovery/checkpoint concurrency; Pico uses one instance and one writer rather than its lock model.
-- SQLite source anchors (the same revision as the invariants above): [`os.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/os.h), [`pager.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/pager.h), [`pcache1.c`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/pcache1.c), [`vdbe.h`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/vdbe.h).
-- [TigerBeetle architecture](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/docs/ARCHITECTURE.md) and [data file](https://github.com/tigerbeetle/tigerbeetle/blob/97c7a8ef385270ebe0e1b75959d3d21d134629df/docs/internals/data_file.md): references for WAL, checkpoints, and LSM persistence; replication and repair are outside Pico v1.
-- [Runtime, Connections, and Concurrency Control](architecture/runtime-and-concurrency.md): refines Pico runtime behavior using DuckDB connection-lifecycle boundaries, TigerBeetle completion-event scheduling, and PostgreSQL snapshot-consistency requirements; only compatible single-instance, single-writer aspects are adopted.
+- [VFS](architecture/vfs.md): data-directory fencing, instance lock, positioned I/O, and atomic publication.
+- [Pager and Static Page Cache](architecture/pager-and-static-cache.md): fixed-size page pinning, eviction, and compile-time cache hard limits.
+- [Execution Engine (VDBE Style)](architecture/vdbe.md): target layering from Pico SQL to a step-able execution program, with cursors and write sets on MVCC, LSM, and a single writer.
+- [Runtime, Connections, and Concurrency Control](architecture/runtime-and-concurrency.md): connection lifecycle, cancellation, bounded scheduling, commit ordering, and snapshot publication.
 - [I/O Scheduling Contract](architecture/io-scheduling.md): defines completion/callback separation, critical-I/O capacity reservation, connection fairness, backpressure, and failure handling; platform backends may vary, but commit and durability semantics may not.
-- [WAL and Crash Recovery](architecture/wal-and-recovery.md): Pico WAL frame format, record types, recovery process, CRC invariants, and fault model; compared with RocksDB WAL design to explain Pico's differences and tradeoffs.
-- [Write Path and WriteBatch](architecture/write-path.md): autocommit and explicit-transaction write APIs, the `txn_batch` atomic model, two-phase staging and commit, group-commit target, durability levels, and sync strategy; compared with RocksDB WriteBatch's binary format.
-- [LSM Storage Engine Design](architecture/lsm-storage.md): MemTable internal-key encoding and arena allocation, SST format (prefix compression and Bloom filters), compaction strategy, Manifest version management, snapshot GC, and space reclamation; a RocksDB LSM reference for Pico's target design and evolution.
+- [WAL and Crash Recovery](architecture/wal-and-recovery.md): Pico WAL frame format, record types, recovery process, CRC invariants, and fault model.
+- [Write Path and WriteBatch](architecture/write-path.md): autocommit and explicit-transaction write APIs, the `txn_batch` atomic model, two-phase staging and commit, group-commit target, durability levels, and sync strategy.
+- [LSM Storage Engine Design](architecture/lsm-storage.md): ordered storage, SST format, compaction, manifest publication, snapshot reclamation, and space management.

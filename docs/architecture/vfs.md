@@ -2,10 +2,7 @@
 
 ## Status and Scope
 
-This document details the `storage/vfs` boundary in the [architecture overview](../ARCHITECTURE.md), using
-the SQLite VFS design as a reference ([`sqlite3_vfs` / `sqlite3_io_methods` in `sqlite.h.in`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/sqlite.h.in),
-the [`os.h` wrapper layer](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/os.h), and the
-[`test_demovfs.c` minimal implementation](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/src/test_demovfs.c)).
+This document details the `storage/vfs` boundary in the [architecture overview](../ARCHITECTURE.md).
 
 The current implementation is defined by `src/storage/vfs.zig`: one **instance** opens one
 **data directory**, takes an exclusive instance lock on it, and permits open, positioned
@@ -18,21 +15,13 @@ VFS does **not** own the WAL format, page cache, transactions, SQL, wire protoco
 compression policy, or checkpoint semantics. It owns only how names within the data
 directory are resolved, how handles are managed, and which I/O primitives callers may use.
 
-## External References and Applicability
+## Pico Boundary
 
-| Reference | Mechanisms reviewed | Pico's approach | Explicitly not adopted |
-| --- | --- | --- | --- |
-| SQLite `sqlite3_vfs` | Separates open/delete/access/path normalization from the platform; upper layers use logical paths | The storage layer uses only logical file names; platform details are confined to VFS and the `std.Io` adapter | Pluggable multi-VFS registries, per-connection VFS selection, and dynamic extension loading (`xDl*`) |
-| SQLite `sqlite3_io_methods` | Positioned `xRead`/`xWrite`, `xSync`, `xTruncate`, `xFileSize`, and `xClose` | Provides positioned I/O, `sync`, `size`, `truncate`, and `close`; WAL and page files share these primitives | Multi-process `xLock`/`xUnlock` levels, `xShmMap`/`xShmLock`, and mmap fetch |
-| SQLite Demo VFS | Omits locks and shared cache, assumes one connection, and may coalesce write buffers before sync | Uses an exclusive single-instance lock; callers and the I/O scheduler own write buffering, with no implicit VFS coalescing | Rollback-journal sector-aligned write coalescing by default and embedded journal buffering |
-| [SQLite `vfs-shm.txt`](https://github.com/sqlite/sqlite/blob/924626e603a36cc48ce87bc3a3eeddc61af1a72f/doc/vfs-shm.txt) | Seven-state WAL-index locking | None | The complete SHM lock state machine and shared-memory index for multiple connections |
-| [I/O scheduling contract](io-scheduling.md) | Separates completion events from callbacks, with capacities and categories | VFS calls should eventually enter the scheduler as categorized I/O operations | Business callbacks or unbounded queues embedded in VFS |
+Pico's VFS is a **safety and ownership boundary**. It prevents storage modules from escaping an instance's data directory and isolates platform I/O without making replaceable filesystems a product feature. It provides positioned reads and writes, sync, size, truncation, close, deletion, and atomic publication. It does not provide page-level multi-process locks, shared-memory indexes, dynamic extensions, or implicit write buffering. The [I/O scheduling contract](io-scheduling.md) assigns future VFS work a category and capacity; VFS itself never owns unbounded queues or business callbacks.
 
-SQLite's VFS is an extension point that lets one core run across operating systems and
-deployment environments. Pico's VFS is a **security and ownership boundary** that prevents the
-storage layer from escaping the data directory, while also isolating platform I/O. Both
-separate file I/O from storage semantics, but Pico does not make replaceable filesystems a
-product feature.
+The boundary gives recovery a small, auditable file vocabulary. WAL, manifest, immutable-table, and page-file code can decide *what* bytes mean, but none of them can turn a malformed table name, a compaction bug, or a future SQL value into an arbitrary host path. They also cannot claim that a renamed file is durable without the required file and directory syncs. This keeps the fault question precise: a caller either receives a completed I/O operation under the data directory, or an error it must surface or recover from.
+
+Atomic publication separates preparation from visibility. Compaction may write and validate a replacement SST or manifest while readers continue using the old name. Only the final replace makes the candidate visible, and recovery accepts only a complete final name. This is why VFS does not interpret records or make commit decisions: byte publication and logical publication are distinct steps owned by different modules.
 
 ## Responsibilities and Invariants
 
@@ -62,22 +51,17 @@ Required invariants:
 6. **Durable deletion**: Sync directory entries after deleting a storage file so that a crash cannot leave ghost entries or cause recovery to use a deleted file.
 7. **Non-transactional existence**: `exists` is advisory; callers must still handle concurrent open/delete failures.
 
-## Mapping to SQLite Methods
+## Interface Contract
 
-| SQLite | Pico VFS | Description |
-| --- | --- | --- |
-| `xOpen` | `Vfs.openFile` / `createAtomicFile` | Logical names only; open flags map to `OpenOptions` |
-| `xDelete` | `Vfs.deleteFile` | Sync the directory afterward |
-| `xAccess` | `Vfs.exists` | Advisory; no permission model beyond F_OK is promised |
-| `xFullPathname` | Resolved internally and not exposed | Prevents upper layers from joining paths |
-| `xRead` / `xWrite` | `File.readAt` / `writeAtAll` | Positioned I/O; complete writes use `writeAtAll` |
-| `xSync` | `File.sync` / `AtomicFile.sync` | Callers choose the durability boundary according to the **durability level** |
-| `xTruncate` / `xFileSize` | `truncate` / `size` | Truncation and measurement for page files and WAL |
-| `xClose` | `File.close` / `AtomicFile.deinit` | |
-| `xLock` family | Instance-level `LOCK` only | No SHARED/RESERVED/PENDING/EXCLUSIVE page locks |
-| `xShm*` | None | A single instance has no shared-memory WAL index |
-| `xRandomness` / `xSleep` / `xCurrentTime` | Outside VFS | Supplied by `util`/runtime when needed, keeping clocks/entropy out of the file layer |
-| `xDl*` | None | Dynamic extensions are not loaded into the storage path |
+| Pico VFS operation | Contract |
+| --- | --- |
+| `openFile` / `createAtomicFile` | Accept logical names only; map storage intent to `OpenOptions`. |
+| `deleteFile` / `exists` | Deletion syncs the directory afterward; existence is advisory. |
+| `readAt` / `writeAtAll` | Positioned I/O; complete writes use `writeAtAll`. |
+| `sync` | Callers choose the durability boundary according to the **durability level**. |
+| `truncate` / `size` | Used by page files and WAL for bounded file layout. |
+| `close` / `deinit` | Release the caller-owned file or atomic-file object. |
+| instance `LOCK` | Excludes a second writer for one data directory; no page-level locking model exists. |
 
 ## Opening, Atomic Publication, and Sync
 
@@ -87,7 +71,7 @@ Required invariants:
 
 - `read` / `write`: access mode.
 - `create` / `truncate` / `exclusive`: creation and exclusive creation.
-- `lock` / `lock_nonblocking`: advisory file lock when supported by the platform; it **cannot** replace the instance `LOCK` or implement SQLite-style multi-process page locking.
+- `lock` / `lock_nonblocking`: advisory file lock when supported by the platform; it **cannot** replace the instance `LOCK` or introduce a page-level multi-process locking model.
 
 WAL, page files, and manifest staging files should all enter through the same `openFile`
 so tests can use the same fault-injection point.

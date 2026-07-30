@@ -124,10 +124,9 @@ Rollback performs no WAL or engine operation; it discards the private in-memory 
 
 ## WriteBatch Model
 
-### WriteBatch in Pico
+### `txn_batch` in Pico
 
-RocksDB `WriteBatch` is a data structure that bundles operations into an atomic unit. Pico's
-equivalent is the **`txn_batch` WAL record**:
+Pico represents one explicit transaction as one atomic **`txn_batch` WAL record**:
 
 ```
 WAL frame:
@@ -143,16 +142,15 @@ WAL frame:
 - Recovery either applies every operation in a complete, valid frame or discards the complete damaged/truncated frame.
 - This provides transaction **atomicity** and **durability** once the commit is confirmed.
 
-### Compared with RocksDB WriteBatch
+### `txn_batch` Contract
 
-| Feature | RocksDB WriteBatch | Pico `txn_batch` |
-|------|--------------------|-----------------|
-| Sequence allocation | 8-byte seq placeholder filled before write | No explicit sequence; implicitly serialized by the single writer |
-| Operation count | 4-byte count | 2-byte `n_ops` |
-| Column families | Embedded varint `cf_id` | None; tables are identified by name |
-| Protection | Optional 8-byte checksum per key | Frame-level CRC32; keys are not protected individually |
-| Merge | Supported (`kTypeMerge`) | Not supported |
-| Range deletion | Supported (`kTypeRangeDeletion`) | Not supported |
+| Field or property | Pico contract |
+|------|----------------|
+| Commit order | No explicit sequence in Phase 0; operations are serialized by `Engine`. The target single writer allocates `commit_seq` at publication. |
+| Operation count | `n_ops` is a 2-byte count. |
+| Object identity | Every operation identifies its table by name; Pico has no storage namespace field in the record. |
+| Integrity | One frame-level CRC32 protects the complete payload; keys are not protected independently. |
+| Supported operations | Nested `insert`, `update`, and `delete` operations only. Merge and range-deletion operations are not part of Pico SQL. |
 
 ### WriteBatch Atomicity Boundary
 
@@ -198,7 +196,10 @@ const WriteOp = union(enum) {
 
 `Engine` is currently the single-writer facade. Each `commitTxnOps` call directly appends one
 frame with `wal.appendTxnBatch(ops)` (and may sync), then serially applies each `applyTxnOp(op)`.
-This is simple and correct, but it has no batching optimization.
+The WAL layer already shares durability rounds among concurrent appenders (`syncThrough`), so
+multi-threaded writers can amortize `fdatasync` without an engine commit queue. A single
+serialized client still pays one durability round per autocommit frame; engine-level batching
+is the next step for multi-connection OLTP.
 
 ### Target: Group-Commit Queue
 
@@ -227,11 +228,29 @@ and small transactions share batch-write overhead.
 The `commit` module will add the queue and batching (see the evolution order in
 `ARCHITECTURE.md`).
 
+### Write-Intensive Admission and Progress
+
+The commit queue is a protection boundary, not an unbounded waiting room. It has explicit limits for request count and staged bytes; a request also has limits for operation count and encoded WAL size. Admission must preserve FIFO order among accepted requests. When a limit is reached, Pico applies bounded backpressure and then rejects new work with an explicit retryable overload outcome rather than accepting unlimited memory growth or allowing a hot connection to monopolize the writer.
+
+Group commit amortizes WAL sync only. It must not merge independent transactions, reorder accepted requests, skip per-transaction conflict/constraint validation, or make a group visible atomically as though it were one user transaction. Within a round, validate and assign commit sequences one request at a time, then write one or more complete transaction records before their shared strict durability round. A failed request does not prevent later independent requests from being considered, and never consumes a visible commit sequence.
+
+Under sustained write load, Pico prioritizes predictable degradation:
+
+1. Keep a small bounded batching window and a maximum batch byte/count budget, so queueing delay has an upper bound under normal admission.
+2. Reserve queue capacity and WAL/I/O progress for commit, recovery, and manifest publication; compaction may prepare files concurrently but must yield before it exhausts the resources needed to make commits durable.
+3. Reject oversized write sets before they can monopolize a group-commit round. Clients split independently valid work only when their application semantics permit it.
+4. Measure hot primary-key, unique-index, and future strict-OCC range conflicts separately from queue or WAL saturation. Retries cannot fix a saturated device, and extra batching cannot fix a single hot logical key.
+5. Return conflict and overload outcomes promptly. Pico Client drivers should retry only transactions declared retryable, using capped exponential backoff with jitter and an idempotency strategy for externally visible effects; the server never retries a transaction on the client's behalf.
+
+Hot-key contention is primarily a data-model and workflow problem. Where application semantics allow it, distribute independently accumulated values across multiple rows and aggregate them later, or append independent work records and process their order-sensitive effects separately. These techniques preserve the normal strict path because they reduce overlap in logical write ranges; they are not permission to use stale reads, omit conflict ranges, or silently weaken constraints. Any future atomic-update syntax or server-side aggregation must define its conflict ranges, interaction with reset/constraint operations, WAL representation, and recovery behavior before it is advertised in Pico SQL.
+
+The first implementation should expose queue depth/bytes, admission rejections, queue wait, batch count/bytes, successful commits, conflict outcomes by kind, WAL append and sync latency, write-set size, and compaction backlog. Report these by durability level and at least p50/p95/p99, so a low-latency async workload cannot mask strict-durability tail latency. Any per-connection quota or fairness policy is runtime scheduling, not a change to commit order.
+
 ## Durability Levels and Sync Policy
 
 | Level | `sync_on_append` | Behavior | Guarantee |
 |------|------------------|----------|-----------|
-| Strict (default) | `true` | `fsync` after each frame | Confirmed commits survive process crash and power-loss models |
+| Strict (default) | `true` | Data-sync each durability round | Confirmed commits survive process crash and power-loss models |
 | Async | `false` | Write to the OS page cache and sync in batches | A process crash may lose the last unsynced frames |
 | Manual | Configuration-controlled | The application explicitly calls `SyncWAL()` | The application is responsible |
 
@@ -249,28 +268,24 @@ The `commit` module will add the queue and batching (see the evolution order in
 | In-memory table apply fails | WAL already contains the operation but memory apply failed, an internal inconsistency (not expected currently) |
 | Commit-time validation fails | Discard the write set and return an error; no WAL cleanup is required |
 
-**Future enhancement** (following RocksDB WAL truncation on memtable failure): if WAL writing
-succeeds but memory application fails, record the WAL truncation position and skip that record
-during the next recovery. Current in-memory application is a pure data-structure operation,
-so failure is currently expected only for OOM.
+**Future enhancement**: if WAL writing succeeds but memory application fails, record the WAL
+truncation position and exclude that record during the next recovery. Current in-memory
+application is a pure data-structure operation, so failure is currently expected only for OOM.
 
 ## Current Implementation vs Target
 
 | Feature | Current (Phase 0) | Target |
 |------|----------------|------|
 | Single-writer path | `Engine` processes directly in sequence | Bounded commit queue + batching |
-| Group Commit | None (one write per frame) | Batched writes + shared `fsync` |
+| Group Commit | WAL-layer shared durability among concurrent appenders | Engine commit queue + batched writes + shared `fsync` |
 | WriteBatch | Single-operation DML frames / explicit-transaction `txn_batch` | Write-set planning integrated with the VDBE execution program |
 | Commit sequence | None (implicit engine order) | Monotonic `commit_seq` (MVCC foundation) |
 | Two-phase write | Session staging + `Engine.commitTxnOps` | Read-set tracking + serializable validation |
-| Write stall | None | Write stall based on `WriteBufferManager` |
-| Write amplification metrics | None | Write amplification, commit latency, and batch-size metrics |
+| Write stall | None | Bounded admission and explicit retryable overload; LSM/compaction pressure feeds back before resource exhaustion |
+| Write amplification metrics | None | Write amplification, queue/admission, conflict, commit-latency, and batch-size metrics |
 
-## References
+## Pico Decisions
 
-- RocksDB [Write APIs and WriteBatch](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/01_write_apis.md): binary format, value-type tags, and protection information.
-- RocksDB [WriteThread and Group Commit](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/02_write_thread.md): lock-free leader election, adaptive waiting, and parallel memtable writes.
-- RocksDB [Write Modes](https://github.com/facebook/rocksdb/blob/main/docs/components/write_flow/06_write_modes.md): normal, pipelined, two-queue, and unordered write modes.
 - [ADR-0005 Single writer + MVCC concurrency model](../adr/0005-single-writer-mvcc.md): concurrency-model tradeoffs.
 - [ADR-0006 WAL durability decision](../adr/0006-wal-durability-defaults.md): sync policy.
 - [WAL and crash recovery](wal-and-recovery.md): WAL frame format and recovery semantics.
