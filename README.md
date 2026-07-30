@@ -157,6 +157,7 @@ currently implemented components.
 
 ## Documentation
 
+- [Documentation standard](docs/DOCUMENTATION.md)
 - [SQL subset support matrix](docs/sql-subset.md)
 - [Pico Wire Protocol v0.1](docs/wire-protocol.md)
 - [Architecture](docs/ARCHITECTURE.md)

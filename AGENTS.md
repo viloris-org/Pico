@@ -8,6 +8,8 @@ This repository contains **Pico Server** (a **single-node, lightweight, network-
 |-----|---------|
 | [`CONTEXT.md`](CONTEXT.md) | Domain language. Prefer those terms; respect `_Avoid_` notes. |
 | [`docs/adr/`](docs/adr/) | Accepted architecture decisions. Do not reverse without a new ADR. |
+| [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) | Documentation writing. Read before creating or revising repository documentation. |
+| [`docs/BUILDING.md`](docs/BUILDING.md) | Code construction and maintenance. Read before implementing or changing code. |
 
 Read `CONTEXT.md` before naming public APIs, errors, docs, or config. New product decisions belong in ADRs, not only in code comments.
 

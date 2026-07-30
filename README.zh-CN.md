@@ -122,6 +122,7 @@ See the [architecture document](docs/ARCHITECTURE.md) for the target boundaries 
 
 ## Documentation
 
+- [文档规范](docs/DOCUMENTATION.md)
 - [SQL subset support matrix](docs/sql-subset.md)
 - [Pico Wire Protocol v0.1](docs/wire-protocol.md)
 - [Architecture document](docs/ARCHITECTURE.md)
