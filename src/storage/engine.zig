@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const value = @import("value.zig");
 const wal_mod = @import("wal.zig");
 const table_mod = @import("table.zig");
+const checkpoint_mod = @import("checkpoint.zig");
 
 pub const EngineError = table_mod.Error;
 pub const Row = table_mod.Row;
@@ -19,6 +20,19 @@ pub const Engine = struct {
     io: Io,
     wal: wal_mod.Wal,
     tables: std.StringHashMap(Table),
+    /// Serializes the mutating sequence (validate → WAL append → apply) against
+    /// itself and against a checkpoint.
+    ///
+    /// A checkpoint discards WAL frames on the strength of the table state it
+    /// captured, so it must never observe a writer between its WAL append and
+    /// its table apply: that state omits the appended record while the rewrite
+    /// drops the frame carrying it, losing a commit.
+    ///
+    /// Scope note: this makes writers mutually exclusive and excludes
+    /// checkpoint. Readers (`getTable`, `selectAll`, `matchIndices`) still run
+    /// unsynchronized against writers — see the concurrency note in
+    /// `docs/architecture/wal-and-recovery.md`.
+    writer_mutex: Io.Mutex = .init,
 
     pub fn open(gpa: Allocator, io: Io, data_dir: []const u8, sync_wal: bool) !Engine {
         var eng: Engine = .{
@@ -108,6 +122,13 @@ pub const Engine = struct {
                 const table = self.tables.getPtr(drop.table) orelse return error.TableNotFound;
                 try table.dropColumn(self.gpa, drop.column);
             },
+            // Checkpoint-only record. Replayed inserts raise `next_serial` to
+            // `max(pk)+1`; this restores the counter the instance actually
+            // reached, so identifiers retired by DELETE are not handed out again.
+            .set_serial => |ss| {
+                const table = self.tables.getPtr(ss.table) orelse return error.TableNotFound;
+                table.next_serial = ss.next_serial;
+            },
             .set_default => |set| {
                 const table = self.tables.getPtr(set.table) orelse return error.TableNotFound;
                 try table.setDefault(self.gpa, set.column, set.default_expr);
@@ -124,6 +145,9 @@ pub const Engine = struct {
     /// entries; apply order must match staging order so later ops see earlier ones.
     pub fn commitTxnOps(self: *Engine, ops: []const wal_mod.TxnOp) !void {
         if (ops.len == 0) return;
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+
         try self.wal.appendTxnBatch(ops);
         for (ops) |op| {
             try self.applyTxnOp(op);
@@ -171,6 +195,12 @@ pub const Engine = struct {
     }
 
     pub fn createTable(self: *Engine, name: []const u8, columns: []const value.Column) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        return self.createTableLocked(name, columns);
+    }
+
+    fn createTableLocked(self: *Engine, name: []const u8, columns: []const value.Column) !void {
         if (self.tables.contains(name)) return error.TableExists;
 
         var specs: std.ArrayList(ColumnSpec) = .empty;
@@ -198,11 +228,15 @@ pub const Engine = struct {
     }
 
     pub fn createTableIfNotExists(self: *Engine, name: []const u8, columns: []const value.Column) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         if (self.tables.contains(name)) return;
-        try self.createTable(name, columns);
+        try self.createTableLocked(name, columns);
     }
 
     pub fn addColumn(self: *Engine, table_name: []const u8, column: value.Column, if_not_exists: bool) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (table.columnIndex(column.name) != null) {
             if (if_not_exists) return;
@@ -216,6 +250,8 @@ pub const Engine = struct {
     }
 
     pub fn dropColumn(self: *Engine, table_name: []const u8, name: []const u8, if_exists: bool) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (table.columnIndex(name) == null) {
             if (if_exists) return;
@@ -227,6 +263,8 @@ pub const Engine = struct {
     }
 
     pub fn setDefault(self: *Engine, table_name: []const u8, name: []const u8, default_expr: value.DefaultExpr) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         _ = table.columnIndex(name) orelse return error.ColumnNotFound;
         try self.wal.appendSetDefault(.{ .table = table_name, .column = name, .default_expr = default_expr });
@@ -234,6 +272,8 @@ pub const Engine = struct {
     }
 
     pub fn setNotNull(self: *Engine, table_name: []const u8, name: []const u8, enabled: bool) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         _ = table.columnIndex(name) orelse return error.ColumnNotFound;
         if (enabled) for (table.rows.items) |row| {
@@ -245,6 +285,8 @@ pub const Engine = struct {
     }
 
     pub fn insert(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         try table.validateInsert(values);
         try self.wal.appendInsert(.{ .table = table_name, .values = values });
@@ -252,6 +294,8 @@ pub const Engine = struct {
     }
 
     pub fn update(self: *Engine, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         try table.validateUpdate(pk, values);
         try self.wal.appendUpdate(.{ .table = table_name, .pk = pk, .values = values });
@@ -260,6 +304,8 @@ pub const Engine = struct {
 
     /// Update by current row index; WAL records full row with PK when present, else uses int index as pseudo-pk for replay.
     pub fn updateAt(self: *Engine, table_name: []const u8, idx: usize, values: []const value.Value) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
         if (table.pk_index) |pki| {
@@ -275,6 +321,8 @@ pub const Engine = struct {
     }
 
     pub fn delete(self: *Engine, table_name: []const u8, pk: value.Value) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (!table.pkContains(pk)) return error.PrimaryKeyNotFound;
 
@@ -283,6 +331,8 @@ pub const Engine = struct {
     }
 
     pub fn deleteAt(self: *Engine, table_name: []const u8, idx: usize) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
         if (table.pk_index) |pki| {
@@ -351,8 +401,31 @@ pub const Engine = struct {
     }
 
     pub fn allocSerial(self: *Engine, table_name: []const u8) !i64 {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         return table.allocSerial();
+    }
+
+    /// Compact the WAL down to the records that reconstruct current committed
+    /// state, bounding both WAL size and recovery time.
+    ///
+    /// Holds `writer_mutex` for the whole rewrite: the emitted snapshot must
+    /// correspond to exactly the set of WAL frames being discarded. A mutation
+    /// interleaved between reading a table and publishing the new WAL would have
+    /// its frame discarded without appearing in the snapshot, losing a commit.
+    pub fn checkpoint(self: *Engine) !checkpoint_mod.Stats {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+
+        var refs: std.ArrayList(*const Table) = .empty;
+        defer refs.deinit(self.gpa);
+        try refs.ensureTotalCapacity(self.gpa, self.tables.count());
+        var it = self.tables.iterator();
+        while (it.next()) |entry| refs.appendAssumeCapacity(entry.value_ptr);
+
+        return checkpoint_mod.run(&self.wal, refs.items);
     }
 };
 
@@ -515,6 +588,137 @@ test "engine rejects invalid writes before they enter the wal" {
 
 // Crash matrix slice: durable prefix of WAL frames survives; a torn final frame
 // is dropped. Matches ARCHITECTURE.md recovery invariant for memtable+WAL phase.
+test "checkpoint preserves rows, altered schema, and serial counter across restart" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-engine-ckpt";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var stats: checkpoint_mod.Stats = undefined;
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true, .serial = true },
+            .{ .name = try gpa.dupe(u8, "name"), .type_tag = .text },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+        try eng.createTable("users", &cols);
+
+        var a: value.Value = .{ .text = try gpa.dupe(u8, "alice") };
+        defer a.deinit(gpa);
+        try eng.insert("users", &.{ .{ .int = 1 }, a });
+        try eng.insert("users", &.{ .{ .int = 2 }, a });
+        try eng.insert("users", &.{ .{ .int = 9 }, a });
+        // Delete the highest id so the live serial counter (10) is ahead of
+        // max(pk) (2). Replaying inserts alone would rewind it.
+        try eng.delete("users", .{ .int = 9 });
+
+        // Schema history the checkpoint must collapse into one create_table.
+        var extra: value.Column = .{ .name = try gpa.dupe(u8, "tier"), .type_tag = .int };
+        defer extra.deinit(gpa);
+        try eng.addColumn("users", extra, false);
+        try eng.dropColumn("users", "name", false);
+
+        stats = try eng.checkpoint();
+        try std.testing.expectEqual(@as(usize, 1), stats.tables);
+        try std.testing.expectEqual(@as(usize, 2), stats.rows);
+        // The whole point: the rewritten WAL is smaller than the history it replaced.
+        try std.testing.expect(stats.wal_bytes_after < stats.wal_bytes_before);
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+
+        const table = eng.getTable("users").?;
+        try std.testing.expectEqual(@as(usize, 2), table.rows.items.len);
+        // Post-ALTER schema, not the original.
+        try std.testing.expectEqual(@as(usize, 2), table.columns.len);
+        try std.testing.expectEqualStrings("id", table.columns[0].name);
+        try std.testing.expectEqualStrings("tier", table.columns[1].name);
+        // Serial did not rewind to max(pk)+1 == 3.
+        try std.testing.expectEqual(@as(i64, 10), table.next_serial);
+        // And a fresh allocation does not reuse a retired identifier.
+        try std.testing.expectEqual(@as(i64, 10), try eng.allocSerial("users"));
+    }
+}
+
+test "writes after a checkpoint survive restart" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-engine-ckpt-append";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.insert("t", &.{.{ .int = 1 }});
+
+        _ = try eng.checkpoint();
+
+        // Appends must land at the rewritten file's offsets, not the old file's.
+        try eng.insert("t", &.{.{ .int = 2 }});
+        try eng.insert("t", &.{.{ .int = 3 }});
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("t");
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 3), all.rows.len);
+    }
+}
+
+// A checkpoint that fails before publication must leave the instance recoverable
+// from the original WAL. Nothing is durably discarded until the atomic rename.
+test "an aborted checkpoint leaves the original wal intact" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/pico-test-engine-ckpt-abort";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.insert("t", &.{.{ .int = 1 }});
+        try eng.insert("t", &.{.{ .int = 2 }});
+
+        const before = eng.wal.offset;
+        var rewrite = try eng.wal.beginRewrite();
+        try rewrite.emitCreateTable(.{ .name = "t", .columns = eng.getTable("t").?.columns });
+        rewrite.abort();
+        // Live WAL untouched: same handle, same offset.
+        try std.testing.expectEqual(before, eng.wal.offset);
+        try eng.insert("t", &.{.{ .int = 3 }});
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("t");
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 3), all.rows.len);
+    }
+}
+
 test "engine recovers only the committed prefix after a torn wal tail" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

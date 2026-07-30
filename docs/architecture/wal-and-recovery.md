@@ -34,7 +34,7 @@ Offset  Size  Field
 ```
 
 - `PICO_WAL` identifies a Pico WAL file quickly.
-- `format_version` is currently **1**. Breaking changes to frame layout, record-type encoding, or checksum algorithm increment it.
+- `format_version` is currently **2**. Version 1 files (no `set_serial` record) are still replayed by this build; a build older than this one rejects version-2 files with `UnsupportedWalFormat`. The checkpoint path upgrades version-1 files in place when it rewrites the WAL.
 - Open validates magic + version; mismatch returns `error.UnsupportedWalFormat` and preserves the file as evidence.
 
 ### Frame Layout
@@ -68,6 +68,7 @@ Offset  Size  Field      Description
 | `set_default` | 7 | Set a DEFAULT expression (table name + column name + expression) |
 | `set_not_null` | 8 | Set NOT NULL (table name + column name + enable/disable) |
 | `txn_batch` | 9 | Transaction batch commit: an atomic frame containing nested operations |
+| `set_serial` | 10 | Checkpoint-only: restore SERIAL counter (table name + i64). Format version 2+. |
 
 ### Record Encoding Details
 
@@ -239,7 +240,8 @@ An explicit transaction's write set is stored in a `txn_batch` frame:
 
 | Feature | Current (Phase 0) | Target |
 |------|----------------|------|
-| File layout | Single WAL file | WAL replacement/rotation + checkpoints |
+| File layout | Single WAL file; checkpoint rewrites it atomically via `AtomicFile` | WAL rotation + manifest + LSM flush |
+| WAL reclamation | **Implemented**: checkpoint (`src/storage/checkpoint.zig`) collapses history into the minimal record set that restores committed state | LSM flush + manifest publication |
 | Group Commit | WAL-layer shared `fdatasync` rounds among concurrent appenders | Engine commit queue + batched writes + shared durability |
 | Recovery modes | Tolerate truncation (implicit) | Strict + tolerant + skip-corruption (configurable) |
 | CRC algorithm | CRC32 | Upgradeable to CRC32C |

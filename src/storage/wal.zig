@@ -17,6 +17,11 @@ pub const RecordType = enum(u8) {
     /// Atomic multi-op commit: all nested ops share one frame/CRC.
     /// Recovery applies every nested op or none (torn tail drops the whole batch).
     txn_batch = 9,
+    /// Authoritative SERIAL counter for a table. Only the checkpoint path emits
+    /// this: replaying inserts alone would rewind the counter past rows that
+    /// were deleted, letting a later INSERT reuse a retired identifier.
+    /// Requires WAL format version 2.
+    set_serial = 10,
 };
 
 /// One DML op inside an explicit-transaction commit batch.
@@ -34,7 +39,14 @@ pub const TxnOp = union(enum) {
 /// Covering the length prevents a flipped length field from being accepted as a
 /// different complete frame; only an incomplete tail may be truncated.
 const file_magic = "PICO_WAL";
-const format_version: u32 = 1;
+/// Version written into every new or rewritten WAL file.
+const format_version: u32 = 2;
+/// Oldest version this build still replays. Version 1 files contain no
+/// `set_serial` record, so reading them needs no compatibility shim; only a
+/// checkpoint rewrite upgrades a file in place. An older build meeting a
+/// version-2 file rejects it with `UnsupportedWalFormat` rather than
+/// misreading `set_serial` as corruption.
+const format_version_min: u32 = 1;
 const file_header_len = file_magic.len + @sizeOf(u32);
 const frame_header_len = @sizeOf(u32) + @sizeOf(u32);
 const frame_payload_len_max = 8 * 1024 * 1024;
@@ -63,6 +75,9 @@ pub const DeleteRecord = struct {
     pk: value.Value,
 };
 
+/// Restores a table's SERIAL counter exactly, independent of its surviving rows.
+pub const SetSerialRecord = struct { table: []const u8, next_serial: i64 };
+
 pub const AddColumnRecord = struct { table: []const u8, column: value.Column };
 pub const DropColumnRecord = struct { table: []const u8, column: []const u8 };
 pub const SetDefaultRecord = struct { table: []const u8, column: []const u8, default_expr: value.DefaultExpr };
@@ -87,6 +102,11 @@ pub const Wal = struct {
     requested_durable_offset: u64,
     sync_in_progress: bool = false,
     sync_failed: bool = false,
+    /// Set when a checkpoint published a new WAL file but failed to adopt the
+    /// handle for it. `self.file` then refers to an unlinked inode, so further
+    /// appends would be written where no recovery can ever find them. Fail every
+    /// later append instead of accepting writes into a discarded file.
+    unusable: bool = false,
     /// Number of `syncData` calls performed by group-commit leaders. Useful for
     /// tests that assert concurrent appenders share durability rounds.
     sync_rounds: u64 = 0,
@@ -97,6 +117,7 @@ pub const Wal = struct {
         InstanceInUse,
         UnsupportedWalFormat,
         CorruptWal,
+        WalUnusable,
         InputOutput,
         LockViolation,
         BrokenPipe,
@@ -119,8 +140,7 @@ pub const Wal = struct {
         var len = try file.size();
         if (len == 0) {
             var header: [file_header_len]u8 = undefined;
-            @memcpy(header[0..file_magic.len], file_magic);
-            bytes.writeU32LE(header[file_magic.len..][0..4], format_version);
+            encodeFileHeader(&header);
             try file.writeAtAll(&header, 0);
             if (sync_on_append) try file.syncData();
             len = file_header_len;
@@ -148,29 +168,14 @@ pub const Wal = struct {
     pub fn appendCreateTable(self: *Wal, rec: CreateTableRecord) !void {
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.gpa);
-        try list.append(self.gpa, @intFromEnum(RecordType.create_table));
-        try writeStr(&list, self.gpa, rec.name);
-        try writeU16(&list, self.gpa, @intCast(rec.columns.len));
-        for (rec.columns) |col| {
-            try writeStr(&list, self.gpa, col.name);
-            try list.append(self.gpa, @intFromEnum(col.type_tag));
-            // flags: bit0 pk, bit1 not_null, bit2 unique, bit3 serial
-            var flags: u8 = 0;
-            if (col.primary_key) flags |= 1;
-            if (col.not_null) flags |= 2;
-            if (col.unique) flags |= 4;
-            if (col.serial) flags |= 8;
-            try list.append(self.gpa, flags);
-            // default: 0 none, 1 now, 2 literal
-            switch (col.default_expr) {
-                .none => try list.append(self.gpa, 0),
-                .now => try list.append(self.gpa, 1),
-                .literal => |v| {
-                    try list.append(self.gpa, 2);
-                    try writeValue(&list, self.gpa, v);
-                },
-            }
-        }
+        try encodeCreateTable(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendSetSerial(self: *Wal, rec: SetSerialRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeSetSerial(&list, self.gpa, rec);
         try self.appendPayload(list.items);
     }
 
@@ -178,10 +183,7 @@ pub const Wal = struct {
         try self.appendEncoded(struct {
             rec: InsertRecord,
             fn encode(ctx: @This(), list: *std.ArrayList(u8), gpa: Allocator) !void {
-                try list.append(gpa, @intFromEnum(RecordType.insert));
-                try writeStr(list, gpa, ctx.rec.table);
-                try writeU16(list, gpa, @intCast(ctx.rec.values.len));
-                for (ctx.rec.values) |v| try writeValue(list, gpa, v);
+                try encodeInsert(list, gpa, ctx.rec);
             }
         }{ .rec = rec });
     }
@@ -293,6 +295,7 @@ pub const Wal = struct {
     }
 
     fn appendPayload(self: *Wal, payload: []const u8) !void {
+        if (self.unusable) return error.WalUnusable;
         if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
 
         // One positional write for the whole frame so a crash yields either a
@@ -367,7 +370,187 @@ pub const Wal = struct {
     fn persistEnd(self: *Wal) !void {
         try self.file.syncData();
     }
+
+    /// Begin a checkpoint: stage a replacement WAL off-name.
+    ///
+    /// The caller emits records describing current committed state, then calls
+    /// `Rewrite.commit` to publish. Holding `append_mutex` for the whole rewrite
+    /// is what makes the staged file a complete description of committed state:
+    /// no frame can be appended to the old file after the caller has read the
+    /// state it encodes.
+    ///
+    /// Crash matrix: the staged file is unnamed until `commit` performs a rename
+    /// plus directory sync, so recovery observes either the old WAL (full
+    /// history) or the new one (compacted). There is no third state, and hence
+    /// no checkpoint sequence number to reconcile.
+    pub fn beginRewrite(self: *Wal) !Rewrite {
+        if (self.unusable) return error.WalUnusable;
+        try self.append_mutex.lock(self.io);
+        errdefer self.append_mutex.unlock(self.io);
+
+        var staged = try self.vfs.createAtomicFile("wal");
+        errdefer staged.deinit();
+
+        var header: [file_header_len]u8 = undefined;
+        encodeFileHeader(&header);
+        try staged.writeAtAll(&header, 0);
+
+        return .{
+            .wal = self,
+            .staged = staged,
+            .offset = file_header_len,
+            .replaced_bytes = self.offset,
+        };
+    }
+
+    /// A replacement WAL under construction. Holds `append_mutex` for its whole
+    /// lifetime; `commit` or `abort` releases it.
+    pub const Rewrite = struct {
+        wal: *Wal,
+        staged: vfs_mod.AtomicFile,
+        offset: u64,
+        /// Live WAL size when the rewrite began, sampled under `append_mutex` so
+        /// a caller reporting reclaimed bytes cannot race a concurrent append.
+        replaced_bytes: u64,
+
+        pub fn emitCreateTable(self: *Rewrite, rec: CreateTableRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeCreateTable(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
+        pub fn emitInsert(self: *Rewrite, rec: InsertRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeInsert(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
+        pub fn emitSetSerial(self: *Rewrite, rec: SetSerialRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeSetSerial(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
+        fn emitPayload(self: *Rewrite, payload: []const u8) !void {
+            if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
+
+            const frame_len = frame_header_len + payload.len;
+            var stack_frame: [small_frame_cap]u8 = undefined;
+            const use_stack = frame_len <= small_frame_cap;
+            const frame = if (use_stack) stack_frame[0..frame_len] else try self.wal.gpa.alloc(u8, frame_len);
+            defer if (!use_stack) self.wal.gpa.free(frame);
+
+            const payload_len: u32 = @intCast(payload.len);
+            bytes.writeU32LE(frame[0..4], payload_len);
+            bytes.writeU32LE(frame[4..8], frameChecksum(payload_len, payload));
+            @memcpy(frame[frame_header_len..], payload);
+
+            try self.staged.writeAtAll(frame, self.offset);
+            self.offset += frame_len;
+        }
+
+        /// Publish the staged WAL and adopt it as the live file.
+        ///
+        /// The staged file is synced before the rename so the published name can
+        /// never reference a partially written file. This sync is unconditional:
+        /// a relaxed durability level may leave recent appends unsynced in the
+        /// old file, and discarding that file makes the staged copy the only
+        /// evidence of those commits.
+        /// Fully self-cleaning: on any failure the staged file is released and
+        /// `append_mutex` is unlocked, so a caller must not also call `abort`.
+        pub fn commit(self: *Rewrite) !void {
+            defer self.wal.append_mutex.unlock(self.wal.io);
+
+            {
+                // Until `staged.commit` returns, the live WAL is still the old
+                // file and remains a complete recovery source; releasing the
+                // staged file here simply discards the attempt.
+                errdefer self.staged.deinit();
+                try self.staged.sync();
+                try self.staged.commit();
+            }
+            self.staged.deinit();
+
+            // The old handle now refers to an unlinked inode. Reopen by name and
+            // rebase the durability counters onto the new file's offsets, which
+            // are unrelated to the old file's.
+            self.wal.adoptRewrittenFile(self.offset) catch |err| {
+                // The new file is already published, so the data directory is
+                // consistent and will recover; this process just no longer holds
+                // a usable handle to it.
+                self.wal.unusable = true;
+                return err;
+            };
+        }
+
+        /// Discard the staged file and leave the live WAL untouched.
+        pub fn abort(self: *Rewrite) void {
+            self.staged.deinit();
+            self.wal.append_mutex.unlock(self.wal.io);
+        }
+    };
+
+    /// Swap in the freshly published WAL file. Caller holds `append_mutex`.
+    fn adoptRewrittenFile(self: *Wal, new_end: u64) !void {
+        // An append that returned before its group-commit round finished can
+        // still have a sync in flight against the old handle. Let it drain
+        // first: otherwise it would publish a `durable_offset` measured in the
+        // old file's offsets, which do not describe the new file.
+        try self.sync_mutex.lock(self.io);
+        while (self.sync_in_progress) {
+            self.sync_cond.wait(self.io, &self.sync_mutex) catch break;
+        }
+        defer self.sync_mutex.unlock(self.io);
+
+        // Open before closing: if the reopen fails the live handle is still the
+        // (now unlinked) old file, which keeps reads and error reporting working
+        // instead of leaving `self.file` undefined.
+        const reopened = try self.vfs.openFile("wal", .{});
+        self.file.close();
+        self.file = reopened;
+        self.offset = new_end;
+        self.durable_offset = new_end;
+        self.requested_durable_offset = new_end;
+        // The staged file was synced before publication, so the new file is
+        // durable through `new_end` regardless of the previous failure state.
+        self.sync_failed = false;
+    }
 };
+
+fn encodeFileHeader(out: *[file_header_len]u8) void {
+    @memcpy(out[0..file_magic.len], file_magic);
+    bytes.writeU32LE(out[file_magic.len..][0..4], format_version);
+}
+
+/// Payload encoders shared by `Wal.append*` and `Rewrite.emit*`. They produce the
+/// record body only (type byte first, no frame header) so both paths agree on the
+/// on-disk record layout by construction rather than by parallel maintenance.
+fn encodeCreateTable(list: *std.ArrayList(u8), gpa: Allocator, rec: CreateTableRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.create_table));
+    try writeStr(list, gpa, rec.name);
+    try writeU16(list, gpa, @intCast(rec.columns.len));
+    for (rec.columns) |col| {
+        try writeColumn(list, gpa, col);
+    }
+}
+
+fn encodeInsert(list: *std.ArrayList(u8), gpa: Allocator, rec: InsertRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.insert));
+    try writeStr(list, gpa, rec.table);
+    try writeU16(list, gpa, @intCast(rec.values.len));
+    for (rec.values) |v| try writeValue(list, gpa, v);
+}
+
+fn encodeSetSerial(list: *std.ArrayList(u8), gpa: Allocator, rec: SetSerialRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.set_serial));
+    try writeStr(list, gpa, rec.table);
+    var b: [8]u8 = undefined;
+    bytes.writeI64LE(&b, rec.next_serial);
+    try list.appendSlice(gpa, &b);
+}
 
 fn frameChecksum(payload_len: u32, payload: []const u8) u32 {
     var len_bytes: [4]u8 = undefined;
@@ -385,7 +568,8 @@ fn validateFileHeader(file: *vfs_mod.File, len: u64) !void {
     const read_len = try file.readAt(&header, 0);
     if (read_len < file_header_len) return error.InvalidWal;
     if (!std.mem.eql(u8, header[0..file_magic.len], file_magic)) return error.UnsupportedWalFormat;
-    if (bytes.readU32LE(header[file_magic.len..][0..4]) != format_version) {
+    const version = bytes.readU32LE(header[file_magic.len..][0..4]);
+    if (version < format_version_min or version > format_version) {
         return error.UnsupportedWalFormat;
     }
 }
@@ -415,6 +599,7 @@ pub const RecordView = union(RecordType) {
     /// Body is `n_ops:u16` then repeated `op_len:u32` + single-op payload (incl. type byte).
     /// Borrowed from the frame buffer for the duration of `apply` only.
     txn_batch: struct { body: []const u8 },
+    set_serial: struct { table: []const u8, next_serial: i64 },
 
     pub const ParsedColumn = struct {
         name: []const u8,
@@ -549,6 +734,14 @@ pub const RecordView = union(RecordType) {
                 if (i >= payload.len) return error.InvalidWal;
                 const enabled = payload[i] != 0;
                 return .{ .view = .{ .set_not_null = .{ .table = table, .column = column, .enabled = enabled } }, .owned = owned };
+            },
+            .set_serial => {
+                const table = try readStr(payload, &i);
+                if (i + 8 > payload.len) return error.InvalidWal;
+                const next_serial = bytes.readI64LE(payload[i..][0..8]);
+                i += 8;
+                if (i != payload.len) return error.InvalidWal;
+                return .{ .view = .{ .set_serial = .{ .table = table, .next_serial = next_serial } }, .owned = owned };
             },
             .txn_batch => {
                 // Validate shape eagerly; engine expands nested ops during apply.
@@ -1068,6 +1261,147 @@ test "wal rejects a flipped length on an otherwise complete frame" {
         try std.testing.expectError(error.CorruptWal, replayWal(&wal, {}, noopApply));
         // Forensics: refuse without truncating away evidence past the bad frame.
         try std.testing.expect((try wal.file.size()) > file_header_len);
+    }
+}
+
+// A version-1 file predates `set_serial` and needs no compatibility shim to
+// replay: it simply cannot contain the record. Rejecting it would force an
+// avoidable data-directory migration, so this build reads it and only upgrades
+// the header when a checkpoint rewrites the file.
+test "wal replays a version 1 file and a checkpoint upgrades it in place" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-v1");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendInsert(.{ .table = "users", .values = &.{.{ .int = 1 }} });
+        // Rewrite the header as version 1; the frames are byte-identical.
+        var ver: [4]u8 = undefined;
+        bytes.writeU32LE(&ver, 1);
+        try wal.file.writeAtAll(&ver, file_magic.len);
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: TestSink = .{};
+        try replayWal(&wal, &sink, TestSink.apply);
+        try std.testing.expectEqual(@as(u32, 1), sink.inserts);
+
+        var rewrite = try wal.beginRewrite();
+        try rewrite.emitInsert(.{ .table = "users", .values = &.{.{ .int = 1 }} });
+        try rewrite.commit();
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var ver: [4]u8 = undefined;
+        _ = try wal.file.readAt(&ver, file_magic.len);
+        try std.testing.expectEqual(format_version, bytes.readU32LE(&ver));
+    }
+}
+
+test "a rewritten wal accepts appends at its own offsets" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-rewrite");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, true);
+        defer wal.deinit();
+        for (0..20) |i| {
+            try wal.appendInsert(.{ .table = "t", .values = &.{.{ .int = @intCast(i) }} });
+        }
+        const before = wal.offset;
+
+        var rewrite = try wal.beginRewrite();
+        try rewrite.emitInsert(.{ .table = "t", .values = &.{.{ .int = 99 }} });
+        try rewrite.commit();
+
+        // Offsets rebase onto the new file, and durability tracking follows.
+        try std.testing.expect(wal.offset < before);
+        try std.testing.expectEqual(wal.offset, wal.durable_offset);
+
+        try wal.appendInsert(.{ .table = "t", .values = &.{.{ .int = 100 }} });
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, true);
+        defer wal.deinit();
+        var sink: TestSink = .{};
+        try replayWal(&wal, &sink, TestSink.apply);
+        // Only the rewritten record plus the post-checkpoint append.
+        try std.testing.expectEqual(@as(u32, 2), sink.inserts);
+        try std.testing.expectEqual(wal.offset, wal.durable_offset);
+    }
+}
+
+test "set_serial survives an encode and replay roundtrip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-set-serial");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendSetSerial(.{ .table = "users", .next_serial = 4242 });
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: SerialSink = .{};
+        try replayWal(&wal, &sink, SerialSink.apply);
+        try std.testing.expectEqual(@as(i64, 4242), sink.seen.?);
+    }
+}
+
+const SerialSink = struct {
+    seen: ?i64 = null,
+
+    fn apply(self: *SerialSink, view: RecordView) !void {
+        switch (view) {
+            .set_serial => |ss| {
+                try std.testing.expectEqualStrings("users", ss.table);
+                self.seen = ss.next_serial;
+            },
+            else => return error.InvalidWal,
+        }
+    }
+};
+
+// A truncated `set_serial` body must be rejected, not read as a short integer.
+test "wal rejects a set_serial record with a truncated counter" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/pico-test-wal-serial-trunc");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+
+        // Hand-build a set_serial payload whose declared frame is complete but
+        // whose body stops inside the i64. A torn-tail truncation would hide
+        // this; a complete frame must fail closed instead.
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(gpa);
+        try payload.append(gpa, @intFromEnum(RecordType.set_serial));
+        try writeStr(&payload, gpa, "users");
+        try payload.appendSlice(gpa, &[_]u8{ 1, 2, 3 });
+        try wal.appendPayload(payload.items);
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try std.testing.expectError(error.InvalidWal, replayWal(&wal, {}, noopApply));
     }
 }
 

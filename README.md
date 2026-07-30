@@ -31,6 +31,7 @@ Pico Server is under active development. The current implementation provides:
 - Autocommit and explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
+- WAL checkpoint (compaction): bounded WAL size and bounded recovery time
 - Text primary keys, multi-statement scripts, and serial-style generated IDs
 
 The storage format and execution architecture are still evolving. Persistent
