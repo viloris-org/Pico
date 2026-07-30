@@ -59,7 +59,7 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
     }
     var pos: usize = 0;
 
-    return switch (msg_type) {
+    const message = switch (msg_type) {
         .hello_ok => blk: {
             const sv = try readString(arena, payload, &pos);
             break :blk Message{ .hello_ok = .{ .server_version = sv } };
@@ -69,6 +69,7 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
             break :blk Message{ .hello_error = .{ .reason = reason } };
         },
         .row_description => blk: {
+            if (payload.len < 2) return error.UnexpectedEof;
             const col_count = std.mem.readInt(u16, payload[pos..][0..2], .big);
             pos += 2;
             var columns = try arena.alloc([]const u8, col_count);
@@ -81,12 +82,16 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
             } };
         },
         .row_data => blk: {
+            if (payload.len < 2) return error.UnexpectedEof;
             const col_count = std.mem.readInt(u16, payload[pos..][0..2], .big);
             pos += 2;
             var values = try arena.alloc([]const u8, col_count);
             var nulls = try arena.alloc(bool, col_count);
             for (0..col_count) |i| {
-                const is_null = payload[pos] != 0;
+                if (pos >= payload.len) return error.UnexpectedEof;
+                const null_flag = payload[pos];
+                if (null_flag > 1) return error.Protocol;
+                const is_null = null_flag == 1;
                 pos += 1;
                 nulls[i] = is_null;
                 if (is_null) {
@@ -101,6 +106,7 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
             } };
         },
         .command_complete => blk: {
+            if (payload.len < 8) return error.UnexpectedEof;
             const affected = std.mem.readInt(u64, payload[pos..][0..8], .big);
             pos += 8;
             const tag = try readString(arena, payload, &pos);
@@ -110,7 +116,9 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
             } };
         },
         .server_error => blk: {
+            if (payload.len < 1) return error.UnexpectedEof;
             const severity = payload[pos];
+            if (severity > 3) return error.Protocol;
             pos += 1;
             const code = try readString(arena, payload, &pos);
             const message = try readString(arena, payload, &pos);
@@ -126,10 +134,14 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
         },
         else => return error.Protocol,
     };
+
+    if (pos != payload.len) return error.Protocol;
+    return message;
 }
 
 /// Write a protocol message to a stream.
 pub fn writeMessage(writer: *Io.Writer, msg_type: proto.Type, payload: []const u8) !void {
+    if (payload.len > proto.MAX_BODY_LENGTH - 1) return error.MessageTooLarge;
     const body_len: u32 = @intCast(1 + payload.len); // type byte + payload
     var header: [5]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], body_len, .big);
@@ -147,6 +159,7 @@ fn readString(arena: Allocator, buf: []const u8, pos: *usize) ProtocolError![]co
     const len = std.mem.readInt(u32, buf[pos.*..][0..4], .big);
     pos.* += 4;
     if (len > proto.MAX_STRING_LENGTH) return error.StringTooLarge;
+    if (len > buf.len - pos.*) return error.UnexpectedEof;
     const slice = try arena.alloc(u8, len);
     @memcpy(slice, buf[pos.*..][0..len]);
     pos.* += len;
@@ -154,6 +167,7 @@ fn readString(arena: Allocator, buf: []const u8, pos: *usize) ProtocolError![]co
 }
 
 pub fn writeString(writer: anytype, s: []const u8) !void {
+    if (s.len > proto.MAX_STRING_LENGTH) return error.StringTooLarge;
     const len: u32 = @intCast(s.len);
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, len, .big);
@@ -167,4 +181,58 @@ pub fn buildHelloPayload(allocator: Allocator) ![]u8 {
     std.mem.writeInt(u16, payload[0..2], proto.PROTOCOL_VERSION_MAJOR, .big);
     std.mem.writeInt(u16, payload[2..4], proto.PROTOCOL_VERSION_MINOR, .big);
     return payload;
+}
+
+test "codec decodes a complete command response" {
+    const bytes = [_]u8{
+        0, 0, 0, 19, @intFromEnum(proto.Type.command_complete),
+        0, 0, 0, 0, 0, 0, 0, 3,
+        0, 0, 0, 6, 'I', 'N', 'S', 'E', 'R', 'T',
+    };
+    var reader: Io.Reader = .fixed(&bytes);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const message = try readMessage(arena.allocator(), &reader);
+    switch (message) {
+        .command_complete => |complete| {
+            try std.testing.expectEqual(@as(u64, 3), complete.affected_rows);
+            try std.testing.expectEqualStrings("INSERT", complete.tag);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "codec rejects malformed message payloads" {
+    const cases = [_]struct {
+        bytes: []const u8,
+        expected: anyerror,
+    }{
+        .{ .bytes = &.{ 0, 0, 0, 1, @intFromEnum(proto.Type.row_description) }, .expected = error.UnexpectedEof },
+        .{ .bytes = &.{ 0, 0, 0, 4, @intFromEnum(proto.Type.row_data), 0, 1, 2 }, .expected = error.Protocol },
+        .{ .bytes = &.{
+            0, 0, 0, 14, @intFromEnum(proto.Type.command_complete),
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 5, 'x',
+        }, .expected = error.UnexpectedEof },
+        .{ .bytes = &.{ 0, 0, 0, 7, @intFromEnum(proto.Type.hello_ok), 0, 0, 0, 1, 'x', 'y' }, .expected = error.Protocol },
+    };
+
+    for (cases) |case| {
+        var reader: Io.Reader = .fixed(case.bytes);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expectError(case.expected, readMessage(arena.allocator(), &reader));
+    }
+}
+
+test "codec rejects oversized outbound frames before writing" {
+    var payload: [proto.MAX_BODY_LENGTH]u8 = undefined;
+    var output: [1]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+
+    try std.testing.expectError(
+        error.MessageTooLarge,
+        writeMessage(&writer, .goodbye, &payload),
+    );
 }

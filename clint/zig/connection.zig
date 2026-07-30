@@ -66,7 +66,7 @@ pub const Connection = struct {
     }
 
     /// Execute a SQL statement. Returns a result iterator.
-    /// Caller must call `deinit` on the iterator after consuming it.
+    /// The caller must consume or drain the result before issuing another statement.
     pub fn execute(self: *Connection, arena: Allocator, sql: []const u8) !QueryResult {
         _ = arena;
         // Write the query message
@@ -90,7 +90,15 @@ pub const Connection = struct {
     /// Close the connection gracefully.
     pub fn close(self: *Connection, io: Io) void {
         codec.writeMessage(&self.writer.interface, .goodbye, "") catch {};
+        self.writer.interface.flush() catch {};
         self.stream.close(io);
+    }
+
+    /// Close the Connection and release all client-owned resources.
+    pub fn deinit(self: *Connection, io: Io) void {
+        self.close(io);
+        self.allocator.free(self.server_version);
+        self.server_version = "";
     }
 };
 
@@ -107,7 +115,7 @@ pub const QueryResult = struct {
 
         const msg = try codec.readMessage(arena, self.reader);
         switch (msg) {
-            .command_complete, .goodbye => {
+            .command_complete, .server_error, .goodbye => {
                 self.done = true;
                 return msg;
             },

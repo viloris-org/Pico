@@ -42,10 +42,7 @@ pub fn main(init: std.process.Init) !void {
         std.log.err("connection failed: {s}", .{@errorName(err)});
         return err;
     };
-    defer {
-        conn.close(io);
-        gpa.free(conn.server_version);
-    }
+    defer conn.deinit(io);
 
     // Stdout writer
     var stdout_buf: [4096]u8 = undefined;

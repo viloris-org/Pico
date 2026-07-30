@@ -135,7 +135,32 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const clint_tests = b.addTest(.{
+        .root_module = clint_mod,
+    });
+    const run_clint_tests = b.addRunArtifact(clint_tests);
+
+    const clint_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("clint/zig/integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "clint", .module = clint_mod },
+            },
+        }),
+    });
+    const run_clint_integration_tests = b.addRunArtifact(clint_integration_tests);
+    run_clint_integration_tests.step.dependOn(b.getInstallStep());
+    run_clint_integration_tests.setEnvironmentVariable(
+        "PICO_TEST_SERVER",
+        b.getInstallPath(.bin, "pico"),
+    );
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_clint_tests.step);
+    test_step.dependOn(&run_clint_integration_tests.step);
 }

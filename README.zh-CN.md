@@ -4,13 +4,14 @@ Pico Server is a lightweight, single-node OLTP database built in Zig. It runs as
 
 Pico intentionally implements an OLTP-oriented SQL subset. It is not PostgreSQL-compatible: Pico defines the wire protocol, SQL dialect, types, errors, drivers, and tools as its own contracts. SQL outside the published support matrix fails with an explicit error.
 
-Pico Server and Pico Client communicate only through the versioned Pico Wire Protocol, Pico SQL, and the public error model. This repository contains Pico Server alone. See [product boundaries](docs/products.md).
+Pico Server and Pico Client communicate only through the versioned Pico Wire Protocol, Pico SQL, and the public error model. See [product boundaries](docs/products.md).
 
 ## Current Status
 
 Pico Server is still under active development. The current implementation provides:
 
-- A TCP server. The current implementation still includes a temporary PostgreSQL Frontend/Backend Protocol adapter, but this does not constitute a product compatibility commitment
+- A native Pico Wire Protocol TCP listener and Pico Client CLI
+- A temporary PostgreSQL Frontend/Backend Protocol adapter, which is not a product compatibility commitment
 - Single-node, single-instance operation with a local data directory
 - `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
 - Single-column primary keys, column-level unique constraints, defaults, and current SQL type aliases
@@ -22,7 +23,7 @@ Pico Server is still under active development. The current implementation provid
 
 The persistence format and execution architecture are still evolving. Persistent LSM tables, secondary indexes, MVCC isolation, group commit, and the extended query protocol are part of the target architecture; this does not imply that all of them are currently implemented.
 
-The following capabilities are currently rejected explicitly: `CREATE INDEX`, foreign keys, table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`, multi-row `INSERT`, `ON CONFLICT`, `ORDER BY`, `OR` (which requires parenthesized grouping), `NOT`, `IN`, `LIKE`, aggregation, grouping, and the extended query messages `Parse`, `Bind`, `Describe`, and `Execute`.
+The following capabilities are currently rejected explicitly: `CREATE INDEX`, foreign keys, table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`, `ON CONFLICT`, multi-column `ORDER BY`, aggregation, grouping, and the extended query messages `Parse`, `Bind`, `Describe`, and `Execute`.
 
 See the [SQL subset support matrix](docs/sql-subset.md) for the complete Pico SQL boundary. The target protocol and ecosystem decision are recorded in [ADR-0009](docs/adr/0009-pico-native-ecosystem.md).
 
@@ -68,6 +69,7 @@ Available options:
 | --- | --- | --- |
 | `--host <address>` | `127.0.0.1` | Listen address |
 | `--port <port>` | `5433` | Listen port |
+| `--pico-port <port>` | `5434` | Native Pico Wire Protocol TCP port (`0` disables it) |
 | `--data-dir <path>` | `./data` | Instance data directory |
 | `--no-sync` | disabled | Disable WAL synchronization; development only |
 
@@ -121,6 +123,7 @@ See the [architecture document](docs/ARCHITECTURE.md) for the target boundaries 
 ## Documentation
 
 - [SQL subset support matrix](docs/sql-subset.md)
+- [Pico Wire Protocol v0.1](docs/wire-protocol.md)
 - [Architecture document](docs/ARCHITECTURE.md)
 - [Architecture decision records](docs/adr/)
 - [Domain terminology and product constraints](CONTEXT.md)

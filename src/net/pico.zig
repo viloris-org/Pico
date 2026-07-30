@@ -42,8 +42,7 @@ pub fn handleConnection(
     // ── Handshake: read HELLO ──
     {
         const msg_type, const payload = try readFrame(r);
-        if (msg_type != .hello) return error.Protocol;
-        if (payload.len < 4) return error.Protocol;
+        if (msg_type != .hello or payload.len != 4) return error.Protocol;
 
         const major = std.mem.readInt(u16, payload[0..2], .big);
         const minor = std.mem.readInt(u16, payload[2..4], .big);
@@ -74,6 +73,11 @@ pub fn handleConnection(
                     try w.flush();
                     continue;
                 };
+                if (pos != payload.len) {
+                    try sendError(w, 2, "P0000", "invalid query message");
+                    try w.flush();
+                    continue;
+                }
 
                 var result = exec.execute(gpa, eng, &session, sql) catch |err| {
                     try sendError(w, 2, "P0001", @errorName(err));
@@ -97,6 +101,7 @@ pub fn handleConnection(
                 try w.flush();
             },
             .goodbye => {
+                if (!validGoodbyePayload(payload)) return error.Protocol;
                 try sendGoodbye(w, "ok");
                 try w.flush();
                 return;
@@ -126,112 +131,91 @@ fn readFrame(r: anytype) !struct { proto.Type, []const u8 } {
 
 /// Send a framed message.
 fn sendFrame(w: anytype, msg_type: proto.Type, payload: []const u8) !void {
-    const body_len: u32 = @intCast(1 + payload.len);
+    try sendFrameHeader(w, msg_type, payload.len);
+    if (payload.len > 0) try w.writeAll(payload);
+}
+
+fn sendFrameHeader(w: anytype, msg_type: proto.Type, payload_len: usize) !void {
+    if (payload_len > proto.MAX_BODY_LENGTH - 1) return error.MessageTooLarge;
+    const body_len: u32 = @intCast(1 + payload_len);
     var header: [5]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], body_len, .big);
     header[4] = @intFromEnum(msg_type);
     try w.writeAll(&header);
-    if (payload.len > 0) try w.writeAll(payload);
 }
 
 // ── Message helpers ──
 
 fn sendHelloOk(w: anytype) !void {
     const s = "Pico 0.0.1";
-    const sl: u32 = @intCast(s.len);
-    var payload_buf: [256]u8 = undefined;
-    std.mem.writeInt(u32, payload_buf[0..4], sl, .big);
-    @memcpy(payload_buf[4..][0..sl], s);
-    try sendFrame(w, .hello_ok, payload_buf[0 .. 4 + sl]);
+    try sendFrameHeader(w, .hello_ok, try stringPayloadLen(s));
+    try sendString(w, s);
 }
 
 fn sendHelloError(w: anytype, reason: []const u8) !void {
-    const rl: u32 = @intCast(reason.len);
-    var buf: [256]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], rl, .big);
-    @memcpy(buf[4..][0..rl], reason);
-    try sendFrame(w, .hello_error, buf[0 .. 4 + rl]);
+    try sendFrameHeader(w, .hello_error, try stringPayloadLen(reason));
+    try sendString(w, reason);
 }
 
 fn sendRowDescription(w: anytype, col_names: [][]const u8) !void {
-    // Build payload in write buffer ahead
-    var payload_buf: [4096]u8 = undefined;
-    var pos: usize = 0;
+    if (col_names.len > std.math.maxInt(u16)) return error.MessageTooLarge;
     const cc: u16 = @intCast(col_names.len);
-    std.mem.writeInt(u16, payload_buf[pos..][0..2], cc, .big);
-    pos += 2;
+    var payload_len: usize = 2;
     for (col_names) |name| {
-        const nl: u32 = @intCast(name.len);
-        std.mem.writeInt(u32, payload_buf[pos..][0..4], nl, .big);
-        pos += 4;
-        @memcpy(payload_buf[pos..][0..nl], name);
-        pos += nl;
+        payload_len = try addPayloadLength(payload_len, try stringPayloadLen(name));
     }
-    try sendFrame(w, .row_description, payload_buf[0..pos]);
+    try sendFrameHeader(w, .row_description, payload_len);
+    var count_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &count_buf, cc, .big);
+    try w.writeAll(&count_buf);
+    for (col_names) |name| try sendString(w, name);
 }
 
 fn sendRowData(w: anytype, cells: []?[]const u8) !void {
-    var payload_buf: [4096]u8 = undefined;
-    var pos: usize = 0;
+    if (cells.len > std.math.maxInt(u16)) return error.MessageTooLarge;
     const cc: u16 = @intCast(cells.len);
-    std.mem.writeInt(u16, payload_buf[pos..][0..2], cc, .big);
-    pos += 2;
+    var payload_len: usize = 2;
     for (cells) |cell| {
-        if (cell) |val| {
-            payload_buf[pos] = 0;
-            pos += 1;
-            const vl: u32 = @intCast(val.len);
-            std.mem.writeInt(u32, payload_buf[pos..][0..4], vl, .big);
-            pos += 4;
-            @memcpy(payload_buf[pos..][0..vl], val);
-            pos += vl;
+        payload_len = try addPayloadLength(payload_len, 1);
+        if (cell) |val| payload_len = try addPayloadLength(payload_len, try stringPayloadLen(val));
+    }
+    try sendFrameHeader(w, .row_data, payload_len);
+    var count_buf: [2]u8 = undefined;
+    std.mem.writeInt(u16, &count_buf, cc, .big);
+    try w.writeAll(&count_buf);
+    for (cells) |cell| {
+        if (cell) |value| {
+            try w.writeByte(0);
+            try sendString(w, value);
         } else {
-            payload_buf[pos] = 1;
-            pos += 1;
+            try w.writeByte(1);
         }
     }
-    try sendFrame(w, .row_data, payload_buf[0..pos]);
 }
 
 fn sendCommandComplete(w: anytype, tag: []const u8, affected_rows: usize) !void {
-    var buf: [128]u8 = undefined;
-    var pos: usize = 0;
     const ar: u64 = @intCast(affected_rows);
-    std.mem.writeInt(u64, buf[pos..][0..8], ar, .big);
-    pos += 8;
-    const tl: u32 = @intCast(tag.len);
-    std.mem.writeInt(u32, buf[pos..][0..4], tl, .big);
-    pos += 4;
-    @memcpy(buf[pos..][0..tl], tag);
-    pos += tl;
-    try sendFrame(w, .command_complete, buf[0..pos]);
+    try sendFrameHeader(w, .command_complete, try addPayloadLength(8, try stringPayloadLen(tag)));
+    var affected_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &affected_buf, ar, .big);
+    try w.writeAll(&affected_buf);
+    try sendString(w, tag);
 }
 
 fn sendError(w: anytype, severity: u8, code: []const u8, message: []const u8) !void {
-    _ = severity;
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-    buf[pos] = 2;
-    pos += 1;
-    const cl: u32 = @intCast(code.len);
-    std.mem.writeInt(u32, buf[pos..][0..4], cl, .big);
-    pos += 4;
-    @memcpy(buf[pos..][0..cl], code);
-    pos += cl;
-    const ml: u32 = @intCast(message.len);
-    std.mem.writeInt(u32, buf[pos..][0..4], ml, .big);
-    pos += 4;
-    @memcpy(buf[pos..][0..ml], message);
-    pos += ml;
-    try sendFrame(w, proto.Type.server_error, buf[0..pos]);
+    if (severity > 3) return error.Protocol;
+    var payload_len: usize = 1;
+    payload_len = try addPayloadLength(payload_len, try stringPayloadLen(code));
+    payload_len = try addPayloadLength(payload_len, try stringPayloadLen(message));
+    try sendFrameHeader(w, .server_error, payload_len);
+    try w.writeByte(severity);
+    try sendString(w, code);
+    try sendString(w, message);
 }
 
 fn sendGoodbye(w: anytype, reason: []const u8) !void {
-    const rl: u32 = @intCast(reason.len);
-    var buf: [256]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], rl, .big);
-    @memcpy(buf[4..][0..rl], reason);
-    try sendFrame(w, .goodbye, buf[0 .. 4 + rl]);
+    try sendFrameHeader(w, .goodbye, try stringPayloadLen(reason));
+    try sendString(w, reason);
 }
 
 // ── String wire format helpers ──
@@ -241,7 +225,49 @@ fn readStringFromPayload(payload: []const u8, pos: *usize) ![]const u8 {
     const len = std.mem.readInt(u32, payload[pos.*..][0..4], .big);
     pos.* += 4;
     if (len > proto.MAX_STRING_LENGTH) return error.MessageTooLarge;
+    if (len > payload.len - pos.*) return error.Protocol;
     const result = payload[pos.* .. pos.* + len];
     pos.* += len;
     return result;
+}
+
+fn stringPayloadLen(value: []const u8) !usize {
+    if (value.len > proto.MAX_STRING_LENGTH) return error.MessageTooLarge;
+    return addPayloadLength(4, value.len);
+}
+
+fn addPayloadLength(current: usize, additional: usize) !usize {
+    const total = std.math.add(usize, current, additional) catch return error.MessageTooLarge;
+    if (total > proto.MAX_BODY_LENGTH - 1) return error.MessageTooLarge;
+    return total;
+}
+
+fn sendString(w: anytype, value: []const u8) !void {
+    if (value.len > proto.MAX_STRING_LENGTH) return error.MessageTooLarge;
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(value.len), .big);
+    try w.writeAll(&len_buf);
+    try w.writeAll(value);
+}
+
+fn validGoodbyePayload(payload: []const u8) bool {
+    if (payload.len == 0) return true;
+    var pos: usize = 0;
+    _ = readStringFromPayload(payload, &pos) catch return false;
+    return pos == payload.len;
+}
+
+test "row data encoding supports values larger than the old fixed buffer" {
+    var value: [5_000]u8 = undefined;
+    @memset(&value, 'x');
+    const cells = [_]?[]const u8{value[0..]};
+    var output: [5_012]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+
+    try sendRowData(&writer, &cells);
+
+    const encoded = writer.buffered();
+    try std.testing.expectEqual(@as(usize, output.len), encoded.len);
+    try std.testing.expectEqual(@as(u32, 5_008), std.mem.readInt(u32, encoded[0..4], .big));
+    try std.testing.expectEqual(proto.Type.row_data, @as(proto.Type, @enumFromInt(encoded[4])));
 }

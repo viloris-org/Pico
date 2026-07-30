@@ -11,17 +11,17 @@ compatible: its protocol, SQL dialect, types, errors, drivers, and tools are
 Pico-owned contracts. SQL outside the published support matrix is rejected with
 an explicit error.
 
-Pico Server and Pico Client communicate only through the versioned Pico wire
-protocol, Pico SQL, and the public error model. This repository contains Pico
-Server only. See [product boundaries](docs/products.md).
+Pico Server and Pico Client communicate only through the versioned Pico Wire
+Protocol, Pico SQL, and the public error model. See [product
+boundaries](docs/products.md).
 
 ## Status
 
 Pico Server is under active development. The current implementation provides:
 
-- A TCP server; the current implementation still uses a temporary PostgreSQL
-  Frontend/Backend Protocol adapter, which is not a product compatibility
-  commitment
+- A native Pico Wire Protocol TCP listener and Pico Client CLI
+- A temporary PostgreSQL Frontend/Backend Protocol adapter, which is not a
+  product compatibility commitment
 - Single-instance operation with a local data directory
 - `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
 - Single-column primary keys, column-level unique constraints, defaults, and
@@ -40,8 +40,7 @@ capabilities.
 
 The following are currently rejected explicitly: `CREATE INDEX`, foreign keys,
 table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`,
-`ON CONFLICT`, multi-column `ORDER BY`, `OR` (outside parentheses), `NOT`,
-`IN`, `LIKE`, aggregation, grouping, and the extended query messages
+`ON CONFLICT`, multi-column `ORDER BY`, aggregation, grouping, and the extended query messages
 `Parse`, `Bind`, `Describe`, and `Execute`.
 
 See the [SQL subset support matrix](docs/sql-subset.md) for the authoritative
@@ -94,6 +93,7 @@ Available options:
 | --- | --- | --- |
 | `--host <address>` | `127.0.0.1` | Listen address |
 | `--port <port>` | `5433` | Listen port |
+| `--pico-port <port>` | `5434` | Native Pico Wire Protocol TCP port (`0` disables it) |
 | `--data-dir <path>` | `./data` | Instance data directory |
 | `--no-sync` | disabled | Disable WAL synchronization; development only |
 
@@ -158,6 +158,7 @@ currently implemented components.
 ## Documentation
 
 - [SQL subset support matrix](docs/sql-subset.md)
+- [Pico Wire Protocol v0.1](docs/wire-protocol.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Architecture decision records](docs/adr/)
 - [Domain terminology and product constraints](CONTEXT.md)
