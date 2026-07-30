@@ -88,6 +88,21 @@ DDL and catalog changes also enter the same single-writer queue. Each statement 
 
 Strict serializability is not a Pico v1 isolation promise. This section records the design to adopt only after a new ADR, a Pico SQL support-matrix entry, and wire-protocol error mapping make that promise explicit. It defines optimistic conflict validation for Pico's single-instance commit path; it does not introduce distributed transaction roles, resolver sharding, replication, or a fixed transaction lifetime.
 
+The design has four non-negotiable properties:
+
+1. A transaction validates logical dependencies formed from one read watermark; it does not validate storage files, page numbers, or an execution plan's transient details.
+2. The single writer is the only authority that accepts or rejects a transaction and assigns its `commit_seq`. Work may be prepared concurrently, but validation decisions are ordered exactly as publication decisions.
+3. A retryable serialization conflict, a non-retryable constraint error, and retryable overload are distinct outcomes. They have different causes and must remain distinct in Pico SQL and Pico Wire Protocol error mapping.
+4. Range history and active snapshots are bounded resources. Pico must reject work that exceeds an announced age or resource limit rather than retaining conflict metadata indefinitely or weakening isolation.
+
+### Range Collection Lifecycle
+
+Range collection begins when the transaction obtains `read_seq`, before the first read whose result can affect a later write. The execution layer records each dependency while it still knows the SQL operation, access path, predicate bounds, and catalog objects used for binding. It then canonicalizes and coalesces compatible overlapping ranges in the private transaction state. Coalescing may widen a range within the same logical namespace, but it must never omit a dependency or combine ranges from different databases, tables, indexes, or catalog domains.
+
+The transaction submits its immutable read ranges, write ranges, observed-version stamps, and logical write set as one commit request. `commit` owns the accepted request thereafter; `txn` must not mutate it while the request is queued. Cancellation before the irreversible commit point discards the request and deregisters its snapshot. Cancellation after that point may suppress the response but cannot revoke validation, WAL persistence, or publication.
+
+Range collection is part of semantic execution, not a diagnostic side channel. A failed predicate evaluation still records the range needed to establish that no qualifying row was visible when the result controls a later write. Conversely, a statement that reads only its own private write set adds no shared read range because no committed-state dependency was observed.
+
 ### Read and Write Ranges
 
 At the first consistent read (or before committing a write-only transaction), a transaction captures `read_seq = published_commit_seq`. It records logical ranges, never physical LSM files or pages:

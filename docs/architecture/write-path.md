@@ -228,9 +228,31 @@ and small transactions share batch-write overhead.
 The `commit` module will add the queue and batching (see the evolution order in
 `ARCHITECTURE.md`).
 
+### Commit Request Contract (Target)
+
+The boundary between `txn` and the single writer is a complete, immutable commit request. It
+must contain enough logical information for the writer to make one deterministic decision; the
+writer must not revisit the connection, rerun SQL text, or depend on a mutable execution object.
+
+| Field | Owner before queueing | Purpose at the single writer |
+| --- | --- | --- |
+| `read_seq` | `txn` | Establishes which published write-range history must be checked. |
+| Read conflict ranges | `txn` | Represents point, index, table, and catalog dependencies that could make the transaction's reads stale. |
+| Write conflict ranges | `txn` | Is published into ordered conflict history after acceptance and protects later readers. |
+| Observed-version stamps | `txn` | Revalidates rows targeted by update or delete against the published state. |
+| Logical write set | `txn` | Supplies constraint validation, WAL encoding, and atomic catalog/table/index publication. |
+| Durability level and result route | `connection` / `txn` | Determines the WAL persistence boundary and where a completion may be delivered; neither changes commit order. |
+
+The writer processes requests in FIFO queue order. For each request it compares the read ranges
+with writes published after `read_seq`, rechecks row and constraint invariants against earlier
+accepted requests in the same round, and either rejects it or assigns the next `commit_seq`.
+An accepted request contributes its write ranges before the next request is validated. Therefore,
+two overlapping requests in one group-commit round have the same outcome they would have had if
+the writer had processed them as separate rounds in that order.
+
 ### Write-Intensive Admission and Progress
 
-The commit queue is a protection boundary, not an unbounded waiting room. It has explicit limits for request count and staged bytes; a request also has limits for operation count and encoded WAL size. Admission must preserve FIFO order among accepted requests. When a limit is reached, Pico applies bounded backpressure and then rejects new work with an explicit retryable overload outcome rather than accepting unlimited memory growth or allowing a hot connection to monopolize the writer.
+The commit queue is a protection boundary, not an unbounded waiting room. It has explicit limits for request count and staged bytes; a request also has limits for operation count, encoded WAL size, conflict-range count, and conflict-range bytes. Connection and operation admission occurs before a strict transaction is issued a snapshot whenever possible; range limits are enforced as dependencies are collected and before a request enters the queue. When a limit is reached, Pico applies bounded backpressure and then rejects new work with an explicit retryable overload outcome rather than accepting unlimited memory growth or allowing a hot connection to monopolize the writer.
 
 Group commit amortizes WAL sync only. It must not merge independent transactions, reorder accepted requests, skip per-transaction conflict/constraint validation, or make a group visible atomically as though it were one user transaction. Within a round, validate and assign commit sequences one request at a time, then write one or more complete transaction records before their shared strict durability round. A failed request does not prevent later independent requests from being considered, and never consumes a visible commit sequence.
 

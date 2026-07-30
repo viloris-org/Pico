@@ -72,8 +72,8 @@ flowchart TB
 | `net` | Protocol encoding/decoding, authentication entry point, and error mapping for one connection | Connection and session state | `sql`, `util` |
 | `sql` | Lexing, parsing, binding, and execution scheduling for the SQL subset (target: a step-able executor) | Parsed statements, executor, short-lived execution state | `txn`, `catalog`, `util` |
 | `catalog` | Database, table, column, and index definitions | Catalog metadata | `storage`, `util` |
-| `txn` | Snapshots, write sets, conflict checks, and commit requests | Active transactions and MVCC timestamps | `catalog`, `storage`, `util` |
-| `commit` | Unique commit order, group commit, and write application | Bounded commit queue and next commit sequence | `txn`, `catalog`, `storage`, `util` |
+| `txn` | Snapshots, write sets, logical conflict-range collection, and commit requests | Active transactions, MVCC timestamps, and private conflict ranges | `catalog`, `storage`, `util` |
+| `commit` | Unique commit order, group commit, conflict-history validation, and write application | Bounded commit queue, next commit sequence, and published write-range history | `txn`, `catalog`, `storage`, `util` |
 | `storage/wal` | WAL format, append, validation, and recovery | WAL files and durability boundary | `storage/vfs`, `util` |
 | `storage/lsm` | Reads/writes for table and index ordered sets, and the manifest | Memtables, immutable tables, and manifest | `storage/vfs`, `storage/pager` (if page files), `util` |
 | `storage/compaction` | LSM flush, merge, and file reclamation | Bounded task queue and candidate set | `storage/lsm`, `storage/vfs`, `util` |

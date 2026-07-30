@@ -157,6 +157,15 @@ share the same commit-sequence domain:
 
 No snapshot may fall between dependent commit publications. Pico achieves that with one published watermark, not a multi-process active-transaction array or a heavy-lock wait graph for ordinary DML. DDL, cancellation, isolation levels, and extended queries still need their own conflict and state-transition rules.
 
+For a future strict-OCC transaction, the runtime admits the connection's work and checks its
+input and operation budgets before issuing `read_seq`. `txn` enforces conflict-range budgets as
+it collects dependencies and before it queues the immutable commit request. This keeps rejected
+or queue-delayed work from retaining an unnecessarily old snapshot and expanding the conflict
+history horizon. Once admitted, `txn` registers the snapshot and builds an immutable commit
+request; `commit` validates that request in queue order. The runtime reports queue delay,
+serialization conflict, stale-snapshot rejection, and overload separately, because only the
+first three may be addressed by changing transaction timing or data shape.
+
 ## Observability and Acceptance
 
 At minimum emit connection and rejection counts, state transitions, current/peak queue depth,

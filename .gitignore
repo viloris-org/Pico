@@ -1,5 +1,6 @@
 .zig-cache/
 zig-cache/
+zig-cache-global/
 zig-out/
 data/
 *.o
