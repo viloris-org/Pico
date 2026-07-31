@@ -4,11 +4,12 @@
 const std = @import("std");
 const Io = std.Io;
 const clint = @import("clint");
+const proto = clint.proto;
 
 const server_port: u16 = 64334;
 const data_dir = "zig-cache/runa-client-protocol-integration";
 
-test "RunaDB Client submits Runa Flow and receives binding errors" {
+test "RunaDB Client v1 protocol lifecycle and request errors" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const server_path = std.mem.span(std.c.getenv("RUNA_TEST_SERVER") orelse return error.ServerPathMissing);
@@ -50,6 +51,9 @@ test "RunaDB Client submits Runa Flow and receives binding errors" {
     }
     try std.testing.expect((try failed.next(arena.allocator())) == null);
 
+    try expectVersionRejection(gpa, io);
+    try expectMalformedRequestsKeepConnectionUsable(gpa, io);
+    try expectGoodbyeConfirmationAndClose(gpa, io);
 }
 
 fn connectWhenReady(gpa: std.mem.Allocator, io: Io) !clint.Connection {
@@ -63,4 +67,113 @@ fn connectWhenReady(gpa: std.mem.Allocator, io: Io) !clint.Connection {
         }
     }
     return last_error orelse error.ServerDidNotStart;
+}
+
+fn connectRaw(io: Io) !Io.net.Stream {
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", server_port);
+    return addr.connect(io, .{ .mode = .stream });
+}
+
+fn writeHello(writer: *Io.Writer, major: u16, minor: u16) !void {
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], major, .big);
+    std.mem.writeInt(u16, payload[2..4], minor, .big);
+    try clint.codec.writeMessage(writer, .hello, &payload);
+    try writer.flush();
+}
+
+fn expectHelloOk(allocator: std.mem.Allocator, reader: *Io.Reader) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const response = try clint.codec.readMessage(arena.allocator(), reader);
+    try std.testing.expect(response == .hello_ok);
+}
+
+fn expectServerError(
+    allocator: std.mem.Allocator,
+    reader: *Io.Reader,
+    expected_code: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const response = try clint.codec.readMessage(arena.allocator(), reader);
+    switch (response) {
+        .server_error => |server_error| {
+            try std.testing.expectEqual(@as(u8, 2), server_error.severity);
+            try std.testing.expectEqualStrings(expected_code, server_error.code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectVersionRejection(allocator: std.mem.Allocator, io: Io) !void {
+    const stream = try connectRaw(io);
+    defer stream.close(io);
+
+    var read_buf: [1024]u8 = undefined;
+    var write_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &write_buf);
+
+    try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR + 1, proto.PROTOCOL_VERSION_MINOR);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const response = try clint.codec.readMessage(arena.allocator(), &reader.interface);
+    switch (response) {
+        .hello_error => |hello_error| {
+            try std.testing.expectEqualStrings("unsupported protocol version", hello_error.reason);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.EndOfStream, clint.codec.readMessage(arena.allocator(), &reader.interface));
+}
+
+fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io: Io) !void {
+    const stream = try connectRaw(io);
+    defer stream.close(io);
+
+    var read_buf: [1024]u8 = undefined;
+    var write_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &write_buf);
+    try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    try expectHelloOk(allocator, &reader.interface);
+
+    // The source string declares one byte but provides none.
+    const truncated_source = [_]u8{ 0, 0, 0, 1 };
+    try clint.codec.writeMessage(&writer.interface, .flow_source, &truncated_source);
+    try writer.interface.flush();
+    try expectServerError(allocator, &reader.interface, "RF1000");
+
+    var unsupported_ir_version: [2]u8 = undefined;
+    std.mem.writeInt(u16, &unsupported_ir_version, proto.IR_FORMAT_VERSION + 1, .big);
+    try clint.codec.writeMessage(&writer.interface, .flow_ir, &unsupported_ir_version);
+    try writer.interface.flush();
+    try expectServerError(allocator, &reader.interface, "RF1004");
+}
+
+fn expectGoodbyeConfirmationAndClose(allocator: std.mem.Allocator, io: Io) !void {
+    const stream = try connectRaw(io);
+    defer stream.close(io);
+
+    var read_buf: [1024]u8 = undefined;
+    var write_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &write_buf);
+    try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    try expectHelloOk(allocator, &reader.interface);
+
+    try clint.codec.writeMessage(&writer.interface, .goodbye, "");
+    try writer.interface.flush();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const response = try clint.codec.readMessage(arena.allocator(), &reader.interface);
+    switch (response) {
+        .goodbye => |goodbye| try std.testing.expectEqualStrings("ok", goodbye.reason),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.EndOfStream, clint.codec.readMessage(arena.allocator(), &reader.interface));
 }
