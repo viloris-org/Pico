@@ -4,7 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 4;
 pub const DEVELOPMENT_MODEL_REVISION: u64 = 0;
 
 pub const IrError = error{
@@ -12,6 +12,8 @@ pub const IrError = error{
     UnsupportedVersion,
     StringTooLarge,
     ExpectedField,
+    ExpectedLiteral,
+    InvalidLiteral,
     InvalidIdentifier,
     InvalidOperation,
     InvalidModality,
@@ -43,12 +45,16 @@ pub const Request = struct {
     model_revision: u64,
     operation: Operation = .emit,
     relation: []u8,
+    where: []ast.Predicate = &.{},
     fields: [][]u8,
+    limit: ?u32 = null,
     observe: ?Observe = null,
     evidence_id: u64 = 0,
 
     pub fn deinit(self: *Request, gpa: Allocator) void {
         gpa.free(self.relation);
+        for (self.where) |*predicate| predicate.deinit(gpa);
+        gpa.free(self.where);
         for (self.fields) |field| gpa.free(field);
         gpa.free(self.fields);
         if (self.observe) |*request| request.deinit(gpa);
@@ -58,8 +64,13 @@ pub const Request = struct {
 pub fn bind(gpa: Allocator, source: ast.Source) !Request {
     const relation = try gpa.dupe(u8, source.relation);
     errdefer gpa.free(relation);
+    const predicates = try duplicatePredicates(gpa, source.where);
+    errdefer {
+        for (predicates) |*predicate| predicate.deinit(gpa);
+        gpa.free(predicates);
+    }
     const fields = try duplicateFields(gpa, source.fields);
-    const request = Request{ .model_revision = DEVELOPMENT_MODEL_REVISION, .relation = relation, .fields = fields };
+    const request = Request{ .model_revision = DEVELOPMENT_MODEL_REVISION, .relation = relation, .where = predicates, .fields = fields, .limit = source.limit };
     try validate(&request);
     return request;
 }
@@ -76,9 +87,14 @@ pub fn encode(gpa: Allocator, request: *const Request) ![]u8 {
     switch (request.operation) {
         .emit => {
             try appendString(&output, gpa, request.relation);
+            if (request.where.len > std.math.maxInt(u8)) return error.StringTooLarge;
+            try output.append(gpa, @intCast(request.where.len));
+            for (request.where) |*predicate| try appendPredicate(&output, gpa, predicate);
             if (request.fields.len > std.math.maxInt(u16)) return error.StringTooLarge;
             try appendInt(&output, gpa, u16, @intCast(request.fields.len));
             for (request.fields) |field| try appendString(&output, gpa, field);
+            try output.append(gpa, if (request.limit != null) 1 else 0);
+            if (request.limit) |limit| try appendInt(&output, gpa, u32, limit);
         },
         .observe => {
             const observation = request.observe.?;
@@ -102,13 +118,17 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
     const operation = std.enums.fromInt(Operation, bytes[pos]) orelse return error.InvalidOperation;
     pos += 1;
     var relation: []u8 = try gpa.alloc(u8, 0);
+    var predicates: []ast.Predicate = try gpa.alloc(ast.Predicate, 0);
     var fields: [][]u8 = try gpa.alloc([]u8, 0);
     var observation: ?Observe = null;
     var evidence_id: u64 = 0;
+    var limit: ?u32 = null;
     var transferred = false;
     errdefer {
         if (!transferred) {
             gpa.free(relation);
+            for (predicates) |*predicate| predicate.deinit(gpa);
+            gpa.free(predicates);
             for (fields) |field| gpa.free(field);
             gpa.free(fields);
             if (observation) |*item| item.deinit(gpa);
@@ -119,6 +139,18 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
             const parsed_relation = try readString(gpa, bytes, &pos);
             gpa.free(relation);
             relation = parsed_relation;
+            if (pos >= bytes.len) return error.InvalidFormat;
+            const predicate_count = bytes[pos];
+            pos += 1;
+            var predicate_list: std.ArrayList(ast.Predicate) = .empty;
+            errdefer {
+                for (predicate_list.items) |*predicate| predicate.deinit(gpa);
+                predicate_list.deinit(gpa);
+            }
+            for (0..predicate_count) |_| try predicate_list.append(gpa, try decodePredicate(gpa, bytes, &pos));
+            const parsed_predicates = try predicate_list.toOwnedSlice(gpa);
+            gpa.free(predicates);
+            predicates = parsed_predicates;
             const count = try readInt(u16, bytes, &pos);
             var list: std.ArrayList([]u8) = .empty;
             errdefer {
@@ -129,6 +161,11 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
             const parsed_fields = try list.toOwnedSlice(gpa);
             gpa.free(fields);
             fields = parsed_fields;
+            if (pos >= bytes.len) return error.InvalidFormat;
+            const has_limit = bytes[pos];
+            pos += 1;
+            if (has_limit > 1) return error.InvalidFormat;
+            if (has_limit == 1) limit = try readInt(u32, bytes, &pos);
         },
         .observe => observation = try decodeObserve(gpa, bytes, &pos),
         .read_evidence_payload => evidence_id = try readInt(u64, bytes, &pos),
@@ -138,7 +175,9 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
         .model_revision = model_revision,
         .operation = operation,
         .relation = relation,
+        .where = predicates,
         .fields = fields,
+        .limit = limit,
         .observe = observation,
         .evidence_id = evidence_id,
     };
@@ -163,6 +202,50 @@ fn decodeObserve(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!Observe
     return .{ .upload_id = upload_id, .object_id = object_id, .modality = modality, .media_type = media_type, .observed_at = observed_at, .origin = origin };
 }
 
+fn decodePredicate(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!ast.Predicate {
+    const column = try readString(gpa, bytes, pos);
+    errdefer gpa.free(column);
+    if (pos.* >= bytes.len) return error.InvalidFormat;
+    const op = std.enums.fromInt(ast.Op, bytes[pos.*]) orelse return error.InvalidOperation;
+    pos.* += 1;
+    var scalar: ?ast.Literal = null;
+    var list: std.ArrayList(ast.Literal) = .empty;
+    errdefer {
+        if (scalar) |*literal| literal.deinit(gpa);
+        for (list.items) |*literal| literal.deinit(gpa);
+        list.deinit(gpa);
+    }
+    switch (op) {
+        .is_null, .not_null => {},
+        .in, .not_in => {
+            const literal_count = try readInt(u16, bytes, pos);
+            if (literal_count == 0) return error.InvalidFormat;
+            try list.ensureUnusedCapacity(gpa, literal_count);
+            for (0..literal_count) |_| list.appendAssumeCapacity(try decodeLiteral(gpa, bytes, pos));
+        },
+        else => scalar = try decodeLiteral(gpa, bytes, pos),
+    }
+    return .{ .column = column, .op = op, .scalar = scalar, .list = list };
+}
+
+fn decodeLiteral(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!ast.Literal {
+    if (pos.* >= bytes.len) return error.InvalidFormat;
+    const tag = bytes[pos.*];
+    pos.* += 1;
+    return switch (tag) {
+        1 => .{ .int = try readInt(i64, bytes, pos) },
+        2 => .{ .text = try readString(gpa, bytes, pos) },
+        3 => blk: {
+            if (pos.* >= bytes.len) return error.InvalidFormat;
+            const boolean = bytes[pos.*];
+            pos.* += 1;
+            if (boolean > 1) return error.InvalidFormat;
+            break :blk .{ .bool = boolean == 1 };
+        },
+        else => return error.InvalidFormat,
+    };
+}
+
 /// Reject structures that cannot be produced by the Runa Flow source grammar.
 /// This protects the canonical IR boundary when a client sends IR directly.
 pub fn validate(request: *const Request) IrError!void {
@@ -170,19 +253,88 @@ pub fn validate(request: *const Request) IrError!void {
         .emit => {
             if (request.observe != null or request.evidence_id != 0) return error.InvalidOperation;
             if (!ast.isIdentifier(request.relation)) return error.InvalidIdentifier;
+            for (request.where) |predicate| {
+                if (!ast.isIdentifier(predicate.column)) return error.InvalidIdentifier;
+                switch (predicate.op) {
+                    .is_null, .not_null => {
+                        if (predicate.scalar != null or predicate.list.items.len != 0) return error.InvalidOperation;
+                    },
+                    .like, .not_like => {
+                        if (predicate.list.items.len != 0) return error.InvalidOperation;
+                        const literal = predicate.scalar orelse return error.ExpectedLiteral;
+                        if (literal != .text) return error.InvalidLiteral;
+                    },
+                    .in, .not_in => {
+                        if (predicate.scalar != null) return error.InvalidOperation;
+                        if (predicate.list.items.len == 0) return error.ExpectedLiteral;
+                        const first = &predicate.list.items[0];
+                        for (predicate.list.items[1..]) |*literal| {
+                            if (!sameLiteralTag(first, literal)) return error.InvalidLiteral;
+                        }
+                    },
+                    else => {
+                        if (predicate.scalar == null) return error.ExpectedLiteral;
+                        if (predicate.list.items.len != 0) return error.InvalidOperation;
+                    },
+                }
+            }
             if (request.fields.len == 0) return error.ExpectedField;
             for (request.fields) |field| if (!ast.isIdentifier(field)) return error.InvalidIdentifier;
         },
         .observe => {
             const observation = request.observe orelse return error.InvalidOperation;
-            if (request.relation.len != 0 or request.fields.len != 0 or request.evidence_id != 0) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.evidence_id != 0 or request.limit != null) return error.InvalidOperation;
             if (observation.upload_id == 0 or observation.object_id.len == 0 or observation.media_type.len == 0 or observation.observed_at.len == 0 or observation.origin.len == 0) return error.ExpectedField;
             if (observation.modality < 1 or observation.modality > 6) return error.InvalidModality;
         },
         .read_evidence_payload => {
-            if (request.relation.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id == 0) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id == 0 or request.limit != null) return error.InvalidOperation;
         },
     }
+}
+
+fn sameLiteralTag(left: *const ast.Literal, right: *const ast.Literal) bool {
+    return switch (left.*) {
+        .int => right.* == .int,
+        .text => right.* == .text,
+        .bool => right.* == .bool,
+    };
+}
+
+fn duplicatePredicates(gpa: Allocator, predicates: []const ast.Predicate) ![]ast.Predicate {
+    const result = try gpa.alloc(ast.Predicate, predicates.len);
+    errdefer gpa.free(result);
+    var copied: usize = 0;
+    errdefer for (result[0..copied]) |*predicate| predicate.deinit(gpa);
+    for (predicates, 0..) |*predicate, index| {
+        result[index] = try duplicatePredicate(gpa, predicate);
+        copied += 1;
+    }
+    return result;
+}
+
+fn duplicatePredicate(gpa: Allocator, source: *const ast.Predicate) !ast.Predicate {
+    const column = try gpa.dupe(u8, source.column);
+    errdefer gpa.free(column);
+    var scalar: ?ast.Literal = null;
+    if (source.scalar) |*literal| scalar = try duplicateLiteral(gpa, literal);
+    errdefer if (scalar) |*literal| literal.deinit(gpa);
+    var list: std.ArrayList(ast.Literal) = .empty;
+    errdefer {
+        for (list.items) |*literal| literal.deinit(gpa);
+        list.deinit(gpa);
+    }
+    try list.ensureUnusedCapacity(gpa, source.list.items.len);
+    for (source.list.items) |*literal| list.appendAssumeCapacity(try duplicateLiteral(gpa, literal));
+    return .{ .column = column, .op = source.op, .scalar = scalar, .list = list };
+}
+
+fn duplicateLiteral(gpa: Allocator, source: *const ast.Literal) !ast.Literal {
+    return switch (source.*) {
+        .int => |integer| .{ .int = integer },
+        .bool => |boolean| .{ .bool = boolean },
+        .text => |text| .{ .text = try gpa.dupe(u8, text) },
+    };
 }
 
 fn duplicateFields(gpa: Allocator, fields: []const []u8) ![][]u8 {
@@ -211,6 +363,37 @@ fn appendString(output: *std.ArrayList(u8), gpa: Allocator, value: []const u8) !
     try output.appendSlice(gpa, value);
 }
 
+fn appendPredicate(output: *std.ArrayList(u8), gpa: Allocator, predicate: *const ast.Predicate) !void {
+    try appendString(output, gpa, predicate.column);
+    try output.append(gpa, @intFromEnum(predicate.op));
+    switch (predicate.op) {
+        .is_null, .not_null => {},
+        .in, .not_in => {
+            if (predicate.list.items.len > std.math.maxInt(u16)) return error.StringTooLarge;
+            try appendInt(output, gpa, u16, @intCast(predicate.list.items.len));
+            for (predicate.list.items) |*literal| try appendLiteral(output, gpa, literal);
+        },
+        else => try appendLiteral(output, gpa, &predicate.scalar.?),
+    }
+}
+
+fn appendLiteral(output: *std.ArrayList(u8), gpa: Allocator, literal: *const ast.Literal) !void {
+    switch (literal.*) {
+        .int => |integer| {
+            try output.append(gpa, 1);
+            try appendInt(output, gpa, i64, integer);
+        },
+        .text => |text| {
+            try output.append(gpa, 2);
+            try appendString(output, gpa, text);
+        },
+        .bool => |boolean| {
+            try output.append(gpa, 3);
+            try output.append(gpa, if (boolean) 1 else 0);
+        },
+    }
+}
+
 fn readInt(comptime T: type, bytes: []const u8, pos: *usize) IrError!T {
     if (bytes.len -| pos.* < @sizeOf(T)) return error.InvalidFormat;
     const value = std.mem.readInt(T, bytes[pos.*..][0..@sizeOf(T)], .big);
@@ -227,7 +410,7 @@ fn readString(gpa: Allocator, bytes: []const u8, pos: *usize) IrError![]u8 {
 }
 
 test "IR encoding round trips exactly" {
-    var source = try ast.parse(std.testing.allocator, "from customer\n| emit { id, name }");
+    var source = try ast.parse(std.testing.allocator, "from customer\n| where id >= 5\n| where name like 'a%'\n| emit { id, name }\n| limit 12");
     defer source.deinit(std.testing.allocator);
     var request = try bind(std.testing.allocator, source);
     defer request.deinit(std.testing.allocator);
@@ -236,16 +419,24 @@ test "IR encoding round trips exactly" {
     var decoded = try decode(std.testing.allocator, bytes);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("customer", decoded.relation);
+    try std.testing.expectEqual(@as(usize, 2), decoded.where.len);
+    try std.testing.expectEqual(ast.Op.gte, decoded.where[0].op);
+    try std.testing.expectEqual(@as(i64, 5), decoded.where[0].scalar.?.int);
+    try std.testing.expectEqual(ast.Op.like, decoded.where[1].op);
+    try std.testing.expectEqualStrings("a%", decoded.where[1].scalar.?.text);
     try std.testing.expectEqualStrings("name", decoded.fields[1]);
+    try std.testing.expectEqual(@as(?u32, 12), decoded.limit);
 }
 
 test "IR decode rejects an empty projection" {
     const bytes = [_]u8{
-        0, 2, // format version
+        0, 4, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
+        0, // where predicate count
         0, 0, // field count
+        0, // no limit
     };
     try std.testing.expectError(error.ExpectedField, decode(std.testing.allocator, &bytes));
 }
@@ -260,9 +451,110 @@ test "IR encode rejects identifiers outside the source grammar" {
     try std.testing.expectError(error.InvalidIdentifier, encode(std.testing.allocator, &request));
 }
 
+test "IR decode rejects an invalid limit presence flag" {
+    const bytes = [_]u8{
+        0, 4, // format version
+        0, 0, 0, 0, 0, 0, 0, 0, // model revision
+        1, // emit operation
+        0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
+        0, // where predicate count
+        0,   1, // field count
+        0,   2,
+        'i', 'd',
+        2, // invalid limit presence flag
+    };
+    try std.testing.expectError(error.InvalidFormat, decode(std.testing.allocator, &bytes));
+}
+
+test "IR decode rejects an invalid predicate op" {
+    const bytes = [_]u8{
+        0, 4, // format version
+        0, 0, 0, 0, 0, 0, 0, 0, // model revision
+        1, // emit operation
+        0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
+        1, // one where predicate
+        0, 2, 'i', 'd', // column
+        99, // invalid op
+    };
+    try std.testing.expectError(error.InvalidOperation, decode(std.testing.allocator, &bytes));
+}
+
+test "IR decode rejects an invalid in-list literal tag" {
+    const bytes = [_]u8{
+        0, 4, // format version
+        0, 0, 0, 0, 0, 0, 0, 0, // model revision
+        1, // emit operation
+        0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
+        1, // one where predicate
+        0, 2, 'i', 'd', // column
+        @intFromEnum(ast.Op.in), // op
+        0, 1, // one literal
+        9, // invalid literal tag
+    };
+    try std.testing.expectError(error.InvalidFormat, decode(std.testing.allocator, &bytes));
+}
+
+test "IR encode rejects a non-homogeneous in list" {
+    const gpa = std.testing.allocator;
+    var predicate: ast.Predicate = .{
+        .column = try gpa.dupe(u8, "id"),
+        .op = .in,
+    };
+    defer predicate.deinit(gpa);
+    try predicate.list.append(gpa, .{ .int = 1 });
+    try predicate.list.append(gpa, .{ .text = try gpa.dupe(u8, "x") });
+    var predicates = [_]ast.Predicate{predicate};
+    var fields = [_][]u8{@constCast("id")};
+    const request = Request{
+        .model_revision = DEVELOPMENT_MODEL_REVISION,
+        .relation = @constCast("customer"),
+        .where = predicates[0..],
+        .fields = fields[0..],
+    };
+    try std.testing.expectError(error.InvalidLiteral, encode(std.testing.allocator, &request));
+}
+
+test "IR encode rejects a non-text like pattern" {
+    const gpa = std.testing.allocator;
+    var predicate: ast.Predicate = .{
+        .column = try gpa.dupe(u8, "name"),
+        .op = .like,
+        .scalar = .{ .int = 5 },
+    };
+    defer predicate.deinit(gpa);
+    var predicates = [_]ast.Predicate{predicate};
+    var fields = [_][]u8{@constCast("id")};
+    const request = Request{
+        .model_revision = DEVELOPMENT_MODEL_REVISION,
+        .relation = @constCast("customer"),
+        .where = predicates[0..],
+        .fields = fields[0..],
+    };
+    try std.testing.expectError(error.InvalidLiteral, encode(std.testing.allocator, &request));
+}
+
+test "IR encode rejects an is null predicate with a literal" {
+    const gpa = std.testing.allocator;
+    var predicate: ast.Predicate = .{
+        .column = try gpa.dupe(u8, "region"),
+        .op = .is_null,
+        .scalar = .{ .int = 1 },
+    };
+    defer predicate.deinit(gpa);
+    var predicates = [_]ast.Predicate{predicate};
+    var fields = [_][]u8{@constCast("id")};
+    const request = Request{
+        .model_revision = DEVELOPMENT_MODEL_REVISION,
+        .relation = @constCast("customer"),
+        .where = predicates[0..],
+        .fields = fields[0..],
+    };
+    try std.testing.expectError(error.InvalidOperation, encode(std.testing.allocator, &request));
+}
+
 test "IR decodes a canonical observe request" {
     const bytes = [_]u8{
-        0, 2, // format version
+        0, 4, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         2, // observe operation
         0, 0, 0,   0,   0,   0, 0, 7, // upload id

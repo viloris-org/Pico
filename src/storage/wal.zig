@@ -44,7 +44,7 @@ pub const TxnOp = union(enum) {
 /// different complete frame; only an incomplete tail may be truncated.
 const file_magic = "RUNADB_WAL";
 /// Version written into every new or rewritten WAL file.
-const format_version: u32 = 3;
+const format_version: u32 = 4;
 /// Oldest version this build still replays. Version 1 files contain no
 /// `set_serial` record, so reading them needs no compatibility shim; only a
 /// checkpoint rewrite upgrades a file in place. An older build meeting a
@@ -1006,6 +1006,17 @@ fn writeValue(list: *std.ArrayList(u8), gpa: Allocator, v: value.Value) !void {
             try list.append(gpa, 3);
             try list.append(gpa, if (b) 1 else 0);
         },
+        .vector => |items| {
+            value.validateVector(items) catch return error.InvalidWal;
+            if (items.len > std.math.maxInt(u16)) return error.NameTooLong;
+            try list.append(gpa, 4);
+            try writeU16(list, gpa, @intCast(items.len));
+            for (items) |item| {
+                var bytes_out: [4]u8 = undefined;
+                std.mem.writeInt(u32, &bytes_out, @bitCast(item), .little);
+                try list.appendSlice(gpa, &bytes_out);
+            }
+        },
     }
 }
 
@@ -1068,6 +1079,18 @@ fn readValue(gpa: Allocator, payload: []const u8, i: *usize) !value.Value {
             const b = payload[i.*] != 0;
             i.* += 1;
             return .{ .bool = b };
+        },
+        4 => {
+            const count = try readU16(payload, i);
+            if (count == 0 or payload.len - i.* < @as(usize, count) * 4) return error.InvalidWal;
+            const items = try gpa.alloc(f32, count);
+            errdefer gpa.free(items);
+            for (items) |*item| {
+                item.* = @bitCast(std.mem.readInt(u32, payload[i.*..][0..4], .little));
+                i.* += 4;
+            }
+            try value.validateVector(items);
+            return .{ .vector = items };
         },
         else => return error.InvalidWal,
     }

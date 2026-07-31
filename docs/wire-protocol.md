@@ -28,7 +28,7 @@ without changing shared state. A framed Request with an invalid payload returns
    length-prefixed reason or Server version string.
 3. Client sends `FLOW_SOURCE` (`0x10`), one length-prefixed Runa Flow source
    request, or `FLOW_IR` (`0x15`), a big-endian `u16` IR format version plus
-   canonical Runa Query IR bytes. The implemented IR format version is `2`.
+   canonical Runa Query IR bytes. The implemented IR format version is `4`.
 4. Server responds with `ROW_DESCRIPTION` (`0x11`), zero or more `ROW_DATA`
    (`0x12`) messages, and `COMMAND_COMPLETE` (`0x13`), or with `SERVER_ERROR`
    (`0x14`). The initial Flow slice's successful completion tag is `EMIT`.

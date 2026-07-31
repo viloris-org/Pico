@@ -79,7 +79,10 @@ fn expectEvidenceRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
     defer gpa.free(recovered);
     try std.testing.expectEqualStrings(payload, recovered);
 
-    var metadata = try conn.executeFlow(arena.allocator(), "from observation_evidence\n| emit { object_id, modality, media_type, payload_length }");
+    var second = try conn.observe("camera_2", .image, "image/png", "2026-07-31T12:01:00+08:00", "integration-camera", "second payload");
+    try second.drain(arena.allocator());
+
+    var metadata = try conn.executeFlow(arena.allocator(), "from observation_evidence\n| emit { object_id, modality, media_type, payload_length }\n| limit 1");
     try std.testing.expect((try metadata.next(arena.allocator())).? == .row_description);
     const metadata_row = (try metadata.next(arena.allocator())).?;
     switch (metadata_row) {
@@ -91,7 +94,22 @@ fn expectEvidenceRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
         },
         else => return error.TestUnexpectedResult,
     }
-    try metadata.drain(arena.allocator());
+    try std.testing.expect((try metadata.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try metadata.next(arena.allocator())) == null);
+
+    // where filters the evidence view by a typed field, then limit bounds rows.
+    var filtered = try conn.executeFlow(arena.allocator(), "from observation_evidence\n| where object_id = 'camera_1'\n| emit { object_id, payload_length }\n| limit 2");
+    try std.testing.expect((try filtered.next(arena.allocator())).? == .row_description);
+    const filtered_row = (try filtered.next(arena.allocator())).?;
+    switch (filtered_row) {
+        .row_data => |data| {
+            try std.testing.expectEqualStrings("camera_1", data.values[0]);
+            try std.testing.expectEqual(payload.len, try std.fmt.parseInt(usize, data.values[1], 10));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try filtered.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try filtered.next(arena.allocator())) == null);
 }
 
 fn connectWhenReady(gpa: std.mem.Allocator, io: Io) !clint.Connection {
@@ -195,12 +213,14 @@ fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io:
     // no projection fields. Direct IR input must obey the same static shape
     // constraints as Runa Flow source.
     const empty_projection_ir = [_]u8{
-        0, 2, // wire IR format version
-        0, 2, // canonical IR format version
+        0, 4, // wire IR format version
+        0, 4, // canonical IR format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
+        0, // where predicate count
         0, 0, // projection field count
+        0, // no limit
     };
     try clint.codec.writeMessage(&writer.interface, .flow_ir, &empty_projection_ir);
     try writer.interface.flush();
@@ -214,6 +234,25 @@ fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io:
     try clint.codec.writeMessage(&writer.interface, .flow_source, &source_payload);
     try writer.interface.flush();
     try expectServerError(allocator, &reader.interface, "RF1001");
+
+    // A where predicate whose literal type does not match the column fails
+    // semantic binding and keeps the Connection usable.
+    const type_mismatch_source = "from observation_evidence\n| where evidence_id = 'nope'\n| emit { evidence_id }";
+    var mismatch_payload: [4 + type_mismatch_source.len]u8 = undefined;
+    std.mem.writeInt(u32, mismatch_payload[0..4], type_mismatch_source.len, .big);
+    @memcpy(mismatch_payload[4..], type_mismatch_source);
+    try clint.codec.writeMessage(&writer.interface, .flow_source, &mismatch_payload);
+    try writer.interface.flush();
+    try expectServerError(allocator, &reader.interface, "RF1002");
+
+    // An unknown where column also fails semantic binding.
+    const unknown_column_source = "from observation_evidence\n| where missing = 1\n| emit { evidence_id }";
+    var unknown_payload: [4 + unknown_column_source.len]u8 = undefined;
+    std.mem.writeInt(u32, unknown_payload[0..4], unknown_column_source.len, .big);
+    @memcpy(unknown_payload[4..], unknown_column_source);
+    try clint.codec.writeMessage(&writer.interface, .flow_source, &unknown_payload);
+    try writer.interface.flush();
+    try expectServerError(allocator, &reader.interface, "RF1002");
 
     // SQL text has no compatibility or translation path in the v2 endpoint.
     const sql_text = "SELECT 1";

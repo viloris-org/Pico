@@ -8,6 +8,7 @@ pub const wal = @import("storage/wal.zig");
 pub const table = @import("storage/table.zig");
 pub const checkpoint = @import("storage/checkpoint.zig");
 pub const evidence = @import("storage/evidence.zig");
+pub const vector = @import("vector.zig");
 pub const engine = @import("storage/engine.zig");
 pub const flow = struct {
     pub const ast = @import("flow/ast.zig");
@@ -15,6 +16,7 @@ pub const flow = struct {
     pub const exec = @import("flow/exec.zig");
 };
 pub const server = @import("net/server.zig");
+pub const mcp = @import("net/mcp.zig");
 
 test {
     _ = util;
@@ -25,9 +27,11 @@ test {
     _ = table;
     _ = checkpoint;
     _ = evidence;
+    _ = vector;
     _ = engine;
     _ = flow.ast;
     _ = flow.ir;
     _ = flow.exec;
     _ = server;
+    _ = mcp;
 }

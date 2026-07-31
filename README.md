@@ -11,10 +11,11 @@ service. It is one of two independently released RunaDB products; RunaDB Client
 provides the CLI, drivers, and developer tools.
 
 Runa Flow is RunaDB's native public request language. The implemented Wire
-Protocol v2.0 development slice accepts `from <relation> | emit { <field> }`
-as source or canonical Runa Query IR. It also supports immutable Observation
-Evidence ingestion, metadata inspection, and bounded payload retrieval through
-the official RunaDB Client. SQL text is not an accepted protocol request.
+Protocol v2.0 development slice accepts `from <relation> | where <predicate>
+| emit { <field> }` as source or canonical Runa Query IR. It also supports
+immutable Observation Evidence ingestion, metadata inspection, and bounded
+payload retrieval through the official RunaDB Client. SQL text is not an
+accepted protocol request.
 
 RunaDB Server and RunaDB Client communicate only through versioned protocol
 definitions and the public error model. See [product boundaries](docs/products.md)
@@ -25,9 +26,10 @@ and [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 RunaDB Server is under active development. The current implementation provides:
 
 - A native RunaDB Wire Protocol TCP listener and RunaDB Client CLI
+- An opt-in MCP stdio adapter for Agent use with the read-only Runa Flow slice
 - Single-instance operation with a local data directory
 - The read-only Runa Flow relation projection slice
-- Canonical Runa Query IR format version `2`
+- Canonical Runa Query IR format version `4`
 - Immutable Observation Evidence payload storage and verified recovery
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
@@ -82,12 +84,34 @@ Available options:
 | `--runa-port <port>` | `5434` | RunaDB Wire Protocol TCP port (`0` disables it) |
 | `--data-dir <path>` | `./data` | Instance data directory |
 | `--no-sync` | disabled | Disable WAL synchronization; development only |
+| `--mcp-stdio` | disabled | Serve MCP `2025-11-25` JSON-RPC over stdin/stdout; only the read-only `runadb_flow_emit` tool is available |
+
+## MCP
+
+RunaDB Server has an opt-in native MCP stdio adapter for local Agent use. Run
+it as a subprocess with its standard input and output connected to the MCP
+client:
+
+```bash
+zig build run -- --mcp-stdio --data-dir ./data
+```
+
+The adapter implements MCP `2025-11-25` lifecycle and tools. Its sole tool,
+`runadb_flow_emit`, accepts a `source` string using the implemented read-only
+Runa Flow grammar and returns bounded structured rows. Standard output contains
+only MCP JSON-RPC messages. Streamable HTTP, remote access, authorization, and
+PEM validation are not implemented in the current release; do not expose the
+stdio process as a network service. Remote MCP and Agent-initiated mutation are
+planned only after their authentication, PEM validation, authorization mapping,
+and audit contracts are implemented.
 
 The implemented Runa Flow source shape is:
 
 ```runa-flow
 from users
+| where id > 10
 | emit { id, email }
+| limit 100
 ```
 
 ## Durability and recovery

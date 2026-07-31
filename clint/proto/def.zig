@@ -4,7 +4,7 @@
 
 pub const PROTOCOL_VERSION_MAJOR: u16 = 2;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
-pub const IR_FORMAT_VERSION: u16 = 2;
+pub const IR_FORMAT_VERSION: u16 = 4;
 
 /// Message type identifiers.
 pub const Type = enum(u8) {

@@ -24,6 +24,8 @@ pub fn main(init: std.process.Init) !void {
             cfg.host = raw_args[i];
         } else if (std.mem.eql(u8, a, "--no-sync")) {
             cfg.sync_wal = false;
+        } else if (std.mem.eql(u8, a, "--mcp-stdio")) {
+            cfg.mcp_stdio = true;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             try printUsage();
             return;
@@ -48,6 +50,7 @@ fn printUsage() !void {
         \\  --runa-port <port>  RunaDB Wire Protocol port (default 5434, 0=disable)
         \\  --data-dir <path>   Data directory (default ./data)
         \\  --no-sync           Disable WAL fsync (dev only)
+        \\  --mcp-stdio         Serve MCP JSON-RPC over stdin/stdout (read-only)
         \\  -h, --help          Show help
         \\
     , .{});

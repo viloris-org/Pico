@@ -22,4 +22,12 @@ This repository co-locates RunaDB Server and RunaDB Client under `src/` and
 removed PostgreSQL adapter and SQL endpoint are not supported compatibility
 surfaces.
 
+RunaDB Server also has an opt-in local MCP stdio adapter for Agent use. It is
+owned by the Server and compiles its bounded read-only tool input through Runa
+Flow; it is not a RunaDB Client component and does not give either product a
+data-directory or in-process dependency on the other. The adapter is not yet a
+remote protocol surface: Streamable HTTP, authentication, authorization, and
+PEM validation are planned prerequisites for remote MCP or Agent-initiated
+modification and remain unsupported in the current release.
+
 See [ADR-0010](adr/0010-client-server-product-boundary.md) for the complete decision.

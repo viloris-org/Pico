@@ -6,12 +6,14 @@ const wal_mod = @import("wal.zig");
 const table_mod = @import("table.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const evidence_mod = @import("evidence.zig");
+const vector_mod = @import("../vector.zig");
 
 pub const EngineError = table_mod.Error;
 pub const Row = table_mod.Row;
 pub const Table = table_mod.Table;
 pub const Pred = table_mod.Pred;
 pub const ColumnSpec = table_mod.ColumnSpec;
+pub const VectorSearchError = error{VectorColumnRequired} || vector_mod.Error || Allocator.Error;
 
 pub const EvidenceStats = struct {
     committed_count: u64 = 0,
@@ -274,6 +276,31 @@ pub const Engine = struct {
         defer self.writer_mutex.unlock(self.io);
         if (self.tables.contains(name)) return;
         try self.createTableLocked(name, columns);
+    }
+
+    /// Rank non-null embeddings in one table column. The caller owns the query
+    /// embedding and must free the returned candidate slice.
+    pub fn searchVectors(
+        self: *Engine,
+        table_name: []const u8,
+        column_name: []const u8,
+        query: vector_mod.Embedding,
+        metric: vector_mod.Metric,
+        limit: usize,
+    ) (VectorSearchError || table_mod.Error)![]vector_mod.Candidate {
+        const table = self.getTable(table_name) orelse return error.TableNotFound;
+        const column_index = table.columnIndex(column_name) orelse return error.ColumnNotFound;
+        if (table.columns[column_index].type_tag != .vector) return error.VectorColumnRequired;
+
+        var entries: std.ArrayList(vector_mod.Entry) = .empty;
+        defer entries.deinit(self.gpa);
+        try entries.ensureTotalCapacity(self.gpa, table.rows.items.len);
+        for (table.rows.items, 0..) |row, row_index| switch (row.values[column_index]) {
+            .null => {},
+            .vector => |embedding| entries.appendAssumeCapacity(.{ .row_index = row_index, .embedding = embedding }),
+            else => unreachable,
+        };
+        return vector_mod.topK(self.gpa, entries.items, query, metric, limit);
     }
 
     pub fn addColumn(self: *Engine, table_name: []const u8, column: value.Column, if_not_exists: bool) !void {
@@ -926,4 +953,45 @@ test "recovery rejects a corrupt committed evidence payload" {
         try file.sync(io);
     }
     try std.testing.expectError(error.CorruptPayload, Engine.open(gpa, io, dir_name, true));
+}
+
+test "vector columns survive checkpoint and restart, and rank deterministically" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-vector-recovery";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var columns = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+            .{ .name = try gpa.dupe(u8, "embedding"), .type_tag = .vector, .not_null = true },
+        };
+        defer for (&columns) |*column| column.deinit(gpa);
+        try eng.createTable("document", &columns);
+
+        var first: value.Value = .{ .vector = try gpa.dupe(f32, &.{ 1, 0 }) };
+        defer first.deinit(gpa);
+        var second: value.Value = .{ .vector = try gpa.dupe(f32, &.{ 0, 1 }) };
+        defer second.deinit(gpa);
+        try eng.insert("document", &.{ .{ .int = 10 }, first });
+        try eng.insert("document", &.{ .{ .int = 20 }, second });
+
+        const ranked = try eng.searchVectors("document", "embedding", &.{ 0, 1 }, .cosine, 1);
+        defer gpa.free(ranked);
+        try std.testing.expectEqual(@as(usize, 1), ranked.len);
+        try std.testing.expectEqual(@as(usize, 1), ranked[0].row_index);
+        _ = try eng.checkpoint();
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        const ranked = try eng.searchVectors("document", "embedding", &.{ 0, 1 }, .cosine, 2);
+        defer gpa.free(ranked);
+        try std.testing.expectEqual(@as(usize, 2), ranked.len);
+        try std.testing.expectEqual(@as(usize, 1), ranked[0].row_index);
+        try std.testing.expectEqual(@as(usize, 0), ranked[1].row_index);
+    }
 }

@@ -20,18 +20,44 @@ scope only for its following stages. The implemented read-only grammar is:
 
 ```text
 from <relation>
+| where <predicate>   (zero or more, AND-combined)
 | emit { <field> [, <field> ...] }
+| limit <non-negative integer>
 ```
+
+A `where` stage filters rows before projection and `limit`; several `where`
+stages are combined with AND. Each predicate names a column and one operator:
+
+```text
+column = literal | column != literal
+column < literal | column <= literal | column > literal | column >= literal
+column is null | column is not null
+column [not] in ( literal [, literal ...] )
+column [not] like 'pattern'
+```
+
+Literals are non-negative or negative integers, `true` or `false`, or a
+single-quoted text value. The literal type must match the column's declared
+type: ordering operators require an orderable column, `like` requires text, and
+every member of an `in` list shares the same type. A mismatch is a static
+binding failure, never a silent no-match.
 
 `observation_evidence` is an implemented read-only World Continuum view with
 these fields: `evidence_id`, `object_id`, `modality`, `media_type`,
 `observed_at`, `origin`, `owner`, `payload_length`, and `payload_digest`.
-Reading metadata does not load payload bytes.
+Reading metadata does not load payload bytes. The view supports `where` on its
+typed fields, including `evidence_id` and `payload_length` as integers.
 
 ```runa-flow
 from observation_evidence
-| emit { evidence_id, object_id, modality, media_type, payload_length }
+| where object_id = 'camera_1'
+| emit { evidence_id, modality, media_type, payload_length }
 ```
+
+`limit` is an optional final stage for relation projections, including the
+`observation_evidence` view. It bounds the number of returned rows; `limit 0`
+returns an empty result. Ordering is the relation's current read order because
+no ordering stage is implemented yet.
 
 Other stages shown below are illustrative until their grammar and semantics are
 published.
@@ -74,9 +100,11 @@ type. A stage requiring a present value must refine it or supply an explicit
 fallback. Units, time domains, vector dimensions, and multimodal value kinds
 participate in validation where applicable.
 
-Static checking rejects invalid combinations before execution. Runtime checks
-remain for data-dependent constraints, model results, and bounded-resource
-conditions.
+Static checking rejects invalid combinations before execution. In the initial
+slice, `where` literals are checked against the bound column type, ordering
+operators require an orderable column, and `like` requires a text column.
+Runtime checks remain for data-dependent constraints, model results, and
+bounded-resource conditions.
 
 ## Runa Query IR
 
@@ -88,8 +116,9 @@ contain source formatting or natural-language text.
 
 The official Zig RunaDB Client sends source or validated IR and implements
 bounded Observation Evidence upload and payload retrieval. Canonical IR format
-2 uses an explicit operation tag for relation `emit`, `observe`, and
-`read_evidence_payload`; an older IR version is rejected rather than
+4 uses an explicit operation tag for relation `emit`, `observe`, and
+`read_evidence_payload`; relation `emit` carries optional `where` predicates
+and the optional `limit` stage. An older IR version is rejected rather than
 reinterpreted.
 
 `observe` binds a completed protocol attachment to an `object_id`, declared
@@ -130,13 +159,18 @@ development-only binding from relation names to the existing table catalog. It
 has no persisted semantic-model layout and must not be treated as a stable
 World Continuum binding. An unknown relation or field fails explicitly.
 Direct Runa Query IR input is also checked for the initial canonical shape: a
-source-valid identifier is required for the relation and every emitted field,
-and `emit` must contain at least one field. Malformed IR receives the Wire
-Protocol's `RF1003` rejection; it is never normalized into a different request.
+source-valid identifier is required for the relation, every `where` column, and
+every emitted field; `emit` must contain at least one field; `in` lists must be
+non-empty and homogeneous; and a `like` pattern must be text. Malformed IR
+receives the Wire Protocol's `RF1003` rejection; it is never normalized into a
+different request.
 
 Observation Evidence payload files and WAL metadata use explicit development
 format versions. Recovery validates every committed payload reference, length,
 envelope checksum, and BLAKE3-256 digest. Missing, corrupt, or unsupported
 payloads reject startup. A checkpoint preserves evidence metadata and is not a
-user backup. Payload deletion, retention, encryption, deduplication, embedding,
-similarity search, and model inference are not supported.
+user backup. Payload deletion, retention, encryption, deduplication, embedding
+generation, similarity search as a Runa Flow operation, and model inference
+are not supported. The server library accepts externally supplied embeddings in
+internal `vector` table columns and exposes bounded `runadb.vector` ranking;
+neither is available through the wire protocol.

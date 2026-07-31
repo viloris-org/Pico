@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const engine_mod = @import("../storage/engine.zig");
+const mcp = @import("mcp.zig");
 const runadb = @import("runadb.zig");
 
 pub const Config = struct {
@@ -9,12 +10,17 @@ pub const Config = struct {
     runa_port: u16 = 5434,
     data_dir: []const u8 = "data",
     sync_wal: bool = true,
+    mcp_stdio: bool = false,
 };
 
 pub fn run(gpa: Allocator, io: Io, cfg: Config) !void {
     var eng = try engine_mod.Engine.open(gpa, io, cfg.data_dir, cfg.sync_wal);
     defer eng.deinit();
 
+    if (cfg.mcp_stdio) {
+        std.log.info("RunaDB MCP stdio adapter listening", .{});
+        return mcp.runStdio(gpa, io, &eng);
+    }
     if (cfg.runa_port == 0) return error.NoListener;
     std.log.info("RunaDB Wire Protocol v2 listening on {s}:{d}", .{ cfg.host, cfg.runa_port });
     std.log.info("Data directory: {s}", .{cfg.data_dir});

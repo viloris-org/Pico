@@ -35,7 +35,7 @@ Explicit non-goals: multi-instance replication, sharding, failover, PostgreSQL c
 
 ## RunaDB's Operating Story
 
-An operator starts one **instance** against one **data directory**. A **connection** carries RunaDB Wire Protocol messages containing Runa Flow source or canonical Runa Query IR; it never receives a storage-file handle or relies on a server-internal module. A Request either produces rows from a stable **snapshot** or builds a private transaction write set. Neither path changes shared state by itself.
+An operator starts one **instance** against one **data directory**. A **connection** carries RunaDB Wire Protocol messages containing Runa Flow source or canonical Runa Query IR; it never receives a storage-file handle or relies on a server-internal module. The opt-in MCP stdio adapter is a local process interface, not a Connection: it maps its bounded read-only tool to the same Runa Flow boundary and has no storage-file access. A Request either produces rows from a stable **snapshot** or builds a private transaction write set. Neither path changes shared state by itself.
 
 At commit, the single writer gives accepted work one observable order. It validates the write set against that order, records the complete logical change in the WAL, reaches the selected **durability level**, publishes catalog/table/index visibility, advances the commit watermark, and only then confirms success. This order is RunaDB's answer to two different failures: a crash cannot leave a confirmed logical change without recovery evidence, and a reader cannot see part of a published transaction.
 

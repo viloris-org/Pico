@@ -178,9 +178,13 @@ pub const Table = struct {
                     if (col.not_null and !col.serial) return error.NotNullViolation;
                 },
                 .int => if (col.type_tag != .int) return error.TypeMismatch,
-                .text => if (col.type_tag != .text) return error.TypeMismatch,
-                .bool => if (col.type_tag != .bool) return error.TypeMismatch,
-            }
+            .text => if (col.type_tag != .text) return error.TypeMismatch,
+            .bool => if (col.type_tag != .bool) return error.TypeMismatch,
+            .vector => |items| {
+                if (col.type_tag != .vector) return error.TypeMismatch;
+                value.validateVector(items) catch return error.TypeMismatch;
+            },
+        }
         }
     }
 
@@ -439,7 +443,7 @@ pub const Table = struct {
         }
 
         for (self.rows.items, 0..) |row, idx| {
-            if (rowMatches(row, preds)) {
+            if (valuesMatch(row.values, preds)) {
                 try out.append(gpa, idx);
             }
         }
@@ -486,14 +490,16 @@ pub const Pred = union(enum) {
     };
 };
 
-fn rowMatches(row: Row, preds: []const Pred) bool {
+/// Match a borrowed value slice against AND-combined predicates. Shared by row
+/// and view matching so evidence filtering uses the same semantics.
+pub fn valuesMatch(values: []const value.Value, preds: []const Pred) bool {
     for (preds) |p| {
         switch (p) {
             .eq => |e| {
-                if (!value.Value.eql(row.values[e.col_index], e.value)) return false;
+                if (!value.Value.eql(values[e.col_index], e.value)) return false;
             },
             .is_null => |n| {
-                const is_null = row.values[n.col_index] == .null;
+                const is_null = values[n.col_index] == .null;
                 if (n.negated) {
                     if (is_null) return false;
                 } else {
@@ -501,7 +507,7 @@ fn rowMatches(row: Row, preds: []const Pred) bool {
                 }
             },
             .cmp => |c| {
-                const ord = value.Value.order(row.values[c.col_index], c.value) orelse return false;
+                const ord = value.Value.order(values[c.col_index], c.value) orelse return false;
                 const pass = switch (c.op) {
                     .neq => ord != .eq,
                     .lt => ord == .lt,
@@ -512,15 +518,15 @@ fn rowMatches(row: Row, preds: []const Pred) bool {
                 if (!pass) return false;
             },
             .in_list => |list| {
-                if (!value.matchesIn(row.values[list.col_index], list.values, list.negated)) return false;
+                if (!value.matchesIn(values[list.col_index], list.values, list.negated)) return false;
             },
             .like => |like| {
-                if (!value.matchesLike(row.values[like.col_index], like.pattern, like.negated)) return false;
+                if (!value.matchesLike(values[like.col_index], like.pattern, like.negated)) return false;
             },
             .or_group => |o| {
                 var any_match = false;
                 for (o.groups) |group| {
-                    if (rowMatches(row, group)) {
+                    if (valuesMatch(values, group)) {
                         any_match = true;
                         break;
                     }

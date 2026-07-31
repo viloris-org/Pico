@@ -1,11 +1,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const vector = @import("../vector.zig");
 
 /// Scalar type tags used by the current table storage representation.
 pub const TypeTag = enum(u8) {
     int = 1,
     text = 2,
     bool = 3,
+    vector = 4,
 };
 
 /// Default expression stored on a column definition.
@@ -39,10 +41,12 @@ pub const Value = union(enum) {
     int: i64,
     text: []u8,
     bool: bool,
+    vector: []f32,
 
     pub fn deinit(self: *Value, gpa: Allocator) void {
         switch (self.*) {
             .text => |t| gpa.free(t),
+            .vector => |v| gpa.free(v),
             else => {},
         }
         self.* = .null;
@@ -54,6 +58,7 @@ pub const Value = union(enum) {
             .int => |i| .{ .int = i },
             .bool => |b| .{ .bool = b },
             .text => |t| .{ .text = try gpa.dupe(u8, t) },
+            .vector => |v| .{ .vector = try gpa.dupe(f32, v) },
         };
     }
 
@@ -70,6 +75,10 @@ pub const Value = union(enum) {
             },
             .text => |at| switch (b) {
                 .text => |bt| std.mem.eql(u8, at, bt),
+                else => false,
+            },
+            .vector => |av| switch (b) {
+                .vector => |bv| std.mem.eql(f32, av, bv),
                 else => false,
             },
         };
@@ -92,6 +101,7 @@ pub const Value = union(enum) {
                 .text => |bt| std.mem.order(u8, at, bt),
                 else => null,
             },
+            .vector => null,
         };
     }
 
@@ -106,9 +116,14 @@ pub const Value = union(enum) {
                 @memcpy(buf[0..t.len], t);
                 break :blk buf[0..t.len];
             },
+            .vector => return error.NoSpaceLeft,
         };
     }
 };
+
+pub fn validateVector(items: []const f32) vector.Error!void {
+    try vector.validate(items);
+}
 
 /// Set matching retains values only for a true result. Null operands do not
 /// match, including for negated membership and pattern checks.
