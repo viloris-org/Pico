@@ -107,6 +107,13 @@ pub const QueryResult = struct {
     allocator: Allocator,
     reader: *Io.Reader,
     done: bool,
+    state: State = .initial,
+    column_count: ?u16 = null,
+
+    const State = enum {
+        initial,
+        rows,
+    };
 
     /// Read the next message from the query response stream.
     /// Returns null when COMMAND_COMPLETE or GOODBYE is received.
@@ -114,12 +121,39 @@ pub const QueryResult = struct {
         if (self.done) return null;
 
         const msg = try codec.readMessage(arena, self.reader);
-        switch (msg) {
-            .command_complete, .server_error, .goodbye => {
-                self.done = true;
-                return msg;
+        switch (self.state) {
+            .initial => switch (msg) {
+                .row_description => {
+                    self.state = .rows;
+                    self.column_count = msg.row_description.column_count;
+                    return msg;
+                },
+                .command_complete, .server_error, .goodbye => {
+                    self.done = true;
+                    return msg;
+                },
+                else => {
+                    self.done = true;
+                    return error.Protocol;
+                },
             },
-            else => return msg,
+            .rows => switch (msg) {
+                .row_data => {
+                    if (msg.row_data.values.len != @as(usize, self.column_count.?)) {
+                        self.done = true;
+                        return error.Protocol;
+                    }
+                    return msg;
+                },
+                .command_complete, .goodbye => {
+                    self.done = true;
+                    return msg;
+                },
+                else => {
+                    self.done = true;
+                    return error.Protocol;
+                },
+            },
         }
     }
 
@@ -128,3 +162,78 @@ pub const QueryResult = struct {
         while (try self.next(arena)) |_| {}
     }
 };
+
+test "query result rejects a response before its row description" {
+    const bytes = [_]u8{
+        0, 0, 0, 3, @intFromEnum(proto.Type.row_data), 0, 0,
+    };
+    var reader: Io.Reader = .fixed(&bytes);
+    var result = QueryResult{
+        .allocator = std.testing.allocator,
+        .reader = &reader,
+        .done = false,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(error.Protocol, result.next(arena.allocator()));
+    try std.testing.expect((try result.next(arena.allocator())) == null);
+}
+
+test "query result rejects a handshake response after a query" {
+    const bytes = [_]u8{
+        0, 0, 0, 5, @intFromEnum(proto.Type.hello_ok), 0, 0, 0, 0,
+    };
+    var reader: Io.Reader = .fixed(&bytes);
+    var result = QueryResult{
+        .allocator = std.testing.allocator,
+        .reader = &reader,
+        .done = false,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expectError(error.Protocol, result.next(arena.allocator()));
+    try std.testing.expect((try result.next(arena.allocator())) == null);
+}
+
+test "query result accepts rows followed by command completion" {
+    const bytes = [_]u8{
+        0,                                         0, 0, 7, @intFromEnum(proto.Type.row_description), 0, 1, 0, 0, 0, 1, 'x',
+        0,                                         0, 0, 4, @intFromEnum(proto.Type.row_data),        0, 1, 1, 0, 0, 0, 13,
+        @intFromEnum(proto.Type.command_complete), 0, 0, 0, 0,                                        0, 0, 0, 1, 0, 0, 0,
+        0,
+    };
+    var reader: Io.Reader = .fixed(&bytes);
+    var result = QueryResult{
+        .allocator = std.testing.allocator,
+        .reader = &reader,
+        .done = false,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expect((try result.next(arena.allocator())).? == .row_description);
+    try std.testing.expect((try result.next(arena.allocator())).? == .row_data);
+    try std.testing.expect((try result.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try result.next(arena.allocator())) == null);
+}
+
+test "query result rejects a row with a different column count" {
+    const bytes = [_]u8{
+        0, 0, 0, 7, @intFromEnum(proto.Type.row_description), 0, 1, 0, 0, 0, 1, 'x',
+        0, 0, 0, 3, @intFromEnum(proto.Type.row_data),        0, 0,
+    };
+    var reader: Io.Reader = .fixed(&bytes);
+    var result = QueryResult{
+        .allocator = std.testing.allocator,
+        .reader = &reader,
+        .done = false,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    try std.testing.expect((try result.next(arena.allocator())).? == .row_description);
+    try std.testing.expectError(error.Protocol, result.next(arena.allocator()));
+    try std.testing.expect((try result.next(arena.allocator())) == null);
+}

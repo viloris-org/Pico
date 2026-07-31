@@ -54,7 +54,10 @@ statement.
 3. An accepted client sends one `QUERY` (`0x10`) containing exactly one
    length-prefixed legacy RunaDB SQL statement. The server replies with either:
    `COMMAND_COMPLETE` (`0x13`), or `ROW_DESCRIPTION` (`0x11`), zero or more
-   `ROW_DATA` (`0x12`) messages, then `COMMAND_COMPLETE`.
+   `ROW_DATA` (`0x12`) messages with the described column count, then
+   `COMMAND_COMPLETE`. RunaDB Client rejects a response that violates this
+   sequence or column-count invariant as a protocol error and ends that result
+   stream.
 4. Either peer can send `GOODBYE` (`0xff`). A client may send an empty body;
    the server replies with its length-prefixed reason and closes the Connection.
 

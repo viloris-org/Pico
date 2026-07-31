@@ -11,3 +11,5 @@ data/
 .claude/
 .kiro/
 .reasonix/
+.ralph/
+.ralphrc
