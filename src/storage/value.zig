@@ -1,18 +1,17 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Column scalar type tags for the SQL subset.
-/// PG aliases (BIGINT, VARCHAR, TIMESTAMPTZ, JSONB, DECIMAL, …) map into these.
+/// Scalar type tags used by the current table storage representation.
 pub const TypeTag = enum(u8) {
     int = 1,
     text = 2,
     bool = 3,
 };
 
-/// DEFAULT expression stored on a column definition.
+/// Default expression stored on a column definition.
 pub const DefaultExpr = union(enum) {
     none,
-    /// Evaluate to current UTC timestamp text at INSERT time.
+    /// Evaluate to current UTC timestamp text when a value is created.
     now,
     /// Owned literal applied when the column is omitted or NULL-defaulted.
     literal: Value,
@@ -96,7 +95,7 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Format for DataRow text protocol.
+    /// Format for the Wire Protocol's row-data text representation.
     pub fn formatText(self: Value, buf: []u8) error{NoSpaceLeft}![]const u8 {
         return switch (self) {
             .null => error.NoSpaceLeft, // caller should send NULL (-1)
@@ -111,8 +110,8 @@ pub const Value = union(enum) {
     }
 };
 
-/// WHERE predicates only retain rows for a true result. NULL operands therefore
-/// do not match, including for NOT IN and NOT LIKE.
+/// Set matching retains values only for a true result. Null operands do not
+/// match, including for negated membership and pattern checks.
 pub fn matchesIn(candidate: Value, values: []const Value, negated: bool) bool {
     if (candidate == .null) return false;
     var has_null = false;
@@ -137,8 +136,8 @@ pub fn matchesLike(candidate: Value, pattern: Value, negated: bool) bool {
     return if (negated) !matched and candidate != .null else matched;
 }
 
-/// Match SQL LIKE's percent and underscore wildcards. A backslash escapes the
-/// following pattern byte; text values are compared as their stored UTF-8 bytes.
+/// Match percent and underscore wildcards. A backslash escapes the following
+/// pattern byte; text values are compared as their stored UTF-8 bytes.
 fn likeMatches(text: []const u8, pattern: []const u8) bool {
     var ti: usize = 0;
     var pi: usize = 0;

@@ -18,8 +18,8 @@ capabilities. Compatibility is verified by the `RunaDB Client version x RunaDB S
 contract tests; it does not depend on matching version numbers or a shared codebase.
 
 This repository co-locates RunaDB Server and RunaDB Client under `src/` and
-`clint/` respectively. The current `psql` connection is used solely to validate
-the temporary PostgreSQL adapter and is not a commitment to support PostgreSQL
-clients.
+`clint/` respectively. They communicate through RunaDB Wire Protocol v2; the
+removed PostgreSQL adapter and SQL endpoint are not supported compatibility
+surfaces.
 
 See [ADR-0010](adr/0010-client-server-product-boundary.md) for the complete decision.

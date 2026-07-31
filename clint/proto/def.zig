@@ -1,10 +1,10 @@
 //! RunaDB Wire Protocol — shared message type definitions.
 //! Used by both RunaDB Server (src/net/runadb.zig) and RunaDB Client (clint/).
-//! Version: v1.0 (development contract; incompatible with the retired v0.1 SQL endpoint).
+//! Version: v2.0 (development contract; incompatible with the retired SQL endpoint).
 
-pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
+pub const PROTOCOL_VERSION_MAJOR: u16 = 2;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
-pub const IR_FORMAT_VERSION: u16 = 1;
+pub const IR_FORMAT_VERSION: u16 = 2;
 
 /// Message type identifiers.
 pub const Type = enum(u8) {
@@ -28,6 +28,17 @@ pub const Type = enum(u8) {
     /// Server → Client: statement failed.
     server_error = 0x14,
 
+    /// Client -> Server attachment staging for an `observe` IR request.
+    attachment_begin = 0x20,
+    attachment_chunk = 0x21,
+    attachment_finish = 0x22,
+    attachment_abort = 0x23,
+
+    /// Server -> Client bounded payload stream for `read_evidence_payload`.
+    payload_begin = 0x28,
+    payload_chunk = 0x29,
+    payload_finish = 0x2A,
+
     /// Either side: clean close.
     goodbye = 0xFF,
 
@@ -44,29 +55,24 @@ pub const Hello = packed struct {
 
 /// Payload of hello_ok (server → client).
 /// Followed by a length-prefixed server version string.
-
 /// Payload of hello_error (server → client).
 /// Followed by a length-prefixed reason string.
-
 /// Payload of flow_source (client → server).
 /// Followed by a length-prefixed Runa Flow source string.
 ///
 /// Payload of flow_ir (client → server).
 /// `u16` big-endian IR format version followed by canonical IR bytes.
-
 /// Payload of row_description (server → client).
 pub const RowDescription = packed struct {
     column_count: u16,
 };
 /// For each column, a length-prefixed name string follows.
-
 /// Payload of row_data (server → client).
 pub const RowData = packed struct {
     column_count: u16,
 };
 /// For each column, a null flag (u8, 0=not null, 1=null) followed by a
 /// length-prefixed text value (omitted if null).
-
 /// Payload of command_complete (server → client).
 /// Followed by a length-prefixed tag string (e.g. "INSERT 0 1", "SELECT 3").
 pub const CommandComplete = packed struct {
@@ -92,3 +98,16 @@ pub const HEADER_SIZE: usize = 5;
 
 /// String on the wire: u32 (big-endian length) + UTF-8 bytes.
 pub const MAX_STRING_LENGTH: usize = 64 * 1024;
+
+pub const MAX_ATTACHMENT_LENGTH: usize = 8 * 1024 * 1024;
+pub const MAX_ATTACHMENT_CHUNK_LENGTH: usize = 256 * 1024;
+pub const PAYLOAD_DIGEST_LENGTH: usize = 32;
+
+pub const Modality = enum(u8) {
+    text = 1,
+    image = 2,
+    audio = 3,
+    video = 4,
+    sensor = 5,
+    other = 6,
+};

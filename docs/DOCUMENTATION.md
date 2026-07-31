@@ -13,8 +13,8 @@ does not prescribe RunaDB's technical content.
 - Accepted product and architecture decisions live in `docs/adr/`. Do not
   reverse an ADR in prose alone; add a new ADR.
 - Link to the document that owns a contract instead of copying it. In
-  particular, RunaDB SQL support belongs in `docs/sql-subset.md`, RunaDB Wire
-  Protocol definitions in `clint/proto/` and `docs/wire-protocol.md`, and
+  particular, Runa Flow and Runa Query IR belong in `docs/runa-flow.md`, RunaDB
+  Wire Protocol definitions in `clint/proto/` and `docs/wire-protocol.md`, and
   architecture invariants in `docs/ARCHITECTURE.md` and its linked pages.
 
 ## Write Facts, Not Intentions
@@ -25,7 +25,7 @@ planned capability as current behavior. A public support claim should identify
 its version, condition, or regression location when practical.
 
 Use RunaDB terminology precisely. In particular, write **RunaDB Server**, **RunaDB
-Client**, **RunaDB Wire Protocol**, **RunaDB SQL**, **Connection**, **durability
+Client**, **RunaDB Wire Protocol**, **Runa Flow**, **Runa Query IR**, **Connection**, **durability
 level**, and **checkpoint** as defined in `CONTEXT.md`. Do not imply
 PostgreSQL compatibility, cluster semantics, or that a checkpoint is a backup.
 
@@ -72,7 +72,7 @@ When behavior changes, update the owning reference, relevant examples, and
 regressions in the same change. Before merging, check that:
 
 - Terms comply with `CONTEXT.md` and accepted ADRs.
-- Commands, limits, protocol values, SQL syntax, and status claims match the
+- Commands, limits, protocol values, Runa Flow syntax, and status claims match the
   implementation or are marked as draft or target design.
 - Errors and safety implications are explicit where relevant.
 - Links and code fences are correct, and the page does not duplicate another

@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const flow = @import("../flow/exec.zig");
 const flow_ir = @import("../flow/ir.zig");
 const engine_mod = @import("../storage/engine.zig");
+const evidence_mod = @import("../storage/evidence.zig");
 const proto = @import("clint_proto");
 
 const ConnError = error{
@@ -19,6 +20,19 @@ const ConnError = error{
     ReadFailed,
     WriteFailed,
 } || Allocator.Error || Io.Cancelable || Io.UnexpectedError;
+
+const Attachment = struct {
+    upload_id: u64,
+    expected_length: u64,
+    expected_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8,
+    bytes: std.ArrayList(u8) = .empty,
+    finished: bool = false,
+
+    fn deinit(self: *Attachment, gpa: Allocator) void {
+        self.bytes.deinit(gpa);
+        self.* = undefined;
+    }
+};
 
 /// Handle one RunaDB protocol connection until terminate or error.
 pub fn handleConnection(
@@ -52,6 +66,9 @@ pub fn handleConnection(
         try sendHelloOk(w);
         try w.flush();
     }
+
+    var attachment: ?Attachment = null;
+    defer if (attachment) |*item| item.deinit(gpa);
 
     // ── Main loop ──
     while (true) {
@@ -111,16 +128,122 @@ pub fn handleConnection(
                     continue;
                 };
                 defer request.deinit(gpa);
-                var result = flow.execute(gpa, eng, &request) catch |err| {
-                    try sendError(w, 2, "RF1002", @errorName(err));
+                switch (request.operation) {
+                    .emit => {
+                        var result = flow.execute(gpa, eng, &request) catch |err| {
+                            try sendError(w, 2, "RF1002", @errorName(err));
+                            try w.flush();
+                            continue;
+                        };
+                        defer result.deinit();
+                        try sendRowDescription(w, result.columns);
+                        for (result.cells) |cell_row| try sendRowData(w, cell_row);
+                        try sendCommandComplete(w, "EMIT", result.cells.len);
+                        try w.flush();
+                    },
+                    .observe => {
+                        const staged = if (attachment) |*item| item else {
+                            try sendError(w, 2, "EV1001", "completed attachment required");
+                            try w.flush();
+                            continue;
+                        };
+                        if (!staged.finished or staged.upload_id != request.observe.?.upload_id) {
+                            try sendError(w, 2, "EV1001", "attachment is incomplete or does not match the request");
+                            try w.flush();
+                            continue;
+                        }
+                        const modality = std.enums.fromInt(evidence_mod.Modality, request.observe.?.modality) orelse {
+                            try sendError(w, 2, "EV1002", "invalid modality");
+                            try w.flush();
+                            continue;
+                        };
+                        const observation = request.observe.?;
+                        const evidence_id = eng.observe(observation.object_id, modality, observation.media_type, observation.observed_at, observation.origin, "development", staged.bytes.items) catch |err| {
+                            try sendError(w, 2, "EV1003", @errorName(err));
+                            try w.flush();
+                            continue;
+                        };
+                        staged.deinit(gpa);
+                        attachment = null;
+                        var id_buf: [32]u8 = undefined;
+                        const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{evidence_id}) catch unreachable;
+                        var columns = [_][]const u8{"evidence_id"};
+                        var cells = [_]?[]const u8{id_text};
+                        try sendRowDescription(w, &columns);
+                        try sendRowData(w, &cells);
+                        try sendCommandComplete(w, "OBSERVE", 1);
+                        try w.flush();
+                    },
+                    .read_evidence_payload => {
+                        const payload_bytes = eng.readEvidencePayload(request.evidence_id) catch |err| {
+                            try sendError(w, 2, "EV1004", @errorName(err));
+                            try w.flush();
+                            continue;
+                        };
+                        defer gpa.free(payload_bytes);
+                        try sendPayload(w, request.evidence_id, payload_bytes);
+                        try sendCommandComplete(w, "READ EVIDENCE PAYLOAD", 1);
+                        try w.flush();
+                    },
+                }
+            },
+            .attachment_begin => {
+                if (payload.len != 8 + 8 + proto.PAYLOAD_DIGEST_LENGTH or attachment != null) {
+                    try sendError(w, 2, "EV1001", "invalid attachment begin");
                     try w.flush();
                     continue;
-                };
-                defer result.deinit();
-                try sendRowDescription(w, result.columns);
-                for (result.cells) |cell_row| try sendRowData(w, cell_row);
-                try sendCommandComplete(w, "EMIT", result.cells.len);
-                try w.flush();
+                }
+                const upload_id = std.mem.readInt(u64, payload[0..8], .big);
+                const expected_length = std.mem.readInt(u64, payload[8..16], .big);
+                if (upload_id == 0 or expected_length > proto.MAX_ATTACHMENT_LENGTH) {
+                    try sendError(w, 2, "EV1001", "attachment limit exceeded");
+                    try w.flush();
+                    continue;
+                }
+                var expected_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
+                @memcpy(&expected_digest, payload[16..]);
+                attachment = .{ .upload_id = upload_id, .expected_length = expected_length, .expected_digest = expected_digest };
+            },
+            .attachment_chunk => {
+                if (attachment == null or payload.len < 8 or payload.len - 8 > proto.MAX_ATTACHMENT_CHUNK_LENGTH) {
+                    try sendError(w, 2, "EV1001", "invalid attachment chunk");
+                    try w.flush();
+                    continue;
+                }
+                const upload_id = std.mem.readInt(u64, payload[0..8], .big);
+                const staged = &attachment.?;
+                if (staged.finished or staged.upload_id != upload_id or staged.bytes.items.len + payload.len - 8 > staged.expected_length) {
+                    try sendError(w, 2, "EV1001", "attachment chunk does not match declared shape");
+                    try w.flush();
+                    continue;
+                }
+                try staged.bytes.appendSlice(gpa, payload[8..]);
+            },
+            .attachment_finish => {
+                if (attachment == null or payload.len != 8) {
+                    try sendError(w, 2, "EV1001", "invalid attachment finish");
+                    try w.flush();
+                    continue;
+                }
+                const upload_id = std.mem.readInt(u64, payload[0..8], .big);
+                const staged = &attachment.?;
+                if (staged.upload_id != upload_id or staged.bytes.items.len != staged.expected_length or !std.mem.eql(u8, &evidence_mod.digest(staged.bytes.items), &staged.expected_digest)) {
+                    staged.deinit(gpa);
+                    attachment = null;
+                    try sendError(w, 2, "EV1001", "attachment length or digest mismatch");
+                    try w.flush();
+                    continue;
+                }
+                staged.finished = true;
+            },
+            .attachment_abort => {
+                if (payload.len != 8 or attachment == null or std.mem.readInt(u64, payload[0..8], .big) != attachment.?.upload_id) {
+                    try sendError(w, 2, "EV1001", "invalid attachment abort");
+                    try w.flush();
+                    continue;
+                }
+                attachment.?.deinit(gpa);
+                attachment = null;
             },
             .goodbye => {
                 if (!validGoodbyePayload(payload)) return error.Protocol;
@@ -238,6 +361,29 @@ fn sendError(w: anytype, severity: u8, code: []const u8, message: []const u8) !v
 fn sendGoodbye(w: anytype, reason: []const u8) !void {
     try sendFrameHeader(w, .goodbye, try stringPayloadLen(reason));
     try sendString(w, reason);
+}
+
+fn sendPayload(w: anytype, evidence_id: u64, payload: []const u8) !void {
+    var begin: [8 + 8 + proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
+    std.mem.writeInt(u64, begin[0..8], evidence_id, .big);
+    std.mem.writeInt(u64, begin[8..16], payload.len, .big);
+    const payload_digest = evidence_mod.digest(payload);
+    @memcpy(begin[16..], &payload_digest);
+    try sendFrame(w, .payload_begin, &begin);
+
+    var offset: usize = 0;
+    while (offset < payload.len) {
+        const length = @min(proto.MAX_ATTACHMENT_CHUNK_LENGTH, payload.len - offset);
+        try sendFrameHeader(w, .payload_chunk, 8 + length);
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, evidence_id, .big);
+        try w.writeAll(&id);
+        try w.writeAll(payload[offset .. offset + length]);
+        offset += length;
+    }
+    var finish: [8]u8 = undefined;
+    std.mem.writeInt(u64, &finish, evidence_id, .big);
+    try sendFrame(w, .payload_finish, &finish);
 }
 
 // ── String wire format helpers ──

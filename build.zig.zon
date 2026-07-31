@@ -3,11 +3,7 @@
     .version = "0.0.1",
     .fingerprint = 0xf6dbed268f8134c3, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .zquic = .{
-            .path = "lib/zquic",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",

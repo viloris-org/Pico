@@ -1,6 +1,6 @@
 # Write Path and WriteBatch
 
-> **Key files:** `src/storage/engine.zig` (single-writer engine facade), `src/storage/wal.zig` (`txn_batch` records), `src/txn/session.zig` (transaction write set), `src/sql/exec/insert.zig`, `src/sql/exec/update.zig`, `src/sql/exec/delete.zig`
+> **Key files:** `src/storage/engine.zig` (transitional single-writer facade) and `src/storage/wal.zig` (`txn_batch` records). Public mutation execution is not currently implemented.
 
 ## Overview
 
@@ -20,7 +20,7 @@ write phases (transaction staging and commit), and the target single-writer batc
 Every DML statement in autocommit follows:
 
 ```
-Client -> SQL parse/execute -> Engine.DML() -> Engine.validate()
+Validated mutation IR -> transaction write set -> Engine.validate()
                                            -> Wal.append{Insert|Update|Delete}()
                                            -> Table.{insert|update|delete}()
                                            -> return result
@@ -43,7 +43,7 @@ All methods follow `validate -> WAL -> apply`:
 
 ```mermaid
 sequenceDiagram
-    participant C as caller (SQL Exec)
+    participant C as caller (Flow execution)
     participant E as Engine
     participant T as in-memory Table
     participant W as WAL
@@ -150,7 +150,7 @@ WAL frame:
 | Operation count | `n_ops` is a 2-byte count. |
 | Object identity | Every operation identifies its table by name; RunaDB has no storage namespace field in the record. |
 | Integrity | One frame-level CRC32 protects the complete payload; keys are not protected independently. |
-| Supported operations | Nested `insert`, `update`, and `delete` operations only. Merge and range-deletion operations are not part of RunaDB SQL. |
+| Supported operations | Internal nested `insert`, `update`, and `delete` records only. No public mutation Request currently emits them. |
 
 ### WriteBatch Atomicity Boundary
 
@@ -232,7 +232,7 @@ The `commit` module will add the queue and batching (see the evolution order in
 
 The boundary between `txn` and the single writer is a complete, immutable commit request. It
 must contain enough logical information for the writer to make one deterministic decision; the
-writer must not revisit the connection, rerun SQL text, or depend on a mutable execution object.
+writer must not revisit the Connection, rerun Request source, or depend on a mutable execution object.
 
 | Field | Owner before queueing | Purpose at the single writer |
 | --- | --- | --- |
@@ -264,7 +264,7 @@ Under sustained write load, RunaDB prioritizes predictable degradation:
 4. Measure hot primary-key, unique-index, and future strict-OCC range conflicts separately from queue or WAL saturation. Retries cannot fix a saturated device, and extra batching cannot fix a single hot logical key.
 5. Return conflict and overload outcomes promptly. RunaDB Client drivers should retry only transactions declared retryable, using capped exponential backoff with jitter and an idempotency strategy for externally visible effects; the server never retries a transaction on the client's behalf.
 
-Hot-key contention is primarily a data-model and workflow problem. Where application semantics allow it, distribute independently accumulated values across multiple rows and aggregate them later, or append independent work records and process their order-sensitive effects separately. These techniques preserve the normal strict path because they reduce overlap in logical write ranges; they are not permission to use stale reads, omit conflict ranges, or silently weaken constraints. Any future atomic-update syntax or server-side aggregation must define its conflict ranges, interaction with reset/constraint operations, WAL representation, and recovery behavior before it is advertised in RunaDB SQL.
+Hot-key contention is primarily a data-model and workflow problem. Where application semantics allow it, distribute independently accumulated values across multiple rows and aggregate them later, or append independent work records and process their order-sensitive effects separately. These techniques preserve the normal strict path because they reduce overlap in logical write ranges; they are not permission to use stale reads, omit conflict ranges, or silently weaken constraints. Any future atomic-update operation or server-side aggregation must define its conflict ranges, interaction with reset/constraint operations, IR form, WAL representation, recovery behavior, and metrics before it is advertised in Runa Flow.
 
 The first implementation should expose queue depth/bytes, admission rejections, queue wait, batch count/bytes, successful commits, conflict outcomes by kind, WAL append and sync latency, write-set size, and compaction backlog. Report these by durability level and at least p50/p95/p99, so a low-latency async workload cannot mask strict-durability tail latency. Any per-connection quota or fairness policy is runtime scheduling, not a change to commit order.
 
@@ -300,7 +300,7 @@ application is a pure data-structure operation, so failure is currently expected
 |------|----------------|------|
 | Single-writer path | `Engine` processes directly in sequence | Bounded commit queue + batching |
 | Group Commit | WAL-layer shared durability among concurrent appenders | Engine commit queue + batched writes + shared `fsync` |
-| WriteBatch | Single-operation DML frames / explicit-transaction `txn_batch` | Write-set planning integrated with the VDBE execution program |
+| WriteBatch | Internal single-operation frames / `txn_batch` | Write-set planning integrated with validated Runa Query IR execution |
 | Commit sequence | None (implicit engine order) | Monotonic `commit_seq` (MVCC foundation) |
 | Two-phase write | Session staging + `Engine.commitTxnOps` | Read-set tracking + serializable validation |
 | Write stall | None | Bounded admission and explicit retryable overload; LSM/compaction pressure feeds back before resource exhaustion |

@@ -7,7 +7,7 @@ modules:
   net:
     paths: ["src/net/**"]
     owner: runadb-core
-    may_depend_on: [runtime, sql, util]
+    may_depend_on: [runtime, flow, util]
     owns_data: [connection_state]
     risk: protocol
   runtime:
@@ -16,11 +16,11 @@ modules:
     may_depend_on: [util]
     owns_data: [io_scheduler_state, completion_queues]
     risk: critical
-  sql:
-    paths: ["src/sql/**"]
+  flow:
+    paths: ["src/flow/**"]
     owner: runadb-core
-    may_depend_on: [txn, catalog, util]
-    owns_data: [parsed_statements, execution_programs]
+    may_depend_on: [txn, catalog, storage, util]
+    owns_data: [parsed_sources, query_ir, execution_state]
     risk: protocol
   txn:
     paths: ["src/txn/**"]
@@ -85,7 +85,7 @@ change_classes:
       - wal_or_manifest_format_change
       - durability_guarantee_change
       - commit_ordering_change
-      - sql_support_matrix_expansion
+      - flow_or_ir_contract_change
 
 validation:
   local:
@@ -104,10 +104,10 @@ validation:
     - vfs_atomic_publish_test
     - pager_page_aligned_io_test
     - pager_static_cache_full_and_pin_test
-  required_before_vdbe_program_execution:
-    - exec_golden_parity_with_ast_interpreter
-    - stepwise_select_backpressure_test
-    - cancel_at_opcode_boundary_test
+  required_before_flow_mutation_execution:
+    - source_ir_execution_parity_test
+    - mutation_recovery_test
+    - official_client_mutation_integration_test
 
 budgets:
   # Calibrate against CI history before making these blocking.

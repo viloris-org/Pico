@@ -3,6 +3,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const bytes = @import("../util/bytes.zig");
 const value = @import("value.zig");
+const evidence = @import("evidence.zig");
 const vfs_mod = @import("vfs.zig");
 
 pub const RecordType = enum(u8) {
@@ -22,6 +23,9 @@ pub const RecordType = enum(u8) {
     /// were deleted, letting a later INSERT reuse a retired identifier.
     /// Requires WAL format version 2.
     set_serial = 10,
+    /// Immutable Observation Evidence metadata. Payload bytes live in the
+    /// versioned payload store and are validated before this record is applied.
+    observe = 11,
 };
 
 /// One DML op inside an explicit-transaction commit batch.
@@ -40,7 +44,7 @@ pub const TxnOp = union(enum) {
 /// different complete frame; only an incomplete tail may be truncated.
 const file_magic = "RUNADB_WAL";
 /// Version written into every new or rewritten WAL file.
-const format_version: u32 = 2;
+const format_version: u32 = 3;
 /// Oldest version this build still replays. Version 1 files contain no
 /// `set_serial` record, so reading them needs no compatibility shim; only a
 /// checkpoint rewrite upgrades a file in place. An older build meeting a
@@ -82,6 +86,7 @@ pub const AddColumnRecord = struct { table: []const u8, column: value.Column };
 pub const DropColumnRecord = struct { table: []const u8, column: []const u8 };
 pub const SetDefaultRecord = struct { table: []const u8, column: []const u8, default_expr: value.DefaultExpr };
 pub const SetNotNullRecord = struct { table: []const u8, column: []const u8, enabled: bool };
+pub const ObserveRecord = evidence.Metadata;
 
 /// Append-only WAL with a versioned file header and checksummed LE frames.
 pub const Wal = struct {
@@ -176,6 +181,13 @@ pub const Wal = struct {
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.gpa);
         try encodeSetSerial(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendObserve(self: *Wal, rec: ObserveRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeObserve(&list, self.gpa, rec);
         try self.appendPayload(list.items);
     }
 
@@ -434,6 +446,13 @@ pub const Wal = struct {
             try self.emitPayload(list.items);
         }
 
+        pub fn emitObserve(self: *Rewrite, rec: ObserveRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeObserve(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
         fn emitPayload(self: *Rewrite, payload: []const u8) !void {
             if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
 
@@ -552,6 +571,20 @@ fn encodeSetSerial(list: *std.ArrayList(u8), gpa: Allocator, rec: SetSerialRecor
     try list.appendSlice(gpa, &b);
 }
 
+fn encodeObserve(list: *std.ArrayList(u8), gpa: Allocator, rec: ObserveRecord) !void {
+    try evidence.validateMetadata(rec);
+    try list.append(gpa, @intFromEnum(RecordType.observe));
+    try writeU64(list, gpa, rec.evidence_id);
+    try writeStr(list, gpa, rec.object_id);
+    try list.append(gpa, @intFromEnum(rec.modality));
+    try writeStr(list, gpa, rec.media_type);
+    try writeStr(list, gpa, rec.observed_at);
+    try writeStr(list, gpa, rec.origin);
+    try writeStr(list, gpa, rec.owner);
+    try writeU64(list, gpa, rec.payload_length);
+    try list.appendSlice(gpa, &rec.payload_digest);
+}
+
 fn frameChecksum(payload_len: u32, payload: []const u8) u32 {
     var len_bytes: [4]u8 = undefined;
     bytes.writeU32LE(&len_bytes, payload_len);
@@ -600,6 +633,7 @@ pub const RecordView = union(RecordType) {
     /// Borrowed from the frame buffer for the duration of `apply` only.
     txn_batch: struct { body: []const u8 },
     set_serial: struct { table: []const u8, next_serial: i64 },
+    observe: evidence.Metadata,
 
     pub const ParsedColumn = struct {
         name: []const u8,
@@ -743,6 +777,36 @@ pub const RecordView = union(RecordType) {
                 if (i != payload.len) return error.InvalidWal;
                 return .{ .view = .{ .set_serial = .{ .table = table, .next_serial = next_serial } }, .owned = owned };
             },
+            .observe => {
+                const evidence_id = try readU64(payload, &i);
+                const object_id = try readStr(payload, &i);
+                if (i >= payload.len) return error.InvalidWal;
+                const modality = std.enums.fromInt(evidence.Modality, payload[i]) orelse return error.InvalidWal;
+                i += 1;
+                const media_type = try readStr(payload, &i);
+                const observed_at = try readStr(payload, &i);
+                const origin = try readStr(payload, &i);
+                const owner = try readStr(payload, &i);
+                const payload_length = try readU64(payload, &i);
+                if (payload.len -| i < evidence.DIGEST_LENGTH) return error.InvalidWal;
+                var payload_digest: [evidence.DIGEST_LENGTH]u8 = undefined;
+                @memcpy(&payload_digest, payload[i..][0..evidence.DIGEST_LENGTH]);
+                i += evidence.DIGEST_LENGTH;
+                if (i != payload.len) return error.InvalidWal;
+                const metadata: evidence.Metadata = .{
+                    .evidence_id = evidence_id,
+                    .object_id = object_id,
+                    .modality = modality,
+                    .media_type = media_type,
+                    .observed_at = observed_at,
+                    .origin = origin,
+                    .owner = owner,
+                    .payload_length = payload_length,
+                    .payload_digest = payload_digest,
+                };
+                try evidence.validateMetadata(metadata);
+                return .{ .view = .{ .observe = metadata }, .owned = owned };
+            },
             .txn_batch => {
                 // Validate shape eagerly; engine expands nested ops during apply.
                 var j: usize = i;
@@ -854,6 +918,12 @@ fn writeU32(list: *std.ArrayList(u8), gpa: Allocator, v: u32) !void {
     try list.appendSlice(gpa, &b);
 }
 
+fn writeU64(list: *std.ArrayList(u8), gpa: Allocator, v: u64) !void {
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u64, &b, v, .little);
+    try list.appendSlice(gpa, &b);
+}
+
 fn encodeTxnOp(list: *std.ArrayList(u8), gpa: Allocator, op: TxnOp) !void {
     switch (op) {
         .insert => |rec| {
@@ -882,6 +952,13 @@ fn readU32(payload: []const u8, i: *usize) !u32 {
     const v = bytes.readU32LE(payload[i.*..][0..4]);
     i.* += 4;
     return v;
+}
+
+fn readU64(payload: []const u8, i: *usize) !u64 {
+    if (i.* + 8 > payload.len) return error.InvalidWal;
+    const value_read = std.mem.readInt(u64, payload[i.*..][0..8], .little);
+    i.* += 8;
+    return value_read;
 }
 
 /// Iterate nested ops inside a `txn_batch` body. `body` excludes the type byte.

@@ -8,7 +8,7 @@ This document makes no platform commitment to `io_uring`, `epoll`, kqueue, IOCP,
 
 ## RunaDB Scheduling Boundary
 
-RunaDB separates platform completion from callback execution so completion handling cannot re-enter SQL, storage, or protocol code while it holds scheduler state. It derives fixed capacity from admitted connections, commit batches, recovery, manifest publication, and shutdown rather than growing queues under load. This is a single-instance service contract: no platform backend, replication queue, or external runtime model is part of the RunaDB product surface.
+RunaDB separates platform completion from callback execution so completion handling cannot re-enter Request execution, storage, or protocol code while it holds scheduler state. It derives fixed capacity from admitted connections, commit batches, recovery, manifest publication, and shutdown rather than growing queues under load. This is a single-instance service contract: no platform backend, replication queue, or external runtime model is part of the RunaDB product surface.
 
 The scheduler's job is to preserve the meaning of RunaDB's other boundaries while work is concurrent. A completed socket write is not permission to reorder a connection's responses. A completed file write is not a commit until the single writer publishes it. A cancelled statement cannot revoke WAL work that has crossed the irreversible point. Separating completion from callbacks makes these decisions occur at owned state transitions rather than incidentally inside a platform event loop.
 
@@ -24,7 +24,7 @@ The scheduler's goals, in order, are:
 4. Platform I/O completions do not run application logic while traversing the kernel queue, avoiding recursively driven call stacks.
 5. Protocol response order within a connection, and commit sequence order in the single writer, do not change under concurrent scheduling.
 
-The scheduler owns no SQL semantics, MVCC visibility, or WAL contents. It owns only I/O submission state, completion queues, budgets, capacity, and timing. Completing a file write is not a successful commit; only `commit` may report success after the WAL reaches its durability boundary and `published_commit_seq` advances.
+The scheduler owns no Runa Flow semantics, MVCC visibility, or WAL contents. It owns only I/O submission state, completion queues, budgets, capacity, and timing. Completing a file write is not a successful commit; only `commit` may report success after the WAL reaches its durability boundary and `published_commit_seq` advances.
 
 ## Work Classes and Capacity
 
@@ -48,7 +48,7 @@ At startup, validate the capacity relationships. Reserve at least one read or cl
 One tick performs only bounded work, in this order:
 
 1. Submit to the platform operations produced by the previous round's callbacks, subject to capacity.
-2. Extract platform completion events in batches, recording only operation results, completion times, and the completion queue; do not call SQL, storage, the network protocol, or user callbacks at this stage.
+2. Extract platform completion events in batches, recording only operation results, completion times, and the completion queue; do not execute Requests, storage, the network protocol, or user callbacks at this stage.
 3. Process the completion queue within callback-count and CPU-time budgets. A callback may change only its own state, release resources, queue follow-up work, or hand the result to its owner; it must not recursively run the scheduler.
 4. Select the next batch by class: replenish `critical` first, then round-robin `foreground_read` and `foreground_write` among admitted connections, and finally run `maintenance` only with the remaining budget.
 5. Submit operations from step 4 and from callbacks, then yield. If ready work remains, the next tick must not wait indefinitely in the kernel; block until the next timer or I/O completion only when no ready work exists.
@@ -95,7 +95,7 @@ Connection closure cancels unsubmitted network I/O and cancellable read-only/mai
 
 ## Observability, Failure, and Acceptance
 
-At minimum emit these metrics, separated by I/O class and durability level: submitted, completed, and callback counts; current and peak queue depth; in-flight slots; buffer bytes; queue age; submit-to-completion latency; completion-to-callback latency; callback CPU time; budget exhaustion count; backpressure transitions; rejected accepts; cancellations; and critical-I/O failures. Connection identifiers, cancellation credentials, SQL text, and row contents must not be metric labels.
+At minimum emit these metrics, separated by I/O class and durability level: submitted, completed, and callback counts; current and peak queue depth; in-flight slots; buffer bytes; queue age; submit-to-completion latency; completion-to-callback latency; callback CPU time; budget exhaustion count; backpressure transitions; rejected accepts; cancellations; and critical-I/O failures. Connection identifiers, cancellation credentials, Request source, and row contents must not be metric labels.
 
 Critical-I/O errors cannot be downgraded to connection errors: if WAL append/sync, recovery reads, or an already-started manifest publication fails, the instance must stop accepting work that would create new persistent state and enter a diagnosable recovery/stop path. Ordinary socket EOF, cancelled read-only work, and cancellable maintenance work follow their owners' local cleanup rules.
 

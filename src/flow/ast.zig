@@ -83,7 +83,10 @@ fn parseEmit(gpa: Allocator, line: []const u8) ParseError![][]u8 {
     return fields.toOwnedSlice(gpa);
 }
 
-fn isIdentifier(name: []const u8) bool {
+/// An identifier is deliberately ASCII-only in the initial development slice.
+/// Keep this shared with IR validation so decoded requests cannot name values
+/// that Runa Flow source could never produce.
+pub fn isIdentifier(name: []const u8) bool {
     if (name.len == 0) return false;
     if (!(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
     for (name[1..]) |byte| {

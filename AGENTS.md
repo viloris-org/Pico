@@ -4,8 +4,9 @@ This repository contains **RunaDB Server** and **RunaDB Client** (CLI, drivers,
 SDKs), both implemented in **Zig**. RunaDB's long-horizon direction is a
 high-performance, unified, verifiable data system; its current implemented
 baseline is a single-node, lightweight, network-accessible OLTP database. The
-two products communicate only through a versioned **RunaDB Wire Protocol** and
-**RunaDB SQL** defined under `clint/proto/`. They are separate products sharing a
+two products communicate only through the versioned **RunaDB Wire Protocol**
+defined under `clint/proto/`; requests use **Runa Flow** or canonical **Runa
+Query IR**. They are separate products sharing a
 repository — see ADR-0011. RunaDB does not promise PostgreSQL compatibility.
 
 ## Source of truth
@@ -28,10 +29,10 @@ that defines its semantics, recovery, observability, compatibility, and tests:
 1. **Single-instance server** today, not embedded-first or a multi-node
    cluster. Distributed work requires a dedicated topology, consistency, and
    failure-model ADR.
-2. **RunaDB wire protocol** and **RunaDB SQL** are the public contracts; no PostgreSQL protocol, SQL, driver, or tool compatibility is promised.
+2. **RunaDB Wire Protocol**, **Runa Flow**, and **Runa Query IR** are the public contracts. SQL execution and PostgreSQL protocol compatibility are not supported.
 3. **RunaDB Client and RunaDB Server are separate products sharing one repo**: client code lives under `clint/`, server code under `src/`. They communicate only through `clint/proto/` protocol definitions. No cross-directory non-protocol references.
-4. **OLTP SQL subset** today; unsupported SQL must fail clearly (no silent
-   wrong results). New models and multimodal values need explicit RunaDB SQL and
+4. The implemented Runa Flow slice is read-only. Unsupported operations must
+   fail clearly; new models and multimodal values need explicit Flow, IR, and
    Wire Protocol contracts.
 5. **LSM-style** primary storage for tables/indexes; keep logical boundary “ordered set + WAL + MVCC”.
 6. **Single-writer commit ordering** + **MVCC** reads; multi-thread OK for net/IO/compaction, not concurrent commit of write sets.
@@ -46,17 +47,17 @@ algorithms or privacy guarantees.
 ## Language & terminology
 
 - Prefer domain terms from `CONTEXT.md` in product/docs discussion when the user does; code identifiers stay English.
-- Say **RunaDB Wire Protocol** or **RunaDB SQL**; do not describe RunaDB as PostgreSQL-compatible.
+- Say **RunaDB Wire Protocol**, **Runa Flow**, or **Runa Query IR**; do not describe RunaDB as SQL- or PostgreSQL-compatible.
 - Use **Connection**, not Session, for client sessions; **contention**, not “lock storm,” as the product concept; **durability level**, not a raw “fsync switch,” in user-facing text.
 - “Safety” in product discussions means crash/durability guarantees, not authentication/cryptography, unless access control is explicitly intended.
 
 ## Implementation norms
 
-- Prefer small modules with clear ownership (protocol, SQL, catalog, txn/MVCC, WAL, LSM, runtime). Avoid overweight files that mix unrelated responsibilities.
+- Prefer small modules with clear ownership (protocol, Flow/IR, catalog, txn/MVCC, WAL, LSM, runtime). Avoid overweight files that mix unrelated responsibilities.
 - Keep public interfaces small; push policy and details inward.
 - Storage/txn code must stay recoverable: crash recovery is correctness, not a nicety.
 - Observability for compaction, write-path latency, durability level, and recovery is first-class—not a later bolt-on.
-- Protocol and SQL tests should include the official RunaDB CLI/driver where practical, not only unit codecs. The current PG adapter has separate, transitional coverage only.
+- Protocol and Flow/IR tests should include the official RunaDB CLI/driver where practical, not only unit codecs.
 
 ## Build & test (when code exists)
 
@@ -71,8 +72,7 @@ Prefer deterministic tests, fault injection, and recovery regressions over “it
 
 - Do not introduce cluster/shard/failover semantics into current storage or
   transaction paths without a focused ADR.
-- Do not expand catalog/types to imitate PostgreSQL without an ADR and
-  support-matrix update.
+- Do not add SQL or PostgreSQL compatibility without a focused ADR.
 - Do not present future multi-model, AI, distributed, post-quantum, privacy,
   or autonomy capabilities as implemented before their contracts and evidence
   exist.

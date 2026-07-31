@@ -5,12 +5,20 @@ const value = @import("value.zig");
 const wal_mod = @import("wal.zig");
 const table_mod = @import("table.zig");
 const checkpoint_mod = @import("checkpoint.zig");
+const evidence_mod = @import("evidence.zig");
 
 pub const EngineError = table_mod.Error;
 pub const Row = table_mod.Row;
 pub const Table = table_mod.Table;
 pub const Pred = table_mod.Pred;
 pub const ColumnSpec = table_mod.ColumnSpec;
+
+pub const EvidenceStats = struct {
+    committed_count: u64 = 0,
+    committed_bytes: u64 = 0,
+    recovery_orphans_found: u64 = 0,
+    recovery_orphan_bytes: u64 = 0,
+};
 
 /// Single-writer storage engine: in-memory tables + WAL.
 /// Phase 0 has no SSTables yet. Table storage lives in `table.zig`;
@@ -19,7 +27,11 @@ pub const Engine = struct {
     gpa: Allocator,
     io: Io,
     wal: wal_mod.Wal,
+    payloads: evidence_mod.Store,
     tables: std.StringHashMap(Table),
+    observations: std.ArrayList(evidence_mod.Record),
+    next_evidence_id: u64 = 1,
+    evidence_stats: EvidenceStats = .{},
     /// Serializes the mutating sequence (validate → WAL append → apply) against
     /// itself and against a checkpoint.
     ///
@@ -35,12 +47,20 @@ pub const Engine = struct {
     writer_mutex: Io.Mutex = .init,
 
     pub fn open(gpa: Allocator, io: Io, data_dir: []const u8, sync_wal: bool) !Engine {
+        var wal = try wal_mod.Wal.open(gpa, io, data_dir, sync_wal);
+        var transferred = false;
+        errdefer if (!transferred) wal.deinit();
+        var payloads = try evidence_mod.Store.open(io, data_dir, sync_wal);
+        errdefer if (!transferred) payloads.deinit();
         var eng: Engine = .{
             .gpa = gpa,
             .io = io,
-            .wal = try wal_mod.Wal.open(gpa, io, data_dir, sync_wal),
+            .wal = wal,
+            .payloads = payloads,
             .tables = std.StringHashMap(Table).init(gpa),
+            .observations = .empty,
         };
+        transferred = true;
         errdefer eng.deinit();
         try eng.recover();
         return eng;
@@ -52,12 +72,21 @@ pub const Engine = struct {
             entry.value_ptr.deinit(self.gpa);
         }
         self.tables.deinit();
+        for (self.observations.items) |*record| record.deinit(self.gpa);
+        self.observations.deinit(self.gpa);
+        self.payloads.deinit();
         self.wal.deinit();
         self.* = undefined;
     }
 
     fn recover(self: *Engine) !void {
         try wal_mod.replayWal(&self.wal, self, applyRecord);
+        var committed = std.AutoHashMap(u64, usize).init(self.gpa);
+        defer committed.deinit();
+        for (self.observations.items, 0..) |record, index| try committed.put(record.evidence_id, index);
+        const reclaimed = try self.payloads.reclaimOrphans(&committed);
+        self.evidence_stats.recovery_orphans_found = reclaimed.count;
+        self.evidence_stats.recovery_orphan_bytes = reclaimed.bytes;
     }
 
     fn applyRecord(self: *Engine, view: wal_mod.RecordView) !void {
@@ -136,6 +165,19 @@ pub const Engine = struct {
             .set_not_null => |set| {
                 const table = self.tables.getPtr(set.table) orelse return error.TableNotFound;
                 try table.setNotNull(set.column, set.enabled);
+            },
+            .observe => |metadata| {
+                if (metadata.evidence_id != self.next_evidence_id) return error.InvalidWal;
+                try self.payloads.validateReference(self.gpa, metadata);
+                const record = try evidence_mod.Record.clone(self.gpa, metadata);
+                errdefer {
+                    var owned = record;
+                    owned.deinit(self.gpa);
+                }
+                try self.observations.append(self.gpa, record);
+                self.next_evidence_id = metadata.evidence_id + 1;
+                self.evidence_stats.committed_count += 1;
+                self.evidence_stats.committed_bytes += metadata.payload_length;
             },
         }
     }
@@ -345,6 +387,56 @@ pub const Engine = struct {
         }
     }
 
+    /// Publish immutable Observation Evidence through payload-file then WAL
+    /// ordering. A failed WAL append leaves a reclaimable orphan file.
+    pub fn observe(self: *Engine, object_id: []const u8, modality: evidence_mod.Modality, media_type: []const u8, observed_at: []const u8, origin: []const u8, owner: []const u8, payload: []const u8) !u64 {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (payload.len > evidence_mod.MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+        const id = self.next_evidence_id;
+        const payload_digest = evidence_mod.digest(payload);
+        const metadata: evidence_mod.Metadata = .{
+            .evidence_id = id,
+            .object_id = object_id,
+            .modality = modality,
+            .media_type = media_type,
+            .observed_at = observed_at,
+            .origin = origin,
+            .owner = owner,
+            .payload_length = payload.len,
+            .payload_digest = payload_digest,
+        };
+        try evidence_mod.validateMetadata(metadata);
+        var record = try evidence_mod.Record.clone(self.gpa, metadata);
+        errdefer record.deinit(self.gpa);
+        try self.observations.ensureUnusedCapacity(self.gpa, 1);
+        const stored_digest = try self.payloads.publish(id, payload);
+        if (!std.mem.eql(u8, &stored_digest, &payload_digest)) return error.CorruptPayload;
+        try self.wal.appendObserve(metadata);
+        self.observations.appendAssumeCapacity(record);
+        self.next_evidence_id = id + 1;
+        self.evidence_stats.committed_count += 1;
+        self.evidence_stats.committed_bytes += payload.len;
+        return id;
+    }
+
+    pub fn readEvidencePayload(self: *Engine, evidence_id: u64) ![]u8 {
+        for (self.observations.items) |record| {
+            if (record.evidence_id == evidence_id) {
+                return self.payloads.read(self.gpa, evidence_id, record.payload_length, record.payload_digest);
+            }
+        }
+        return error.EvidenceNotFound;
+    }
+
+    pub fn observationsView(self: *Engine) []const evidence_mod.Record {
+        return self.observations.items;
+    }
+
+    pub fn evidenceStats(self: *const Engine) EvidenceStats {
+        return self.evidence_stats;
+    }
+
     pub const SelectResult = struct {
         columns: []const value.Column,
         rows: []const Row,
@@ -425,7 +517,7 @@ pub const Engine = struct {
         var it = self.tables.iterator();
         while (it.next()) |entry| refs.appendAssumeCapacity(entry.value_ptr);
 
-        return checkpoint_mod.run(&self.wal, refs.items);
+        return checkpoint_mod.run(&self.wal, refs.items, self.observations.items);
     }
 };
 
@@ -784,4 +876,54 @@ test "engine recovers only the committed prefix after a torn wal tail" {
     }
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+}
+
+test "observation evidence survives checkpoint and restart with verified payload" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-evidence-recovery";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var evidence_id: u64 = 0;
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        evidence_id = try eng.observe("camera_1", .image, "image/png", "2026-07-31T12:00:00+08:00", "test-camera", "development", "png bytes");
+        try std.testing.expectEqual(@as(usize, 1), eng.observationsView().len);
+        _ = try eng.checkpoint();
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        try std.testing.expectEqual(@as(usize, 1), eng.observationsView().len);
+        const payload = try eng.readEvidencePayload(evidence_id);
+        defer gpa.free(payload);
+        try std.testing.expectEqualStrings("png bytes", payload);
+    }
+}
+
+test "recovery rejects a corrupt committed evidence payload" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-evidence-corrupt";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        _ = try eng.observe("sensor_1", .sensor, "application/octet-stream", "2026-07-31T12:00:00+08:00", "test-sensor", "development", "sensor bytes");
+    }
+    {
+        var root = try Io.Dir.cwd().openDir(io, dir_name, .{});
+        defer root.close(io);
+        var file = try root.openFile(io, "payloads/0000000000000001.rpe", .{ .mode = .read_write });
+        defer file.close(io);
+        var byte: [1]u8 = undefined;
+        _ = try file.readPositionalAll(io, &byte, 20);
+        byte[0] ^= 1;
+        try file.writePositionalAll(io, &byte, 20);
+        try file.sync(io);
+    }
+    try std.testing.expectError(error.CorruptPayload, Engine.open(gpa, io, dir_name, true));
 }

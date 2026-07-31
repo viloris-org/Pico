@@ -7,15 +7,15 @@ lightweight, single-node, network-accessible OLTP baseline. RunaDB's
 long-horizon product direction is defined in ADR-0016 and does not make any
 future capability part of this architecture yet. RunaDB Server is a standalone
 product; RunaDB Client is a separate product. Each instance owns one data
-directory and exposes the supported RunaDB SQL subset to RunaDB Client through the
-versioned RunaDB wire protocol. It is not an embedded library, a cluster, or a
-PostgreSQL-compatible implementation.
+directory and accepts Runa Flow source or canonical Runa Query IR from RunaDB
+Client through the versioned RunaDB Wire Protocol. It is not an embedded
+library, a cluster, or an SQL-compatible implementation.
 
 The target implementation uses a single writer as the commit-ordering point, MVCC snapshots for parallel reads, the WAL as the source of truth for recovery, and independent LSM ordered sets for tables and secondary indexes. By default, the WAL is durable before a successful commit response; checkpoints advance persistence within the data directory and are not user backups.
 
 This document records target boundaries; it does not claim that Phase 1 is fully implemented. See [README](../README.md) for current status: in-memory tables and a versioned, CRC32-validated WAL are available, while persistent LSM storage, MVCC, transaction isolation, group commit, and the extended query protocol remain under development.
 
-The detailed runtime boundaries for connection state, I/O backpressure, commit scheduling, and MVCC snapshots are in [Runtime, Connections, and Concurrency Control](architecture/runtime-and-concurrency.md). Version visibility, isolation levels, write-write contention, and reclamation invariants are in the [Concurrency Control Contract](architecture/concurrency-control.md). The data-directory file abstraction is in [VFS](architecture/vfs.md); fixed-size pages and the static cache are in [Pager and Static Page Cache](architecture/pager-and-static-cache.md); the target SQL executor shape is in [Execution Engine (VDBE Style)](architecture/vdbe.md).
+The detailed runtime boundaries for connection state, I/O backpressure, commit scheduling, and MVCC snapshots are in [Runtime, Connections, and Concurrency Control](architecture/runtime-and-concurrency.md). Version visibility, isolation levels, write-write contention, and reclamation invariants are in the [Concurrency Control Contract](architecture/concurrency-control.md). The data-directory file abstraction is in [VFS](architecture/vfs.md); fixed-size pages and the static cache are in [Pager and Static Page Cache](architecture/pager-and-static-cache.md); the current request language and IR are in [Runa Flow](runa-flow.md).
 
 The two-phase write-path and transaction-commit model is in [Write Path and WriteBatch](architecture/write-path.md). WAL frame format, recovery, and validation invariants are in [WAL and Crash Recovery](architecture/wal-and-recovery.md). The complete LSM design (MemTable, SST, Compaction, and Manifest) is in [LSM Storage Engine Design](architecture/lsm-storage.md).
 
@@ -25,7 +25,7 @@ Accepted ADR-0001 and ADR-0004 through ADR-0009 constrain this architecture. Pri
 
 1. Commit semantics remain recoverable after a crash, and unknown formats or corrupt complete records are never interpreted speculatively.
 2. The write path remains predictable under contention, with one observable commit order.
-3. RunaDB wire protocol and RunaDB SQL form an independent, deliberately bounded client contract.
+3. RunaDB Wire Protocol, Runa Flow, and Runa Query IR form an independent, deliberately bounded client contract.
 4. Clear module boundaries and fault injection keep Zig storage code evolvable.
 5. Single-instance deployment, resource usage, and startup remain simple.
 
@@ -35,7 +35,7 @@ Explicit non-goals: multi-instance replication, sharding, failover, PostgreSQL c
 
 ## RunaDB's Operating Story
 
-An operator starts one **instance** against one **data directory**. A **connection** carries RunaDB Wire Protocol messages and RunaDB SQL statements into the server; it never receives a storage-file handle or relies on a server-internal module. A statement either produces rows from a stable **snapshot** or builds a private transaction write set. Neither path changes shared state by itself.
+An operator starts one **instance** against one **data directory**. A **connection** carries RunaDB Wire Protocol messages containing Runa Flow source or canonical Runa Query IR; it never receives a storage-file handle or relies on a server-internal module. A Request either produces rows from a stable **snapshot** or builds a private transaction write set. Neither path changes shared state by itself.
 
 At commit, the single writer gives accepted work one observable order. It validates the write set against that order, records the complete logical change in the WAL, reaches the selected **durability level**, publishes catalog/table/index visibility, advances the commit watermark, and only then confirms success. This order is RunaDB's answer to two different failures: a crash cannot leave a confirmed logical change without recovery evidence, and a reader cannot see part of a published transaction.
 
@@ -47,21 +47,21 @@ This story also sets the resource behavior. A slow connection is backpressured a
 
 ```mermaid
 flowchart LR
-  client["RunaDB Client\nCLI / drivers / tools"] -->|"RunaDB wire protocol + RunaDB SQL"| runadb["RunaDB Server instance"]
+  client["RunaDB Client\nCLI / drivers / tools"] -->|"Wire Protocol + Flow / Query IR"| runadb["RunaDB Server instance"]
   runadb -->|"WAL, checkpoints, LSM files, directory metadata"| data["Local data directory"]
   operator["Operator"] -->|"durability level, data directory, port"| runadb
 ```
 
-RunaDB Client depends only on the wire protocol, public error model, and published SQL support matrix; it does not depend on storage-file formats or server-internal modules. RunaDB Server uses only its local data directory and does not replicate state to other instances. This architecture makes no commitment about authentication, authorization, or TLS policy; those concerns must be designed separately. Product responsibilities and release boundaries are in [RunaDB Product Boundaries](products.md).
+RunaDB Client depends only on the Wire Protocol, public error model, and published Flow/IR contract; it does not depend on storage-file formats or server-internal modules. RunaDB Server uses only its local data directory and does not replicate state to other instances. This architecture makes no commitment about authentication, authorization, or TLS policy; those concerns must be designed separately. Product responsibilities and release boundaries are in [RunaDB Product Boundaries](products.md).
 
 ## Modules and Ownership
 
 ```mermaid
 flowchart TB
-  net["net\nconnections, wire protocol, error mapping"] --> sql["sql\nparse, bind, plan, execute"]
-  sql --> txn["txn\nsnapshots, write sets, commit requests"]
+  net["net\nconnections, wire protocol, error mapping"] --> flow["flow\nparse, validate IR, bind, execute"]
+  flow --> txn["txn\nsnapshots, write sets, commit requests"]
   txn --> writer["commit\nsingle writer, batching, commit sequence"]
-  sql --> read["read\nMVCC visibility, access paths"]
+  flow --> read["read\nMVCC visibility, access paths"]
   writer --> catalog["catalog\ndatabase, table, column, index metadata"]
   writer --> wal["storage/wal\nappend, validate, persist, recover"]
   writer --> lsm["storage/lsm\nordered sets for tables and indexes"]
@@ -70,14 +70,12 @@ flowchart TB
   wal --> vfs
   pager --> vfs
   lsm --> compaction["storage/compaction\nflush, merge, reclaim"]
-  sql --> vdbe["SQL executor\nVDBE style (target)"]
-  vdbe --> txn
 ```
 
 | Module | Sole responsibility | Owned state | May depend on |
 | --- | --- | --- | --- |
-| `net` | Protocol encoding/decoding, authentication entry point, and error mapping for one connection | Connection and session state | `sql`, `util` |
-| `sql` | Lexing, parsing, binding, and execution scheduling for the SQL subset (target: a step-able executor) | Parsed statements, executor, short-lived execution state | `txn`, `catalog`, `util` |
+| `net` | Protocol encoding/decoding, authentication entry point, and error mapping for one Connection | Connection state | `flow`, `util` |
+| `flow` | Runa Flow parsing, Runa Query IR validation, binding, and execution | Parsed source, validated IR, short-lived execution state | `txn`, `catalog`, `storage`, `util` |
 | `catalog` | Database, table, column, and index definitions | Catalog metadata | `storage`, `util` |
 | `txn` | Snapshots, write sets, logical conflict-range collection, and commit requests | Active transactions, MVCC timestamps, and private conflict ranges | `catalog`, `storage`, `util` |
 | `commit` | Unique commit order, group commit, conflict-history validation, and write application | Bounded commit queue, next commit sequence, and published write-range history | `txn`, `catalog`, `storage`, `util` |
@@ -96,17 +94,17 @@ The target `catalog` / `commit` / `lsm` modules do not yet exist independently. 
 | `storage/table` | `catalog` column definitions + `lsm` in-memory-table subset | Rows, primary-key index, constraint validation, and predicate matching for one table | `storage/value`, `util` |
 | `storage/engine` | `commit` single-writer facade | Table registration, validate -> WAL append -> apply to `table`, and startup recovery | `storage/table`, `storage/wal`, `util` |
 
-- `sql` / `net` depend only on the public `storage/engine` facade (`Engine` re-exports types such as `Table` / `Pred`).
+- `flow` / `net` depend only on the public `storage/engine` facade.
 - `storage/table` knows nothing about WAL; durability ordering and recovery replay belong only to `engine`.
 - When independent `catalog` / `lsm` / `commit` modules arrive, move registration and persistent ordered sets out of `engine`/`table` rather than returning the logic to one file.
 
-`net` must not import `storage`; `sql` must not read or write WAL or LSM files; `storage` must not know SQL text or RunaDB frames. `commit` is the sole writer allowed to change catalog, WAL, and LSM-visible state. Background compaction may prepare new files in parallel, but it makes them visible to new readers only through the `commit`/manifest publication path. `storage/pager` `flush`/`sync` is not a user commit; the user-table main path must not devolve into page overwrites without WAL protection.
+`net` must not import `storage`; `flow` must not read or write WAL or LSM files; `storage` must not know Runa Flow source, Runa Query IR, or protocol frames. `commit` is the sole writer allowed to change catalog, WAL, and LSM-visible state. Background compaction may prepare new files in parallel, but it makes them visible to new readers only through the `commit`/manifest publication path. `storage/pager` `flush`/`sync` is not a user commit; the user-table main path must not devolve into page overwrites without WAL protection.
 
 ## Data Ownership and Invariants
 
 | Data | Source of truth | Sole writer | Readers | Recovery responsibility |
 | --- | --- | --- | --- | --- |
-| Catalog metadata | Catalog records and their persistent representation | `commit` | `sql`, `txn`, recovery | Replay WAL over checkpoint state |
+| Catalog metadata | Catalog records and their persistent representation | `commit` | `flow`, `txn`, recovery | Replay WAL over checkpoint state |
 | Committed logical changes | Durable WAL | `commit` | Recovery | Replay in order from the latest valid checkpoint |
 | Table primary storage and secondary indexes | Immutable files referenced by the LSM manifest | Published by `commit`, prepared by `compaction` | `read` | Checkpoint + WAL |
 | Active write sets and snapshots | In-memory `txn` state | Each transaction; ordered for commit only by `commit` | `txn`, `read` | Discard uncommitted write sets after a crash |
@@ -128,19 +126,19 @@ The following invariants must hold:
 ```mermaid
 sequenceDiagram
   participant C as Client connection
-  participant S as SQL/transaction
+  participant S as Flow/transaction
   participant W as Single writer
   participant L as WAL
   participant M as LSM/catalog
 
-  C->>S: DML or COMMIT
+  C->>S: validated mutation Request or commit
   S->>S: Bind, validate constraints, build write set
   S->>W: Commit request
   W->>W: Allocate commit sequence and form batch
   W->>L: Append complete WAL record
   L-->>W: Synced at default durability level
   W->>M: Apply catalog, table, and index changes
-  W-->>C: CommandComplete / ReadyForQuery
+  W-->>C: command completion
 ```
 
 On WAL sync failure, record-encoding failure, or constraint conflict, `commit` does not publish the write set and the connection receives an explicit error. A looser durability level may change when sync occurs, but must be explicitly configured and observable and must not be the default. Batching may reduce the cost of shared sync across commits, but cannot change their visibility order.
@@ -155,7 +153,7 @@ Detailed compaction and LSM flushing are in [LSM Storage Engine Design](architec
 
 ## Compatibility, Observability, and Verification
 
-The public boundary is the versioned RunaDB wire protocol and published RunaDB SQL support matrix. New semantics require updating the matrix and official RunaDB-client regressions; unsupported statements must fail explicitly. WAL, manifest, and checkpoint formats are internal: breaking format changes require a version, migration, or explicit rejection policy, and new bytes must never be interpreted as an old format. The current PG adapter is not a compatibility promise.
+The public boundary is the versioned RunaDB Wire Protocol, Runa Flow, and Runa Query IR. New semantics require updating their owning references and official RunaDB Client regressions; unsupported Requests must fail explicitly. WAL, manifest, and checkpoint formats are internal: breaking format changes require a version, migration, or explicit rejection policy, and new bytes must never be interpreted as an old format.
 
 The system must emit and test: commit-queue depth and batch size, commit and WAL-sync latency, durability level, recovery duration and replay count, WAL size, checkpoint progress, compaction backlog/read amplification/space amplification, checksum failures, and recovery-rejection reasons.
 
@@ -174,16 +172,16 @@ Executable module boundaries, data-write ownership, and initial quality gates ar
 2. Add persistent catalog metadata, checkpoint positions, and the minimal in-memory/immutable-table LSM path; recovery remains based only on checkpoint + WAL.
 3. Extract commit ordering into a bounded single-writer queue, adding group commit, write-set conflicts, and Read Committed snapshots.
 4. Add secondary indexes, atomic manifest publication, compaction, and reclamation, then extend reads from in-memory tables to LSM lookup.
-5. Expand RunaDB SQL and the RunaDB wire protocol only at stages where each semantic is verified.
+5. Expand Runa Flow, Runa Query IR, and the RunaDB Wire Protocol only at stages where each semantic is verified.
 
 If the single writer becomes unacceptable under measured workloads, first use commit-queue, WAL-sync, and LSM/compaction metrics to locate the cause. Only after confirming that commit ordering itself is the limit should sharding be evaluated through a new ADR; do not insert fine-grained locks, cross-instance coordination, or implicit asynchronous durability into the existing path.
 
 ## RunaDB Architecture Map
 
-- [ADRs](adr/): accepted RunaDB product, protocol, SQL, storage, concurrency, durability, and language decisions; ADR-0009 supersedes ADR-0002's external protocol choice.
+- [ADRs](adr/): accepted RunaDB product, protocol, storage, concurrency, durability, and language decisions; ADR-0017 supersedes earlier SQL language decisions.
 - [VFS](architecture/vfs.md): data-directory fencing, instance lock, positioned I/O, and atomic publication.
 - [Pager and Static Page Cache](architecture/pager-and-static-cache.md): fixed-size page pinning, eviction, and compile-time cache hard limits.
-- [Execution Engine (VDBE Style)](architecture/vdbe.md): target layering from RunaDB SQL to a step-able execution program, with cursors and write sets on MVCC, LSM, and a single writer.
+- [Runa Flow](runa-flow.md): source grammar, canonical Runa Query IR, validation, and implemented execution slice.
 - [Runtime, Connections, and Concurrency Control](architecture/runtime-and-concurrency.md): connection lifecycle, cancellation, bounded scheduling, commit ordering, and snapshot publication.
 - [I/O Scheduling Contract](architecture/io-scheduling.md): defines completion/callback separation, critical-I/O capacity reservation, connection fairness, backpressure, and failure handling; platform backends may vary, but commit and durability semantics may not.
 - [WAL and Crash Recovery](architecture/wal-and-recovery.md): RunaDB WAL frame format, record types, recovery process, CRC invariants, and fault model.

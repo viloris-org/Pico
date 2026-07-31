@@ -38,6 +38,16 @@ pub const Message = union(enum) {
         code: []const u8,
         message: []const u8,
     },
+    payload_begin: struct {
+        evidence_id: u64,
+        payload_length: u64,
+        payload_digest: []const u8,
+    },
+    payload_chunk: struct {
+        evidence_id: u64,
+        bytes: []const u8,
+    },
+    payload_finish: struct { evidence_id: u64 },
     goodbye: struct { reason: []const u8 },
 };
 
@@ -128,6 +138,30 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
                 .message = message,
             } };
         },
+        .payload_begin => blk: {
+            if (payload.len != 8 + 8 + proto.PAYLOAD_DIGEST_LENGTH) return error.Protocol;
+            const digest = try arena.dupe(u8, payload[16..]);
+            pos = payload.len;
+            break :blk Message{ .payload_begin = .{
+                .evidence_id = std.mem.readInt(u64, payload[0..8], .big),
+                .payload_length = std.mem.readInt(u64, payload[8..16], .big),
+                .payload_digest = digest,
+            } };
+        },
+        .payload_chunk => blk: {
+            if (payload.len < 8 or payload.len - 8 > proto.MAX_ATTACHMENT_CHUNK_LENGTH) return error.Protocol;
+            const data = try arena.dupe(u8, payload[8..]);
+            pos = payload.len;
+            break :blk Message{ .payload_chunk = .{
+                .evidence_id = std.mem.readInt(u64, payload[0..8], .big),
+                .bytes = data,
+            } };
+        },
+        .payload_finish => blk: {
+            if (payload.len != 8) return error.Protocol;
+            pos = payload.len;
+            break :blk Message{ .payload_finish = .{ .evidence_id = std.mem.readInt(u64, payload[0..8], .big) } };
+        },
         .goodbye => blk: {
             const reason = if (pos < payload.len) try readString(arena, payload, &pos) else "";
             break :blk Message{ .goodbye = .{ .reason = reason } };
@@ -185,9 +219,11 @@ pub fn buildHelloPayload(allocator: Allocator) ![]u8 {
 
 test "codec decodes a complete command response" {
     const bytes = [_]u8{
-        0, 0, 0, 19, @intFromEnum(proto.Type.command_complete),
-        0, 0, 0, 0, 0, 0, 0, 3,
-        0, 0, 0, 6, 'I', 'N', 'S', 'E', 'R', 'T',
+        0,   0,   0,   19,  @intFromEnum(proto.Type.command_complete),
+        0,   0,   0,   0,   0,
+        0,   0,   3,   0,   0,
+        0,   6,   'I', 'N', 'S',
+        'E', 'R', 'T',
     };
     var reader: Io.Reader = .fixed(&bytes);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -211,9 +247,10 @@ test "codec rejects malformed message payloads" {
         .{ .bytes = &.{ 0, 0, 0, 1, @intFromEnum(proto.Type.row_description) }, .expected = error.UnexpectedEof },
         .{ .bytes = &.{ 0, 0, 0, 4, @intFromEnum(proto.Type.row_data), 0, 1, 2 }, .expected = error.Protocol },
         .{ .bytes = &.{
-            0, 0, 0, 14, @intFromEnum(proto.Type.command_complete),
-            0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 5, 'x',
+            0, 0, 0,   14, @intFromEnum(proto.Type.command_complete),
+            0, 0, 0,   0,  0,
+            0, 0, 0,   0,  0,
+            0, 5, 'x',
         }, .expected = error.UnexpectedEof },
         .{ .bytes = &.{ 0, 0, 0, 7, @intFromEnum(proto.Type.hello_ok), 0, 0, 0, 1, 'x', 'y' }, .expected = error.Protocol },
     };

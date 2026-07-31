@@ -14,7 +14,7 @@ tests, and the one or more references that own the changed surface:
 | Changed surface | Read |
 | --- | --- |
 | Module ownership or dependencies | [architecture](ARCHITECTURE.md), [module boundaries](engineering/module-boundaries.md) |
-| RunaDB SQL or RunaDB Wire Protocol | [SQL support](sql-subset.md), [wire protocol](wire-protocol.md), [change protocols](engineering/change-protocols.md) |
+| Runa Flow, Runa Query IR, or RunaDB Wire Protocol | [Runa Flow](runa-flow.md), [wire protocol](wire-protocol.md), [change protocols](engineering/change-protocols.md) |
 | SDK or Client behavior | [module boundaries](engineering/module-boundaries.md), [change protocols](engineering/change-protocols.md) |
 | WAL, recovery, VFS, formats, LSM, or compaction | [architecture](ARCHITECTURE.md), [storage references](architecture/), [change protocols](engineering/change-protocols.md) |
 | Tests, handoff, documentation, or review | [verification](engineering/verification.md), [documentation standard](DOCUMENTATION.md) |
@@ -32,8 +32,8 @@ an interpretation.
   without a focused ADR.
 - RunaDB Client (`clint/`) and RunaDB Server (`src/`) share only the versioned
   RunaDB Wire Protocol definitions in `clint/proto/`.
-- Public contracts are RunaDB Wire Protocol and RunaDB SQL. Do not promise
-  PostgreSQL compatibility. Unsupported public input must fail explicitly.
+- Public contracts are RunaDB Wire Protocol, Runa Flow, and Runa Query IR. SQL
+  is not supported. Unsupported public input must fail explicitly.
 - The single writer alone orders and publishes commits. A transaction write set
   remains private until publication; reads use snapshots.
 - WAL evidence precedes visibility. At the default durability level, successful

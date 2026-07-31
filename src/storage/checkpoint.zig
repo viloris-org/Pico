@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const wal_mod = @import("wal.zig");
 const table_mod = @import("table.zig");
 const value_mod = @import("value.zig");
+const evidence_mod = @import("evidence.zig");
 
 pub const Stats = struct {
     tables: usize,
@@ -34,7 +35,7 @@ pub const Stats = struct {
 /// duration of this call. The rewritten WAL becomes the only record of
 /// committed state, so a torn read of a table here would durably lose a commit
 /// rather than merely return a bad row.
-pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table) !Stats {
+pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table, observations: []const evidence_mod.Record) !Stats {
     var rewrite = try wal.beginRewrite();
 
     var rows: usize = 0;
@@ -59,6 +60,7 @@ pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table) !Stats {
             // INSERT from reusing a retired identifier.
             try rewrite.emitSetSerial(.{ .table = table.name, .next_serial = table.next_serial });
         }
+        for (observations) |record| try rewrite.emitObserve(record.metadata());
     }
 
     const before = rewrite.replaced_bytes;
@@ -128,7 +130,7 @@ test "checkpoint emits current schema and rows, with set_serial after the insert
         try table.delete(gpa, .{ .int = 7 });
         try std.testing.expectEqual(@as(i64, 8), table.next_serial);
 
-        stats = try run(&wal, &.{&table});
+        stats = try run(&wal, &.{&table}, &.{});
     }
 
     try std.testing.expectEqual(@as(usize, 1), stats.tables);
@@ -159,7 +161,7 @@ test "checkpoint of an empty instance still yields a replayable wal" {
     {
         var wal = try wal_mod.Wal.open(gpa, io, dir_name, false);
         defer wal.deinit();
-        const stats = try run(&wal, &.{});
+        const stats = try run(&wal, &.{}, &.{});
         try std.testing.expectEqual(@as(usize, 0), stats.tables);
         try std.testing.expectEqual(@as(usize, 0), stats.rows);
     }

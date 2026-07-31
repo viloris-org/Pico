@@ -6,8 +6,8 @@ continuous state, representations, relationships, and hypotheses share common
 query, governance, history, and integrity contracts. The current implementation
 is a lightweight, single-instance, network-accessible OLTP baseline. Its write
 path remains predictable under contention and it provides recoverable durable
-storage. Runa Flow is the target formal data language; the currently
-implemented RunaDB SQL path is legacy-only during the protocol transition.
+storage. Runa Flow is the native formal data language. The legacy RunaDB SQL
+parser, executor, and protocol endpoints have been removed.
 
 ## Language
 
@@ -300,8 +300,8 @@ _Avoid_: Declarative SQL cursor syntax (do not present it as a product feature b
 
 ## Example dialogue
 
-> **Developer**: The current implementation can connect with `psql`. Does that count as a RunaDB product compatibility commitment?
-> **Domain**: No. That is an implementation detail of the migration adapter. The target external contracts are the versioned **RunaDB Wire Protocol** and **Runa Flow**; the current RunaDB SQL path is legacy-only. The adapter must not define language, type, or transaction semantics.
+> **Developer**: Can the current implementation connect with `psql` or execute SQL?
+> **Domain**: No. The external contracts are the versioned **RunaDB Wire Protocol**, **Runa Flow**, and **Runa Query IR**. A future compatibility adapter would require a focused ADR and could not define language, type, or transaction semantics.
 >
 > **Developer**: If two connections modify the same primary key at the same time, is that **contention** or a fault?
 > **Domain**: It is **contention**. One **transaction** will **commit**; the other waits according to isolation rules or fails with a write conflict. The **write path** must remain predictable and must not lock up the entire instance.

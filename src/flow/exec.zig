@@ -7,6 +7,7 @@ const ast = @import("ast.zig");
 const ir = @import("ir.zig");
 const engine_mod = @import("../storage/engine.zig");
 const value = @import("../storage/value.zig");
+const evidence = @import("../storage/evidence.zig");
 
 pub const ExecError = ast.ParseError || ir.IrError || error{ SemanticNameNotFound, FieldNotFound, ModelRevisionMismatch } || Allocator.Error;
 
@@ -33,6 +34,8 @@ pub fn compile(gpa: Allocator, source: []const u8) !ir.Request {
 
 pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
     if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
+    if (request.operation != .emit) return error.InvalidOperation;
+    if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request.fields);
     // Revision 0 is an explicit development binding of relation names to the
     // existing table catalog. It is read-only and is not persisted as a model.
     const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
@@ -60,6 +63,77 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
         try cells.append(gpa, output);
     }
     return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
+}
+
+const evidence_fields = [_][]const u8{
+    "evidence_id",
+    "object_id",
+    "modality",
+    "media_type",
+    "observed_at",
+    "origin",
+    "owner",
+    "payload_length",
+    "payload_digest",
+};
+
+fn executeEvidence(gpa: Allocator, eng: *engine_mod.Engine, fields: []const []u8) !Result {
+    const projection = try gpa.alloc(usize, fields.len);
+    defer gpa.free(projection);
+    for (fields, 0..) |field, output_index| {
+        for (evidence_fields, 0..) |known, known_index| {
+            if (std.mem.eql(u8, field, known)) {
+                projection[output_index] = known_index;
+                break;
+            }
+        } else return error.FieldNotFound;
+    }
+    const columns = try gpa.alloc([]const u8, fields.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |field_index, index| columns[index] = evidence_fields[field_index];
+
+    var owned_text: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (owned_text.items) |text| gpa.free(text);
+        owned_text.deinit(gpa);
+    }
+    var cells: std.ArrayList([]?[]const u8) = .empty;
+    errdefer {
+        for (cells.items) |row| gpa.free(row);
+        cells.deinit(gpa);
+    }
+    for (eng.observationsView()) |record| {
+        const row = try gpa.alloc(?[]const u8, projection.len);
+        errdefer gpa.free(row);
+        for (projection, 0..) |field_index, output_index| {
+            row[output_index] = switch (field_index) {
+                0 => try ownedFormat(gpa, &owned_text, "{d}", .{record.evidence_id}),
+                1 => record.object_id,
+                2 => @tagName(record.modality),
+                3 => record.media_type,
+                4 => record.observed_at,
+                5 => record.origin,
+                6 => record.owner,
+                7 => try ownedFormat(gpa, &owned_text, "{d}", .{record.payload_length}),
+                8 => blk: {
+                    const hex = std.fmt.bytesToHex(record.payload_digest, .lower);
+                    const text = try gpa.dupe(u8, &hex);
+                    try owned_text.append(gpa, text);
+                    break :blk text;
+                },
+                else => unreachable,
+            };
+        }
+        try cells.append(gpa, row);
+    }
+    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
+}
+
+fn ownedFormat(gpa: Allocator, owned: *std.ArrayList([]u8), comptime format: []const u8, args: anytype) ![]const u8 {
+    const text = try std.fmt.allocPrint(gpa, format, args);
+    errdefer gpa.free(text);
+    try owned.append(gpa, text);
+    return text;
 }
 
 fn bindProjection(gpa: Allocator, table: *engine_mod.Table, fields: []const []u8) ![]usize {

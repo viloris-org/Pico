@@ -8,7 +8,7 @@ claim is intentionally narrow:
 
 | Client package | RunaDB Wire Protocol | RunaDB Server |
 | --- | --- | --- |
-| Checked-out RunaDB Zig SDK | `1.0` | `RunaDB 0.0.1` in this checked-out revision |
+| Checked-out RunaDB Zig SDK | `2.0` | `RunaDB 0.0.1` in this checked-out revision |
 
 Other server versions are unverified until they have a compatibility regression.
 Run `zig build test` to build the independently deployable `runadb` binary and
@@ -21,5 +21,12 @@ server error. `SERVER_ERROR`, `COMMAND_COMPLETE`, and `GOODBYE` end that result
 sequence. Call `Connection.deinit` to close a Connection and free client-owned
 resources.
 
-The protocol has no timeout, cancellation, or retry message in v1.0. The
-implemented Flow slice is read-only, so it has no write retry semantics.
+`Connection.observe` stages a payload in bounded protocol chunks and submits a
+canonical `observe` IR request. It returns the committed `evidence_id` as a
+normal result row. `Connection.readEvidencePayload` retrieves one payload and
+validates its ID, declared length, chunk bounds, and BLAKE3-256 digest before
+returning bytes to the caller. The payload limit is 8,388,608 bytes.
+
+The protocol has no timeout, cancellation, or retry message in v2.0. The
+implemented Flow source slice is read-only; Observation Evidence mutations are
+not retried automatically.

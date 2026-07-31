@@ -16,7 +16,7 @@ pub fn run(gpa: Allocator, io: Io, cfg: Config) !void {
     defer eng.deinit();
 
     if (cfg.runa_port == 0) return error.NoListener;
-    std.log.info("RunaDB Wire Protocol v1 listening on {s}:{d}", .{ cfg.host, cfg.runa_port });
+    std.log.info("RunaDB Wire Protocol v2 listening on {s}:{d}", .{ cfg.host, cfg.runa_port });
     std.log.info("Data directory: {s}", .{cfg.data_dir});
     try runRunaListener(.{
         .gpa = gpa,

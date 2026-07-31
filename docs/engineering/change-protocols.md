@@ -4,15 +4,16 @@ This reference defines the work required for public and persistent contract
 changes. Read it from [the build loop](../BUILDING.md) when the change touches
 one of these surfaces.
 
-## RunaDB SQL
+## Runa Flow And Runa Query IR
 
-For a new RunaDB SQL capability, specify accepted syntax and its semantic
-boundary; define invalid, unsupported, and partially supported rejection; then
-implement parsing, validation, execution, and transaction behavior together.
-No stage may report success while omitting effects. Add parser, execution,
-rejection, recovery, and official RunaDB Client evidence where applicable.
-Update `docs/sql-subset.md` only after verification. Changes affecting catalog,
-indexes, constraints, visibility, or commit are persistence changes too.
+For a new Runa Flow capability, specify source syntax, canonical IR, and the
+semantic boundary; define parse, binding, type, unsupported, and malformed-IR
+rejection; then implement validation, execution, and transaction behavior
+together. No stage may report success while omitting effects. Add source, IR,
+execution, rejection, recovery, and official RunaDB Client evidence where
+applicable. Update `docs/runa-flow.md` only after verification. Changes
+affecting catalog, indexes, constraints, visibility, or commit are persistence
+changes too.
 
 ## RunaDB Wire Protocol
 
@@ -61,4 +62,3 @@ FORMAT CHANGE
   tail. Do not scan forward after a complete-record failure.
 - Preserve diagnostic evidence when startup rejects a data directory.
 - A checkpoint advances persistence and WAL reclamation; it is not backup.
-

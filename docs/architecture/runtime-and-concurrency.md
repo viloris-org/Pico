@@ -11,7 +11,7 @@ modules and regressions land.
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 
 1. RunaDB is a single-machine, single-instance service entered through the versioned RunaDB wire protocol.
-2. SQL is an explicit subset; a parseable protocol message does not imply supported semantics.
+2. Runa Flow and Runa Query IR are explicit subsets; a parseable protocol message does not imply supported semantics.
 3. Only the single writer performs commit ordering and publication of committed state; reads may run in parallel.
 4. At the default durability level, a commit response waits for the corresponding WAL persistence boundary.
 
@@ -33,8 +33,8 @@ Connection quotas are likewise not transaction semantics. They decide how much i
 flowchart LR
   client["RunaDB client"] --> reactor["net/reactor\nreceive, send, frames, backpressure"]
   reactor --> connection["net/connection\nconnection state and statement order"]
-  connection --> sql["sql + txn\nparse, execute, snapshots, write sets"]
-  sql -->|"bounded commit request"| commit["commit\ncommit order and publication"]
+  connection --> flow["flow + txn\nvalidate, execute, snapshots, write sets"]
+  flow -->|"bounded commit request"| commit["commit\ncommit order and publication"]
   commit --> wal["WAL\nappend and durability boundary"]
   commit --> storage["catalog and LSM\napply committed changes"]
   storage --> completion["runtime/completion\ncompletion notification"]
@@ -43,9 +43,9 @@ flowchart LR
 
 | Owner | Responsible for | Not responsible for |
 | --- | --- | --- |
-| `net/reactor` | Listening, nonblocking reads/writes, admission, frame limits, backpressure, and I/O completion events | SQL parsing, transaction state, WAL, or storage files |
+| `net/reactor` | Listening, nonblocking reads/writes, admission, frame limits, backpressure, and I/O completion events | Flow/IR validation, transaction state, WAL, or storage files |
 | `net/connection` | Per-connection protocol state, statement order, output-frame order, and cancellation routing | Global commit order or other connections' execution state |
-| `sql` / `txn` | SQL-subset decisions, statement snapshots, write sets, and conflict candidates | Writing WAL or publishing visible data directly |
+| `flow` / `txn` | Request validation, snapshots, write sets, and conflict candidates | Writing WAL or publishing visible data directly |
 | `commit` | Accepting bounded requests, assigning commit sequences, WAL persistence, atomic publication, and completion results | Socket I/O and slow-client output buffers |
 | `runtime/completion` | Delivering completion results to the connection's execution context | Recursively running business callbacks inside the kernel completion queue |
 
@@ -87,7 +87,7 @@ result streaming, commit-queue waits, and pre-WAL-sync execution must inspect th
 bounded work units.
 
 1. Before `commit`, discard local results; an autocommit statement produces no commit.
-2. A cancellable statement in an explicit transaction reports an error, while transaction-failure semantics come from the published SQL subset rules, not reactor guesses.
+2. A cancellable Request in an explicit transaction reports an error, while transaction-failure semantics come from the published Flow/IR rules, not reactor guesses.
 3. Withdraw requests queued without a commit sequence. Requests with a sequence but no WAL write terminate deterministically without a visibility hole.
 4. Once a complete commit record is in WAL, cancellation cannot make it uncommitted. The single writer publishes it and discards or reports the result depending on connection liveness.
 
@@ -105,7 +105,7 @@ order. Only `txn` supplies wire-protocol transaction state; `net` must not infer
 last message.
 
 Length, format, message-order, and startup violations are protocol errors: send a feasible
-error frame and close. Unsupported RunaDB SQL, binding, and execution errors end only the current
+error frame and close. Unsupported Flow/IR, binding, and execution errors end only the current
 statement and return to the protocol's next-statement state. Transport EOF performs shutdown
 cleanup without attempting an error. Protocol extensions such as batching or prepared queries
 must define recovery states and frames explicitly rather than scattering state through socket

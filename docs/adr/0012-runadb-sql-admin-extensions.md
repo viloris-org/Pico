@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Superseded by ADR-0017. These SQL administration statements and their endpoint
+are not implemented.
 
 ## Context
 

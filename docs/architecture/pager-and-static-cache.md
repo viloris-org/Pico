@@ -25,7 +25,7 @@ Likewise, a successful Pager `sync` means only that its file has reached the pla
 
 ```mermaid
 flowchart TB
-  sql["sql / vdbe"] --> txn["txn write set and snapshot"]
+  flow["flow / Query IR"] --> txn["txn write set and snapshot"]
   txn --> commit["commit single writer"]
   commit --> wal["WAL"]
   commit --> lsm["LSM manifest / memtable"]
@@ -140,7 +140,7 @@ This is consistent with ADR-0005: commit ordering remains in `commit`; the Pager
 
 ## Observability, Failure, and Acceptance
 
-Recommended metrics: cache hits/misses, eviction count, dirty-page writebacks, `CacheFull` count, peak pins, `flush`/`sync` latency, and `CorruptPageFile` count. Label them by file role, not SQL text.
+Recommended metrics: cache hits/misses, eviction count, dirty-page writebacks, `CacheFull` count, peak pins, `flush`/`sync` latency, and `CorruptPageFile` count. Label them by file role, not Request source.
 
 Minimum regressions (some are already covered by `pager.zig`):
 

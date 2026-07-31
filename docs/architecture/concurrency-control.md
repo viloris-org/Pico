@@ -4,9 +4,9 @@
 
 This document refines ADR-0005's "single-writer commit ordering + MVCC reads" and defines the semantic boundaries RunaDB must satisfy when implementing transactions, versioned storage, and background reclamation. It describes the target architecture; it does not claim that Phase 0 already provides these capabilities.
 
-In Phase 0, `BEGIN`, `COMMIT`, and `ROLLBACK` are compatibility labels in the wire protocol/SQL subset. Each DML statement directly modifies an in-memory table and writes to the WAL; there are no cross-statement write sets, MVCC versions, or transaction-isolation guarantees yet. The only promise about current behavior is the support matrix in [README](../../README.md). Until the implementation reaches the phase described here, these labels must not be advertised as transaction support.
+The current public Flow/IR slice is read-only and has no transaction-control operations. Internal table mutation methods write to the WAL, but they are not public transaction support. Until the implementation reaches the phase described here, transaction syntax or isolation must not be advertised.
 
-This document constrains concurrency within a single RunaDB **instance**. It does not define cross-instance coordination, replication, distributed transactions, user-visible lock syntax, `SAVEPOINT`, `SELECT FOR UPDATE`, or complete PostgreSQL isolation levels. The wire protocol's ability to carry related SQL does not mean that the RunaDB SQL subset supports its semantics.
+This document constrains concurrency within a single RunaDB **instance**. It does not define cross-instance coordination, replication, distributed transactions, user-visible lock operations, savepoints, or PostgreSQL isolation compatibility. A future Flow/IR shape does not become supported merely because the Wire Protocol can carry it.
 
 ## Design Conclusions
 
@@ -60,11 +60,11 @@ stateDiagram-v2
   idle --> [*]: connection closed
 ```
 
-An autocommit statement owns a temporary transaction and returns to `idle` through `commit_wait` after success; on failure it discards its write set. An explicit transaction accumulates a private write set in `active`. After an execution error or commit conflict it enters `failed`; every SQL statement other than `ROLLBACK` must be rejected rather than silently continuing with a partial write set. Closing a connection is equivalent to rolling back any transaction that has not crossed the irreversible commit point.
+An autocommitted Request owns a temporary transaction and returns to `idle` through `commit_wait` after success; on failure it discards its write set. An explicit transaction accumulates a private write set in `active`. After an execution error or commit conflict it enters `failed`; every Request other than rollback must be rejected rather than silently continuing with a partial write set. Closing a Connection is equivalent to rolling back any transaction that has not crossed the irreversible commit point.
 
-The initial deliverable isolation level is **Read Committed**: each statement takes a fresh snapshot watermark at the start and always sees earlier private modifications from the same transaction. It prohibits dirty reads, but two `SELECT` statements in one explicit transaction may see commits made by other transactions between them. RunaDB does not accept `READ UNCOMMITTED` as a weaker promise, nor does it treat PostgreSQL's mapping for it as supported syntax.
+The initial mutation-capable deliverable isolation level is **Read Committed**: each Request takes a fresh snapshot watermark at the start and always sees earlier private modifications from the same transaction. It prohibits dirty reads, but two reads in one explicit transaction may see commits made by other transactions between them. Weaker isolation is not accepted implicitly.
 
-"Optional snapshot reads" may be enabled only when explicitly listed in the SQL support matrix. Their snapshot must be fixed before the transaction's first read/write and retained until commit or rollback; this still does not equal `SERIALIZABLE`. Until predicate-dependency tracking, a read/write conflict graph, and a rollback-retry protocol exist, `REPEATABLE READ`, `SERIALIZABLE`, and imported/exported snapshots must return an explicit "unsupported" error rather than being downgraded.
+Optional snapshot reads may be enabled only when explicitly defined in Runa Flow and Runa Query IR. Their snapshot must be fixed before the transaction's first read/write and retained until commit or rollback; this still does not equal strict serializability. Until dependency tracking, a read/write conflict graph, and a rollback-retry protocol exist, stronger isolation and imported/exported snapshots must return an explicit unsupported error rather than being downgraded.
 
 ## Write-Write Contention and Constraints
 
@@ -78,7 +78,7 @@ While building a write set, a write transaction records the "observed version" o
 | Update/delete a row that no longer exists | The target was deleted or did not appear after the transaction's snapshot | Write-write conflict; transaction fails |
 | Secondary unique key | Every affected index key is unique within the commit batch and published state | Unique-constraint error |
 
-Conflict outcomes must be deterministic and observable: the same commit-queue order and write sets must produce the same success, unique-constraint error, or write-write-conflict result. RunaDB v1 does not wait on row locks, re-execute `WHERE` predicates at commit, or silently implement "last writer wins." Cases requiring a client retry must use an explicit SQL error category; error codes and wire-protocol mapping are defined together with the SQL subset/protocol.
+Conflict outcomes must be deterministic and observable: the same commit-queue order and write sets must produce the same success, unique-constraint error, or write-write-conflict result. RunaDB v1 does not wait on row locks, re-evaluate filters at commit, or silently implement "last writer wins." Cases requiring a client retry must use an explicit Flow/IR error category defined with the Wire Protocol mapping.
 
 Neither Read Committed nor future snapshot reads prevent write skew from multi-row or range predicates. For example, two transactions can read the same set and then update different primary keys, both passing the version checks above. Applications must use a single conditional update or a retry protocol for such workloads; until serializability is implemented, RunaDB must not claim to prevent phantoms or serialization anomalies.
 
@@ -86,18 +86,18 @@ DDL and catalog changes also enter the same single-writer queue. Each statement 
 
 ## Deferred: Strictly Consistent OCC
 
-Strict serializability is not a RunaDB v1 isolation promise. This section records the design to adopt only after a new ADR, a RunaDB SQL support-matrix entry, and wire-protocol error mapping make that promise explicit. It defines optimistic conflict validation for RunaDB's single-instance commit path; it does not introduce distributed transaction roles, resolver sharding, replication, or a fixed transaction lifetime.
+Strict serializability is not a RunaDB v1 isolation promise. This section records the design to adopt only after a new ADR, Flow/IR contracts, and Wire Protocol error mapping make that promise explicit. It defines optimistic conflict validation for RunaDB's single-instance commit path; it does not introduce distributed transaction roles, resolver sharding, replication, or a fixed transaction lifetime.
 
 The design has four non-negotiable properties:
 
 1. A transaction validates logical dependencies formed from one read watermark; it does not validate storage files, page numbers, or an execution plan's transient details.
 2. The single writer is the only authority that accepts or rejects a transaction and assigns its `commit_seq`. Work may be prepared concurrently, but validation decisions are ordered exactly as publication decisions.
-3. A retryable serialization conflict, a non-retryable constraint error, and retryable overload are distinct outcomes. They have different causes and must remain distinct in RunaDB SQL and RunaDB Wire Protocol error mapping.
+3. A retryable serialization conflict, a non-retryable constraint error, and retryable overload are distinct outcomes. They have different causes and must remain distinct in Runa Flow, Runa Query IR, and Wire Protocol error mapping.
 4. Range history and active snapshots are bounded resources. RunaDB must reject work that exceeds an announced age or resource limit rather than retaining conflict metadata indefinitely or weakening isolation.
 
 ### Range Collection Lifecycle
 
-Range collection begins when the transaction obtains `read_seq`, before the first read whose result can affect a later write. The execution layer records each dependency while it still knows the SQL operation, access path, predicate bounds, and catalog objects used for binding. It then canonicalizes and coalesces compatible overlapping ranges in the private transaction state. Coalescing may widen a range within the same logical namespace, but it must never omit a dependency or combine ranges from different databases, tables, indexes, or catalog domains.
+Range collection begins when the transaction obtains `read_seq`, before the first read whose result can affect a later write. The execution layer records each dependency while it still knows the IR operation, access path, predicate bounds, and catalog objects used for binding. It then canonicalizes and coalesces compatible overlapping ranges in the private transaction state. Coalescing may widen a range within the same logical namespace, but it must never omit a dependency or combine ranges from different databases, tables, indexes, or catalog domains.
 
 The transaction submits its immutable read ranges, write ranges, observed-version stamps, and logical write set as one commit request. `commit` owns the accepted request thereafter; `txn` must not mutate it while the request is queued. Cancellation before the irreversible commit point discards the request and deregisters its snapshot. Cancellation after that point may suppress the response but cannot revoke validation, WAL persistence, or publication.
 
@@ -107,7 +107,7 @@ Range collection is part of semantic execution, not a diagnostic side channel. A
 
 At the first consistent read (or before committing a write-only transaction), a transaction captures `read_seq = published_commit_seq`. It records logical ranges, never physical LSM files or pages:
 
-| SQL operation | Read conflict range | Write conflict range |
+| IR operation | Read conflict range | Write conflict range |
 | --- | --- | --- |
 | Primary-key point lookup | That table and primary-key point | None |
 | Primary-key insert/update/delete | Any row or index key inspected for constraints and the target's observed row | The changed primary key and every changed secondary-index or unique key |
@@ -117,7 +117,7 @@ At the first consistent read (or before committing a write-only transaction), a 
 
 Ranges use a canonical ordered encoding that includes database, table, index, and key boundaries. A half-open range `[begin, end)` is required so equality, prefixes, and empty ranges are unambiguous. The optimizer must not narrow a range unless the chosen access path proves the narrower range contains every row or index entry whose change could alter the statement result. A conservative wider range is correct, although it creates more retryable contention.
 
-The transaction's private write set remains read-your-writes: reads satisfied solely by an earlier private write add no read conflict range. Every mutation adds its write conflict ranges even when it is a blind write. Constraint validation may add read ranges; this preserves SQL primary-key and unique semantics rather than treating a blind write as automatically conflict-free.
+The transaction's private write set remains read-your-writes: reads satisfied solely by an earlier private write add no read conflict range. Every mutation adds its write conflict ranges even when it is a blind write. Constraint validation may add read ranges; this preserves declared primary-key and uniqueness semantics rather than treating a blind write as automatically conflict-free.
 
 ### Commit-Time Validation
 
@@ -127,19 +127,19 @@ The single writer keeps an in-memory, commit-sequence-ordered history of publish
 2. Validate primary-key, unique-key, foreign-key, and catalog invariants against the state produced by all earlier accepted requests in the same group-commit round.
 3. On success, allocate `commit_seq`, append the complete WAL record, publish its versions, and add its write ranges to the history before validating a later queued request.
 
-The first rule detects read-write and predicate conflicts, including phantoms. The second is still necessary: SQL constraints and modifications derived from observed rows cannot be weakened to unconditional blind-write behavior. A rejected transaction creates no WAL record, publishes nothing, and returns a distinct retryable serialization-conflict outcome. A constraint violation remains a non-retryable constraint error. The client must rerun the full transaction against a new snapshot; RunaDB Server does not rerun SQL statements, repeat external side effects, or silently change the transaction's isolation.
+The first rule detects read-write and predicate conflicts, including phantoms. The second is still necessary: declared constraints and modifications derived from observed values cannot be weakened to unconditional blind-write behavior. A rejected transaction creates no WAL record, publishes nothing, and returns a distinct retryable serialization-conflict outcome. A constraint violation remains a non-retryable constraint error. The client must rerun the full transaction against a new snapshot; RunaDB Server does not rerun Requests, repeat external side effects, or silently change the transaction's isolation.
 
-The history is retained until no active strict transaction can have a `read_seq` that needs it. Before admitting or validating a transaction, RunaDB may reject it with a distinct retryable "transaction too old" outcome when its snapshot falls behind the retained history horizon or its age/resource limits. The future RunaDB Wire Protocol error code remains to be designed. This bounds memory and avoids turning long-running snapshots into unbounded conflict metadata retention. The exact maximum age, range count, and range-byte limits are configuration and observability concerns, not SQL semantics.
+The history is retained until no active strict transaction can have a `read_seq` that needs it. Before admitting or validating a transaction, RunaDB may reject it with a distinct retryable "transaction too old" outcome when its snapshot falls behind the retained history horizon or its age/resource limits. The future RunaDB Wire Protocol error code remains to be designed. This bounds memory and avoids turning long-running snapshots into unbounded conflict metadata retention. The exact maximum age, range count, and range-byte limits are configuration and observability concerns, not language semantics.
 
 ### Strictness Boundary
 
 The read watermark must be issued from the same publication order as commits. Therefore, if RunaDB has responded successfully to commit A before connection B starts a strict transaction, B's `read_seq` is at least A's `commit_seq`; B cannot read a state preceding A. Commit responses remain ordered after WAL durability and publication. Together with range validation, this supplies a single-instance strict serial order without locks on ordinary reads or writes.
 
-Snapshot or explicitly non-conflicting reads would weaken this guarantee. They must be a separately named, explicitly documented future RunaDB SQL feature; the normal strict mode cannot quietly omit their conflict ranges.
+Snapshot or explicitly non-conflicting reads would weaken this guarantee. They must be separately named, explicitly documented future Flow/IR operations; the normal strict mode cannot quietly omit their conflict ranges.
 
 ### Why RunaDB Uses Logical Ranges
 
-SQL dependencies are logical, not physical. A predicate may be satisfied by a memtable today and an immutable table after compaction, but it is still a dependency on the same table/index keys. Recording physical files, page numbers, or a selected access path would make the isolation result change when compaction changes layout. A canonical logical range keeps the result stable across recovery, checkpoints, and query-plan changes.
+Request dependencies are logical, not physical. A predicate may be satisfied by a memtable today and an immutable table after compaction, but it is still a dependency on the same table/index keys. Recording physical files, page numbers, or a selected access path would make the isolation result change when compaction changes layout. A canonical logical range keeps the result stable across recovery, checkpoints, and planning changes.
 
 The conservative rule is intentional. If RunaDB cannot prove that an index interval covers every row that could change a predicate result, it records the whole table's logical range. This can cause an avoidable retry under high contention, but it cannot admit a phantom-dependent commit. Improving the optimizer may narrow a range only when it preserves that proof; it may never make a transaction silently less isolated.
 
@@ -147,7 +147,7 @@ The conservative rule is intentional. If RunaDB cannot prove that an index inter
 
 The single writer orders commits; it does not make a repeatedly modified logical key inexpensive. A hot primary key, unique key, or strict read range can create conflicts even when WAL and CPU capacity are available. RunaDB must report those outcomes separately from commit-queue saturation and device latency, because the remedies differ.
 
-For application work that permits it, distribute independently accumulated values across separate rows and combine them in a later read, or append independent work records and apply their order-sensitive effects in a controlled transaction. These are data-model choices, not a hidden weakening of RunaDB SQL. A future atomic-update operation, snapshot read, or range-conflict exception requires a RunaDB SQL definition, logical conflict ranges, WAL representation, recovery rules, metrics, and an ADR before it becomes available.
+For application work that permits it, distribute independently accumulated values across separate rows and combine them in a later read, or append independent work records and apply their order-sensitive effects in a controlled transaction. These are data-model choices, not a hidden weakening of transaction semantics. A future atomic-update operation, snapshot read, or range-conflict exception requires Flow/IR definitions, logical conflict ranges, WAL representation, recovery rules, metrics, and an ADR before it becomes available.
 
 ### Required Strict-OCC Tests
 
@@ -156,7 +156,7 @@ When this mode is implemented, extend the required tests with:
 1. Two transactions that read the same predicate and update different rows: the later commit conflicts when either update changes the predicate result.
 2. An index range scan and a concurrent insert into that interval: the scan transaction conflicts rather than committing a phantom-dependent write.
 3. A full-table predicate without an ordered access path: concurrent row insertion conflicts, proving conservative range collection.
-4. Two blind writes to distinct keys: both may commit; two SQL writes whose constraint checks overlap retain the constraint result.
+4. Two blind writes to distinct keys: both may commit; two mutations whose constraint checks overlap retain the constraint result.
 5. A transaction beyond the conflict-history horizon fails retryably and leaves no WAL record or visible version.
 6. Repeated runs with the same queue order, ranges, and writes produce the same commit/conflict decisions.
 

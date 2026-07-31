@@ -11,7 +11,7 @@ read/write, sync, truncate, existence checks, deletion, and atomic publication o
 (I/O-scheduler integration, fault injection, and WAL/LSM-specific open flags) are target
 contracts until the corresponding modules land; they are not implemented guarantees yet.
 
-VFS does **not** own the WAL format, page cache, transactions, SQL, wire protocol,
+VFS does **not** own the WAL format, page cache, transactions, Flow/IR, wire protocol,
 compression policy, or checkpoint semantics. It owns only how names within the data
 directory are resolved, how handles are managed, and which I/O primitives callers may use.
 
@@ -19,7 +19,7 @@ directory are resolved, how handles are managed, and which I/O primitives caller
 
 RunaDB's VFS is a **safety and ownership boundary**. It prevents storage modules from escaping an instance's data directory and isolates platform I/O without making replaceable filesystems a product feature. It provides positioned reads and writes, sync, size, truncation, close, deletion, and atomic publication. It does not provide page-level multi-process locks, shared-memory indexes, dynamic extensions, or implicit write buffering. The [I/O scheduling contract](io-scheduling.md) assigns future VFS work a category and capacity; VFS itself never owns unbounded queues or business callbacks.
 
-The boundary gives recovery a small, auditable file vocabulary. WAL, manifest, immutable-table, and page-file code can decide *what* bytes mean, but none of them can turn a malformed table name, a compaction bug, or a future SQL value into an arbitrary host path. They also cannot claim that a renamed file is durable without the required file and directory syncs. This keeps the fault question precise: a caller either receives a completed I/O operation under the data directory, or an error it must surface or recover from.
+The boundary gives recovery a small, auditable file vocabulary. WAL, manifest, immutable-table, and page-file code can decide *what* bytes mean, but none of them can turn a malformed table name, a compaction bug, or a future user value into an arbitrary host path. They also cannot claim that a renamed file is durable without the required file and directory syncs. This keeps the fault question precise: a caller either receives a completed I/O operation under the data directory, or an error it must surface or recover from.
 
 Atomic publication separates preparation from visibility. Compaction may write and validate a replacement SST or manifest while readers continue using the old name. Only the final replace makes the candidate visible, and recovery accepts only a complete final name. This is why VFS does not interpret records or make commit decisions: byte publication and logical publication are distinct steps owned by different modules.
 
@@ -120,7 +120,7 @@ In the target implementation, VFS reads, writes, and syncs should be registered 
 | Compaction writes, prefetch, and checkpoint preparation | `maintenance` |
 
 The VFS API may retain a synchronous shape or expose explicit asynchronous handles, but
-platform completion callbacks must not run SQL or commit logic directly. The current phase
+platform completion callbacks must not execute Requests or commit logic directly. The current phase
 may use blocking `std.Io` calls. When asynchronous scheduling is introduced, caller and VFS
 error models and cancellation semantics must remain intact: connection cancellation cannot
 undo an operation that has entered an irreversible WAL/manifest step.
@@ -137,7 +137,7 @@ Minimum regressions (partly covered by `vfs.zig` tests):
 
 Recommended metrics: open/close counts, sync count and latency, atomic publication
 successes/failures, rejected paths, and instance-lock conflicts. Do not use full paths or
-SQL text as labels.
+Request source as labels.
 
 ## Implementation Boundaries
 

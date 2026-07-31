@@ -11,10 +11,10 @@ service. It is one of two independently released RunaDB products; RunaDB Client
 provides the CLI, drivers, and developer tools.
 
 Runa Flow is RunaDB's native public request language. The implemented Wire
-Protocol v1.0 development slice accepts `from <relation> | emit { <field> }`
-as source or canonical Runa Query IR. It is read-only and uses an explicit,
-development-only binding to the current table catalog. SQL text is not an
-accepted protocol request.
+Protocol v2.0 development slice accepts `from <relation> | emit { <field> }`
+as source or canonical Runa Query IR. It also supports immutable Observation
+Evidence ingestion, metadata inspection, and bounded payload retrieval through
+the official RunaDB Client. SQL text is not an accepted protocol request.
 
 RunaDB Server and RunaDB Client communicate only through versioned protocol
 definitions and the public error model. See [product boundaries](docs/products.md)
@@ -27,11 +27,11 @@ RunaDB Server is under active development. The current implementation provides:
 - A native RunaDB Wire Protocol TCP listener and RunaDB Client CLI
 - Single-instance operation with a local data directory
 - The read-only Runa Flow relation projection slice
-- Canonical Runa Query IR format version `1`
+- Canonical Runa Query IR format version `2`
+- Immutable Observation Evidence payload storage and verified recovery
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
 - WAL checkpoint (compaction): bounded WAL size and bounded recovery time
-- Text primary keys, multi-statement scripts, and serial-style generated IDs
 
 The storage format and execution architecture are still evolving. Persistent
 LSM tables, secondary indexes, MVCC isolation, group commit, and the extended
@@ -90,27 +90,6 @@ from users
 | emit { id, email }
 ```
 
-The following former SQL examples are historical implementation context only:
-
-```sql
-CREATE TABLE IF NOT EXISTS users (
-  id BIGSERIAL PRIMARY KEY,
-  email VARCHAR(255) NOT NULL UNIQUE,
-  role VARCHAR(20) NOT NULL DEFAULT 'user',
-  balance DECIMAL(20, 8) NOT NULL DEFAULT 0,
-  deleted_at TIMESTAMPTZ
-);
-
-INSERT INTO users (email) VALUES ('alice@example.com');
-
-SELECT id, email, role
-FROM users
-WHERE email = 'alice@example.com' AND deleted_at IS NULL;
-
-UPDATE users SET role = 'admin' WHERE email = 'alice@example.com';
-DELETE FROM users WHERE id = 1;
-```
-
 ## Durability and recovery
 
 RunaDB writes changes to a write-ahead log before applying them to table state.
@@ -131,10 +110,9 @@ is being built in small modules with explicit ownership boundaries:
 
 | Directory | Responsibility |
 | --- | --- |
-| `src/net/` | TCP connections and RunaDB wire protocol (the current PG adapter is transitional) |
-| `src/sql/` | SQL subset tokenization, parsing, and execution |
+| `src/net/` | TCP connections and RunaDB Wire Protocol |
+| `src/flow/` | Runa Flow parsing, Runa Query IR, binding, and execution |
 | `src/storage/` | Tables, WAL, VFS, pager, values, and recovery |
-| `src/txn/` | Transaction boundaries and session state |
 | `src/util/` | Shared encoding and utility code |
 
 Read [ARCHITECTURE.md](docs/ARCHITECTURE.md) for target boundaries and
@@ -144,9 +122,8 @@ currently implemented components.
 ## Documentation
 
 - [Documentation standard](docs/DOCUMENTATION.md)
-- [Legacy SQL support matrix](docs/sql-subset.md)
-- [Runa Flow target design](docs/runa-flow.md)
-- [RunaDB Wire Protocol v1.0](docs/wire-protocol.md)
+- [Runa Flow and Runa Query IR](docs/runa-flow.md)
+- [RunaDB Wire Protocol v2.0](docs/wire-protocol.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Architecture decision records](docs/adr/)
 - [Domain terminology and product constraints](CONTEXT.md)

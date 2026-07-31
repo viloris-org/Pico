@@ -1,17 +1,17 @@
 # Runa Flow
 
-Status: Partially implemented development contract. RunaDB Wire Protocol v1.0
+Status: Partially implemented development contract. RunaDB Wire Protocol v2.0
 accepts the read-only relation slice below as Runa Flow source or Runa Query IR.
-SQL text is not an accepted protocol request. All other operation families
-remain target design until their semantic, policy, transaction, durability, and
-recovery contracts are delivered.
+Canonical IR also implements `observe` and `read_evidence_payload` for immutable
+Observation Evidence. SQL text is not an accepted protocol request. All other
+operation families remain target design.
 
 ## Purpose
 
 Runa Flow is RunaDB's future formal data language. It presents requests as a
 linear pipeline and binds them against a semantic model before any physical
-planning occurs. It replaces RunaDB SQL in the next incompatible RunaDB Wire
-Protocol major version.
+planning occurs. It replaced RunaDB SQL in RunaDB Wire Protocol v1; protocol v2
+adds the first World Continuum persistence slice.
 
 ## Pipeline Shape
 
@@ -21,6 +21,16 @@ scope only for its following stages. The implemented read-only grammar is:
 ```text
 from <relation>
 | emit { <field> [, <field> ...] }
+```
+
+`observation_evidence` is an implemented read-only World Continuum view with
+these fields: `evidence_id`, `object_id`, `modality`, `media_type`,
+`observed_at`, `origin`, `owner`, `payload_length`, and `payload_digest`.
+Reading metadata does not load payload bytes.
+
+```runa-flow
+from observation_evidence
+| emit { evidence_id, object_id, modality, media_type, payload_length }
 ```
 
 Other stages shown below are illustrative until their grammar and semantics are
@@ -76,11 +86,19 @@ versioned structure: operation graph, typed values, resolved semantic object
 identities, result shape, policy requirements, and model revision. It does not
 contain source formatting or natural-language text.
 
-The official RunaDB Client and SDKs will support sending source for compilation,
-sending validated IR where the protocol permits it, receiving a canonical
-explanation, and receiving explicit validation errors. Cache keys, query
-versioning, and provenance references use the IR plus model revision rather
-than source text.
+The official Zig RunaDB Client sends source or validated IR and implements
+bounded Observation Evidence upload and payload retrieval. Canonical IR format
+2 uses an explicit operation tag for relation `emit`, `observe`, and
+`read_evidence_payload`; an older IR version is rejected rather than
+reinterpreted.
+
+`observe` binds a completed protocol attachment to an `object_id`, declared
+modality, normalized media type, observation time, and origin. The Server sets
+the owner from the Connection context; the development authentication context
+currently records `development`. Evidence is immutable and append-only. The
+Server validates declared metadata and payload integrity but does not infer the
+media type, transcode content, extract features, create embeddings, or execute
+models.
 
 ## Natural-Language Requests
 
@@ -97,10 +115,10 @@ explicit approval policy; defining that policy is separate work.
 
 ## Compatibility
 
-No SQL compatibility layer is part of Runa Flow. The current SQL support
-matrix remains a record of the legacy implementation only. The new protocol
-major, IR versioning rules, migration policy, and formal grammar must be
-published before Runa Flow becomes a supported public capability.
+No SQL compatibility layer is part of Runa Flow. The retired SQL parser,
+executor, and protocol endpoints are not built. The v2 protocol and IR format
+remain development contracts until the formal grammar, semantic model, and
+compatibility policy are published.
 
 Until then, Runa Flow source, Runa Query IR, semantic-model layouts, and
 development storage formats may change destructively. An incompatible input or
@@ -111,3 +129,14 @@ The current implementation uses semantic-model revision `0`, an explicit
 development-only binding from relation names to the existing table catalog. It
 has no persisted semantic-model layout and must not be treated as a stable
 World Continuum binding. An unknown relation or field fails explicitly.
+Direct Runa Query IR input is also checked for the initial canonical shape: a
+source-valid identifier is required for the relation and every emitted field,
+and `emit` must contain at least one field. Malformed IR receives the Wire
+Protocol's `RF1003` rejection; it is never normalized into a different request.
+
+Observation Evidence payload files and WAL metadata use explicit development
+format versions. Recovery validates every committed payload reference, length,
+envelope checksum, and BLAKE3-256 digest. Missing, corrupt, or unsupported
+payloads reject startup. A checkpoint preserves evidence metadata and is not a
+user backup. Payload deletion, retention, encryption, deduplication, embedding,
+similarity search, and model inference are not supported.

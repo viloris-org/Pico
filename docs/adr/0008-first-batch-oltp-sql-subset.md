@@ -1,6 +1,6 @@
 # First-Batch OLTP SQL Subset
 
-**Status: Accepted**
+**Status: Superseded by ADR-0017; the SQL implementation has been removed.**
 **Date: 2026-07-28**
 **Owners and stakeholders: RunaDB maintainers**
 

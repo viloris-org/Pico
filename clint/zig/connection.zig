@@ -9,12 +9,15 @@ const codec = @import("codec.zig");
 
 pub const Connection = struct {
     allocator: Allocator,
+    io: Io,
     stream: Io.net.Stream,
     read_buf: [16 * 1024]u8,
     write_buf: [4 * 1024]u8,
     reader: Io.net.Stream.Reader,
     writer: Io.net.Stream.Writer,
     server_version: []const u8,
+    next_upload_id: u64 = 1,
+    bound_address: usize,
 
     pub fn connect(allocator: Allocator, io: Io, host: []const u8, port: u16) !Connection {
         const addr = try Io.net.IpAddress.parse(host, port);
@@ -23,16 +26,20 @@ pub const Connection = struct {
 
         var self = Connection{
             .allocator = allocator,
+            .io = io,
             .stream = stream,
             .read_buf = undefined,
             .write_buf = undefined,
             .reader = undefined,
             .writer = undefined,
             .server_version = "",
+            .next_upload_id = 1,
+            .bound_address = 0,
         };
 
         self.reader = stream.reader(io, &self.read_buf);
         self.writer = stream.writer(io, &self.write_buf);
+        self.bound_address = @intFromPtr(&self);
 
         // Send HELLO
         {
@@ -68,6 +75,7 @@ pub const Connection = struct {
     /// Submit Runa Flow source. Returns a result iterator.
     /// The caller must consume or drain the result before issuing another statement.
     pub fn executeFlow(self: *Connection, arena: Allocator, source: []const u8) !QueryResult {
+        self.ensureBound();
         _ = arena;
         // Write the query message
         {
@@ -89,6 +97,7 @@ pub const Connection = struct {
 
     /// Submit canonical Runa Query IR with its explicit format version.
     pub fn executeIr(self: *Connection, ir_format_version: u16, bytes: []const u8) !QueryResult {
+        self.ensureBound();
         if (bytes.len > 64 * 1024) return error.MessageTooLarge;
         var payload_buf: [2 + 64 * 1024]u8 = undefined;
         std.mem.writeInt(u16, payload_buf[0..2], ir_format_version, .big);
@@ -98,8 +107,94 @@ pub const Connection = struct {
         return .{ .allocator = self.allocator, .reader = &self.reader.interface, .done = false };
     }
 
+    /// Stage and commit immutable Observation Evidence through canonical IR.
+    pub fn observe(self: *Connection, object_id: []const u8, modality: proto.Modality, media_type: []const u8, observed_at: []const u8, origin: []const u8, payload: []const u8) !QueryResult {
+        self.ensureBound();
+        if (payload.len > proto.MAX_ATTACHMENT_LENGTH) return error.MessageTooLarge;
+        const upload_id = self.next_upload_id;
+        self.next_upload_id += 1;
+        var payload_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
+        std.crypto.hash.Blake3.hash(payload, &payload_digest, .{});
+
+        var begin: [8 + 8 + proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
+        std.mem.writeInt(u64, begin[0..8], upload_id, .big);
+        std.mem.writeInt(u64, begin[8..16], payload.len, .big);
+        @memcpy(begin[16..], &payload_digest);
+        try codec.writeMessage(&self.writer.interface, .attachment_begin, &begin);
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            const length = @min(proto.MAX_ATTACHMENT_CHUNK_LENGTH, payload.len - offset);
+            var chunk: [8 + proto.MAX_ATTACHMENT_CHUNK_LENGTH]u8 = undefined;
+            std.mem.writeInt(u64, chunk[0..8], upload_id, .big);
+            @memcpy(chunk[8..][0..length], payload[offset .. offset + length]);
+            try codec.writeMessage(&self.writer.interface, .attachment_chunk, chunk[0 .. 8 + length]);
+            offset += length;
+        }
+        var finish: [8]u8 = undefined;
+        std.mem.writeInt(u64, &finish, upload_id, .big);
+        try codec.writeMessage(&self.writer.interface, .attachment_finish, &finish);
+
+        const ir_bytes = try buildObserveIr(self.allocator, upload_id, object_id, modality, media_type, observed_at, origin);
+        defer self.allocator.free(ir_bytes);
+        var wrapped = try self.allocator.alloc(u8, 2 + ir_bytes.len);
+        defer self.allocator.free(wrapped);
+        std.mem.writeInt(u16, wrapped[0..2], proto.IR_FORMAT_VERSION, .big);
+        @memcpy(wrapped[2..], ir_bytes);
+        try codec.writeMessage(&self.writer.interface, .flow_ir, wrapped);
+        try self.writer.interface.flush();
+        return .{ .allocator = self.allocator, .reader = &self.reader.interface, .done = false };
+    }
+
+    /// Read and verify one committed evidence payload.
+    pub fn readEvidencePayload(self: *Connection, gpa: Allocator, evidence_id: u64) ![]u8 {
+        self.ensureBound();
+        const ir_bytes = try buildReadPayloadIr(gpa, evidence_id);
+        defer gpa.free(ir_bytes);
+        var wrapped = try gpa.alloc(u8, 2 + ir_bytes.len);
+        defer gpa.free(wrapped);
+        std.mem.writeInt(u16, wrapped[0..2], proto.IR_FORMAT_VERSION, .big);
+        @memcpy(wrapped[2..], ir_bytes);
+        try codec.writeMessage(&self.writer.interface, .flow_ir, wrapped);
+        try self.writer.interface.flush();
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const first = try codec.readMessage(arena.allocator(), &self.reader.interface);
+        const begin = switch (first) {
+            .payload_begin => |item| item,
+            .server_error => return error.ServerRejected,
+            else => return error.Protocol,
+        };
+        if (begin.evidence_id != evidence_id or begin.payload_length > proto.MAX_ATTACHMENT_LENGTH) return error.Protocol;
+        const result = try gpa.alloc(u8, @intCast(begin.payload_length));
+        errdefer gpa.free(result);
+        var offset: usize = 0;
+        while (true) {
+            const message = try codec.readMessage(arena.allocator(), &self.reader.interface);
+            switch (message) {
+                .payload_chunk => |chunk| {
+                    if (chunk.evidence_id != evidence_id or chunk.bytes.len > result.len - offset) return error.Protocol;
+                    @memcpy(result[offset..][0..chunk.bytes.len], chunk.bytes);
+                    offset += chunk.bytes.len;
+                },
+                .payload_finish => |finish| {
+                    if (finish.evidence_id != evidence_id or offset != result.len) return error.Protocol;
+                    var actual: [proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
+                    std.crypto.hash.Blake3.hash(result, &actual, .{});
+                    if (!std.mem.eql(u8, &actual, begin.payload_digest)) return error.Protocol;
+                    break;
+                },
+                else => return error.Protocol,
+            }
+        }
+        const complete = try codec.readMessage(arena.allocator(), &self.reader.interface);
+        if (complete != .command_complete) return error.Protocol;
+        return result;
+    }
+
     /// Close the connection gracefully.
     pub fn close(self: *Connection, io: Io) void {
+        self.ensureBound();
         codec.writeMessage(&self.writer.interface, .goodbye, "") catch {};
         self.writer.interface.flush() catch {};
         self.stream.close(io);
@@ -111,7 +206,52 @@ pub const Connection = struct {
         self.allocator.free(self.server_version);
         self.server_version = "";
     }
+
+    fn ensureBound(self: *Connection) void {
+        const address = @intFromPtr(self);
+        if (self.bound_address == address) return;
+        self.reader = self.stream.reader(self.io, &self.read_buf);
+        self.writer = self.stream.writer(self.io, &self.write_buf);
+        self.bound_address = address;
+    }
 };
+
+fn buildObserveIr(gpa: Allocator, upload_id: u64, object_id: []const u8, modality: proto.Modality, media_type: []const u8, observed_at: []const u8, origin: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(gpa);
+    try appendInt(&output, gpa, u16, proto.IR_FORMAT_VERSION);
+    try appendInt(&output, gpa, u64, 0);
+    try output.append(gpa, 2);
+    try appendInt(&output, gpa, u64, upload_id);
+    try appendIrString(&output, gpa, object_id);
+    try output.append(gpa, @intFromEnum(modality));
+    try appendIrString(&output, gpa, media_type);
+    try appendIrString(&output, gpa, observed_at);
+    try appendIrString(&output, gpa, origin);
+    return output.toOwnedSlice(gpa);
+}
+
+fn buildReadPayloadIr(gpa: Allocator, evidence_id: u64) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(gpa);
+    try appendInt(&output, gpa, u16, proto.IR_FORMAT_VERSION);
+    try appendInt(&output, gpa, u64, 0);
+    try output.append(gpa, 3);
+    try appendInt(&output, gpa, u64, evidence_id);
+    return output.toOwnedSlice(gpa);
+}
+
+fn appendInt(output: *std.ArrayList(u8), gpa: Allocator, comptime T: type, value: T) !void {
+    var buffer: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &buffer, value, .big);
+    try output.appendSlice(gpa, &buffer);
+}
+
+fn appendIrString(output: *std.ArrayList(u8), gpa: Allocator, value: []const u8) !void {
+    if (value.len > std.math.maxInt(u16)) return error.StringTooLarge;
+    try appendInt(output, gpa, u16, @intCast(value.len));
+    try output.appendSlice(gpa, value);
+}
 
 /// Iterator over query result messages.
 pub const QueryResult = struct {

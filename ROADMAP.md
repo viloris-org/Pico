@@ -12,9 +12,8 @@ multiple data models, multimodal values, AI-assisted execution, continuum-scale
 deployment, long-lived history, privacy, and sustainable operation. This
 roadmap begins with the recoverable single-instance OLTP foundation, then moves
 the public request boundary to Runa Flow, Runa Query IR, and a semantic model as
-defined by ADR-0017. The current RunaDB SQL path and RunaDB Wire Protocol v0.1
-are legacy implementation surfaces until the next incompatible protocol major
-version is delivered. RunaDB Client and RunaDB Server communicate only through
+defined by ADR-0017. RunaDB Wire Protocol v2 has removed the legacy SQL and
+PostgreSQL endpoints. RunaDB Client and RunaDB Server communicate only through
 versioned protocol definitions and the public error model. PostgreSQL
 compatibility and treating a checkpoint as a backup remain out of scope;
 distributed, analytical, and other future capabilities require dedicated ADRs
@@ -32,16 +31,15 @@ capabilities exist but are not collectively a release claim:
 
 | Area | Current baseline | Authoritative detail |
 | --- | --- | --- |
-| Legacy RunaDB SQL | Core table definition and DML, predicates, ordering, limits, and explicit transaction syntax; no new SQL syntax | [SQL subset support matrix](docs/sql-subset.md) |
+| Runa Flow | Read-only relation projection from source or canonical Runa Query IR | [Runa Flow](docs/runa-flow.md) |
 | Persistence | WAL-backed table changes, CRC32 validation, and recovery of a valid committed prefix | [WAL and crash recovery](docs/architecture/wal-and-recovery.md) |
-| Legacy native client path | RunaDB Wire Protocol v0.1 over sequential TCP and a RunaDB Zig client integration suite | [RunaDB Wire Protocol v0.1](docs/wire-protocol.md) |
-| PostgreSQL adapter | Transitional development adapter only; not a product compatibility commitment | [ADR-0009](docs/adr/0009-runadb-native-ecosystem.md) |
+| Native client path | RunaDB Wire Protocol v2 over sequential TCP and a RunaDB Zig client integration suite | [RunaDB Wire Protocol v2](docs/wire-protocol.md) |
 | Target architecture | LSM storage, MVCC, single-writer commits, group commit, VFS, Pager, execution programs, and asynchronous runtime boundaries are designed but not all implemented | [Architecture](docs/ARCHITECTURE.md) |
-| Target public contract | Runa Flow, Runa Query IR, semantic model, and the next incompatible RunaDB Wire Protocol major version | [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md) |
+| Public development contract | Runa Flow, Runa Query IR, semantic model revision `0`, and RunaDB Wire Protocol v2 | [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md) |
 | Accepted later work | Interactive RunaDB Client, Ed25519 authentication and permissions, and QUIC transport | [ADRs](docs/adr/) |
 
-The [README](README.md), legacy SQL support matrix, and legacy protocol
-specification own current implementation claims. This document intentionally
+The [README](README.md), Runa Flow reference, and Wire Protocol specification
+own current implementation claims. This document intentionally
 does not duplicate them.
 
 ## Long-Horizon Direction
@@ -65,7 +63,7 @@ format migration, observability, recovery, and evidence requirements.
 - Keep the write path WAL-first. The default durability level must confirm
   persistence before a successful `COMMIT`; relaxed durability must remain
   explicit and non-default.
-- Reject unsupported legacy RunaDB SQL, Runa Flow, Runa Query IR, and protocol
+- Reject unsupported Runa Flow, Runa Query IR, and protocol
   input clearly. Never silently accept a partially implemented semantic.
 - Version every persistent or public format change and add compatibility,
   malformed-input, and recovery coverage before publishing support.
@@ -79,29 +77,14 @@ format migration, observability, recovery, and evidence requirements.
 
 ## Roadmap
 
-### Phase 0: Preserve the Legacy Baseline
+### Phase 0: Retire The Legacy SQL Baseline
 
-**Goal:** Keep the existing SQL and protocol v0.1 implementation dependable as
-a development baseline while its replacement is designed and delivered.
+**Status:** Complete. The SQL parser/executor, PostgreSQL adapter, SQL-specific
+client APIs, and protocol v0.1 endpoint have been removed.
 
-- Complete the legacy RunaDB Wire Protocol v0.1 error model, version-negotiation
-  behavior, connection lifecycle, message-size handling, and malformed-frame
-  tests.
-- Keep the legacy SQL support matrix exact: document every supported statement,
-  type, constraint, error, and explicit rejection with its regression location.
-- Expand RunaDB Client-to-Server contract tests for successful statements,
-  server errors, connection closure, unknown write outcomes, and compatibility
-  across independently built products.
-- Define a release-oriented observability baseline for startup recovery, WAL
-  size and frames, write-path latency, connection count, and durability level.
-- Classify the PostgreSQL adapter as migration-only in code, tests, examples,
-  and release material; remove it from RunaDB product acceptance criteria.
-
-**Exit criteria:** Legacy protocol v0.1 and RunaDB SQL documentation agree with
-tests; the official RunaDB Client exercises the legacy contract; malformed input
-cannot change shared state; and a recovery regression covers the advertised WAL
-behavior. These criteria do not make the legacy contract the future public
-boundary.
+**Exit evidence:** The build graph contains no SQL or PostgreSQL protocol
+module; Wire Protocol v2 rejects old peers by major version; current public
+documentation describes only Flow/IR request execution.
 
 ### Phase 1: Runa Flow Contract and Protocol Major
 
@@ -120,7 +103,7 @@ capabilities or language syntax as deliverable work.
 - Define the source-to-IR explanation boundary and the validation boundary for
   natural-language requests. Generated requests remain advisory until validated
   Runa Query IR is accepted for execution.
-- Stop expanding RunaDB SQL and prevent a silent SQL-to-Flow translation path.
+- Keep SQL absent and prevent a silent SQL-to-Flow translation path.
 
 **Exit criteria:** The target language, IR, semantic model, error model, and
 protocol-major negotiation are published as coherent drafts with deterministic
@@ -201,7 +184,7 @@ recoverable LSM structures while preserving snapshot visibility.
 - Implement MemTables, sorted-string tables, indexes, manifests, and point and
   range read paths behind the storage ownership boundary.
 - Add flush and compaction scheduling with explicit backpressure and resource
-  limits. Compaction must not run SQL execution or commit logic directly.
+  limits. Compaction must not run Request execution or commit logic directly.
 - Retain versions until no active snapshot can observe them; delay file
   reclamation until manifest and reader-safety conditions hold.
 - Implement secondary indexes only after the table, catalog, MVCC, and recovery
@@ -221,8 +204,7 @@ machine context, and durability level.
 boundaries or weakening commit correctness.
 
 - Introduce execution programs incrementally, preserving golden result and
-  error parity with validated Runa Query IR execution. Keep legacy SQL coverage
-  separate until the legacy path is removed.
+  error parity with validated Runa Query IR execution.
 - Add streaming result production, cancellation points, result backpressure,
   and resource accounting at execution-program boundaries.
 - Implement the runtime I/O scheduler, connection lifecycle, and bounded work
@@ -310,7 +292,7 @@ Every phase and release must maintain these conditions:
 
 | Gate | Required evidence |
 | --- | --- |
-| Public contract | Versioned protocol, Runa Flow, Runa Query IR, semantic-model, or legacy SQL support-matrix update; explicit errors; and official RunaDB Client end-to-end coverage |
+| Public contract | Versioned protocol, Runa Flow, Runa Query IR, or semantic-model update; explicit errors; and official RunaDB Client end-to-end coverage |
 | Durable commit | WAL-first ordering, selected durability-level behavior, interruption testing, and restart recovery of only the confirmed prefix |
 | Persistent format | Versioning, malformed/corrupt-data rejection, I/O failure coverage, and recovery regression |
 | Concurrency | Commit order, snapshot visibility, conflict/cancellation behavior, bounded queues, and contention tests |

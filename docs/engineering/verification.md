@@ -9,7 +9,7 @@ For nontrivial work, record this in the task or PR before production code:
 
 ```text
 IMPLEMENTATION PLAN
-  surface:       RunaDB SQL | RunaDB Wire Protocol | server internal | RunaDB Client | RunaDB SDK
+  surface:       Runa Flow/IR | RunaDB Wire Protocol | server internal | RunaDB Client | RunaDB SDK
   user result:   <new behavior or explicit rejection>
   owner:         <module that owns new mutable state>
   invariants:    <success, failure, crash, contention behavior>
@@ -28,7 +28,7 @@ backup.
 | Change class | Required evidence before `Verified` |
 | --- | --- |
 | Utility or data structure | Deterministic normal, error, and relevant resource-limit tests |
-| RunaDB SQL | Parser, binding/execution, rejection, stable error mapping, support matrix |
+| Runa Flow/IR | Source parser, IR validation, binding/execution, rejection, stable error mapping, language reference |
 | Wire Protocol | Codec, negotiation, malformed frame, server behavior, Client end-to-end |
 | Client or SDK | Public lifecycle/result/error tests and Server compatibility suite over the protocol |
 | Transaction or contention | Commit/rollback, failed state, visibility, conflict, cancellation, bounded queue as applicable |
@@ -62,7 +62,7 @@ Every material change ends with:
 
 ```text
 IMPLEMENTATION STATUS
-  surface:      <RunaDB SQL / RunaDB Wire Protocol / internal / RunaDB Client / RunaDB SDK>
+  surface:      <Runa Flow/IR / RunaDB Wire Protocol / internal / RunaDB Client / RunaDB SDK>
   state:        Draft | Implemented | Verified | Blocked
   owner:        <module that owns the state>
   evidence:     <test files and commands actually run>
@@ -73,8 +73,8 @@ IMPLEMENTATION STATUS
 
 ## Documentation And Review
 
-Update the owning reference with a behavior change: SQL support updates
-`docs/sql-subset.md`; Wire Protocol updates `clint/proto/`, compatibility
+Update the owning reference with a behavior change: Flow/IR support updates
+`docs/runa-flow.md`; Wire Protocol updates `clint/proto/`, compatibility
 documentation, and examples; SDK work updates package documentation,
 compatibility matrix, examples, and integration instructions; product language
 or boundaries update `CONTEXT.md`, products documentation, and ADRs; storage or
@@ -86,4 +86,3 @@ ownership and dependency direction, public-boundary integrity, relevant error
 and resource behaviors, WAL-first durable visibility, recovery distinction
 between truncated tails and corruption, documentation status accuracy, actual
 full-build results, and bounded TODO/PERF closure conditions.
-

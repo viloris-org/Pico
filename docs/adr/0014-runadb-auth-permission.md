@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted target design. ADR-0017 supersedes the SQL-operation permission and
+SQL administration portions; future permissions bind Runa Flow/IR operations.
 
 ## Context
 

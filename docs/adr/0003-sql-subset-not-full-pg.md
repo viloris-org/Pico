@@ -1,5 +1,8 @@
 # Use an OLTP SQL Subset; Do Not Promise the Full PostgreSQL Dialect
 
+**Status: Superseded by ADR-0017.** The described parser, executor, protocol,
+and support matrix have been removed.
+
 RunaDB’s external offering is **the PostgreSQL wire protocol plus a common OLTP SQL subset**. The parser and executor implement only the promised statements and types; all others fail explicitly.
 
 The intended v1 capabilities include multiple tables, primary and secondary indexes, `INSERT` / `UPDATE` / `DELETE` / `SELECT` (including basic `WHERE`), transaction blocks, and a limited type set. Stored procedures, triggers, extensions, a full optimizer, and analytical syntax are outside the initial scope.
