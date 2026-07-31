@@ -171,6 +171,9 @@ envelope checksum, and BLAKE3-256 digest. Missing, corrupt, or unsupported
 payloads reject startup. A checkpoint preserves evidence metadata and is not a
 user backup. Payload deletion, retention, encryption, deduplication, embedding
 generation, similarity search as a Runa Flow operation, and model inference
-are not supported. The server library accepts externally supplied embeddings in
-internal `vector` table columns and exposes bounded `runadb.vector` ranking;
-neither is available through the wire protocol.
+are not supported. The embedding and RAG (vector retrieval) primitives are
+deprecated and permanently frozen (see ADR-0020); the server library retains
+internal `vector` table columns and bounded `runadb.vector` ranking as frozen
+internal state only. Neither is available through the wire protocol. Future
+retrieval and memory needs are designed as **MEMO (Memory as a Model)** per
+ADR-0022.

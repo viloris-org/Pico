@@ -33,8 +33,11 @@ RunaDB will evolve toward the following enduring properties:
    gain explicit, versioned representations for additional data models and
    multimodal values. Flexible modeling must remain semantically explicit;
    automatic adaptation must not silently alter meaning or constraints.
-2. **AI-native operation with verifiable boundaries.** Vector retrieval, graph
-   reasoning, retrieval-augmented generation, and in-database inference may
+2. **AI-native operation with verifiable boundaries.** Embedding, vector
+   retrieval, and retrieval-augmented generation are permanently frozen and
+   deprecated (see ADR-0020). Future memory and retrieval capabilities are
+   designed as **MEMO (Memory as a Model)** per ADR-0022. Graph
+   reasoning and in-database inference may
    run near governed data. Neural results may assist ranking or interpretation;
    symbolic predicates, authorization, transactions, provenance, and declared
    constraints remain authoritative. Natural-language interfaces are advisory

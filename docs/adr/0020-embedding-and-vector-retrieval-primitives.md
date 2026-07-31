@@ -2,8 +2,19 @@
 
 ## Status
 
-Implemented and tested as an internal/library capability with WAL v4 recovery.
-This does not add a Runa Flow or RunaDB Wire Protocol operation.
+**Deprecated and permanently frozen.** The embedding and RAG (vector retrieval)
+primitives in this ADR are explicitly rejected as a public product capability.
+They are no longer a candidate surface for Runa Flow, Runa Query IR, or the
+RunaDB Wire Protocol.
+
+The internal/library slice remains implemented and tested with WAL v4
+recovery, but only as frozen internal state: it is not extended, not exposed
+through the wire protocol, and not documented as supported.
+
+Future retrieval and memory needs are designed as **MEMO (Memory as a
+Model)** in ADR-0022. MEMO must define its Representation Chart,
+model/provenance metadata, WAL and recovery format, resource limits, and
+protocol version before it becomes a public query capability.
 
 ## Decision
 
@@ -17,10 +28,12 @@ scores rank first). Ties are ordered by row index.
 The server does not infer embeddings, execute a model, or build an on-disk
 vector index in this slice. Observation Evidence remains
 the factual input; an embedding is a derived representation supplied by an
-external component. A future persisted representation and Flow/IR operation
-must define its Representation Chart, model/provenance metadata, WAL and
-recovery format, resource limits, and protocol version before becoming a public
-query capability.
+external component. No future persisted representation, Flow/IR operation, or
+wire-protocol surface will be built on these primitives. Any retrieval or
+memory capability is **MEMO (Memory as a Model)** per ADR-0022, which must
+define its Representation Chart, model/provenance metadata, WAL and recovery
+format, resource limits, and protocol version before becoming a public query
+capability.
 
 ## Evidence
 

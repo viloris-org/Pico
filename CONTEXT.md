@@ -246,6 +246,40 @@ Execution that combines learned interpretation with symbolic predicates,
 constraints, or reasoning. Symbolic results remain the source of truth for
 precise logic and access decisions.
 
+**MEMO (Memory as a Model)**:
+RunaDB's target memory and retrieval capability, per ADR-0022. Knowledge from
+a target corpus is encoded into a compact **Memory model**; a frozen reasoning
+model (**Executive model**) retrieves from it through a structured multi-turn
+protocol. A **reflection** is a self-contained, corpus-derived question-answer
+pair used to train the Memory model. MEMO replaces the frozen embedding and
+RAG primitives of ADR-0020.
+_Avoid_: Retrieval-augmented generation, embedding index, vector search as the
+current or future public retrieval capability
+
+**Reflection**:
+A self-contained, corpus-derived question-answer pair that exposes underlying
+corpus knowledge without requiring access to the source document. Reflections
+are derived training representations, not Observation Evidence.
+_Avoid_: Ground truth, factual record
+
+**Memory Model**:
+The compact model trained to answer from its parameters alone, encoding
+knowledge from a target corpus as a learned State Field. Its Representation
+Chart declares the training corpus, Generator model lineage, coverage,
+uncertainty, and compatibility rules.
+_Avoid_: Vector index, retrieval cache, embedding store
+
+**Executive Model**:
+The frozen reasoning model that answers user queries by querying the Memory
+model through the MEMO retrieval protocol. It is treated as a black box;
+RunaDB does not access its weights, gradients, or output logits.
+_Avoid_: Hosted model, in-process inference on the critical path
+
+**Generator Model**:
+The external LLM used offline to distill a target corpus into a reflection QA
+dataset for Memory model training. It may be smaller than the Executive model.
+_Avoid_: Retrieval model, ranker, in-database inference
+
 **Consistency Level**:
 The declared visibility and ordering guarantees for reads and writes across an
 identified scope. Strong consistency, eventual consistency, and any intermediate
