@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const pico = @import("pico");
+const runadb = @import("runadb");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -9,16 +9,16 @@ pub fn main(init: std.process.Init) !void {
 
     const raw_args = try init.minimal.args.toSlice(arena);
 
-    var cfg: pico.server.Config = .{};
+    var cfg: runadb.server.Config = .{};
     var i: usize = 1; // skip argv0
     while (i < raw_args.len) : (i += 1) {
         const a = raw_args[i];
         if (std.mem.eql(u8, a, "--port") and i + 1 < raw_args.len) {
             i += 1;
             cfg.port = try std.fmt.parseInt(u16, raw_args[i], 10);
-        } else if (std.mem.eql(u8, a, "--pico-port") and i + 1 < raw_args.len) {
+        } else if (std.mem.eql(u8, a, "--runa-port") and i + 1 < raw_args.len) {
             i += 1;
-            cfg.pico_port = try std.fmt.parseInt(u16, raw_args[i], 10);
+            cfg.runa_port = try std.fmt.parseInt(u16, raw_args[i], 10);
         } else if (std.mem.eql(u8, a, "--data-dir") and i + 1 < raw_args.len) {
             i += 1;
             cfg.data_dir = raw_args[i];
@@ -37,19 +37,19 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    try pico.server.run(gpa, io, cfg);
+    try runadb.server.run(gpa, io, cfg);
 }
 
 fn printUsage() !void {
     std.debug.print(
-        \\Pico — lightweight networked OLTP database
+        \\RunaDB — lightweight networked OLTP database
         \\
-        \\Usage: pico [options]
+        \\Usage: runadb [options]
         \\
         \\Options:
         \\  --host <addr>       Listen address (default 127.0.0.1)
         \\  --port <port>       PG protocol port (default 5433)
-        \\  --pico-port <port>  Native Pico protocol port (default 5434, 0=disable)
+        \\  --runa-port <port>    Native RunaDB protocol port (default 5434, 0=disable)
         \\  --data-dir <path>   Data directory (default ./data)
         \\  --no-sync           Disable WAL fsync (dev only)
         \\  -h, --help          Show help

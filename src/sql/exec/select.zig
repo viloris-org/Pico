@@ -27,7 +27,7 @@ fn valueToText(gpa: Allocator, arena_data: *std.ArrayList([]u8), v: value.Value)
 }
 
 /// Compare values using SQL ordering for the scalar types currently stored by
-/// Pico. ASC places NULL last, matching PostgreSQL's default; DESC reverses it.
+/// RunaDB. ASC places NULL last, matching PostgreSQL's default; DESC reverses it.
 fn compareOrderValues(a: value.Value, b: value.Value, descending: bool) std.math.Order {
     const base: std.math.Order = switch (a) {
         .null => switch (b) {

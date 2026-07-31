@@ -1,4 +1,4 @@
-//! Pico library root — re-exports subsystem modules.
+//! RunaDB library root — re-exports subsystem modules.
 
 pub const util = @import("util/bytes.zig");
 pub const value = @import("storage/value.zig");

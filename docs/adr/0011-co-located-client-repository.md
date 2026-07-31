@@ -1,4 +1,4 @@
-# Co-Locate Pico Client and Pico Server in One Repository
+# Co-Locate RunaDB Client and RunaDB Server in One Repository
 
 ## Status
 
@@ -6,7 +6,7 @@ Accepted (supersedes ADR-0010 §“Separate repositories” layout decision)
 
 ## Context
 
-ADR-0010 establishes Pico Client and Pico Server as two **independent products** with versioned Pico protocol and Pico SQL contracts, separate build artifacts, versions, and release lifecycles. This ADR **retains that product-boundary principle**.
+ADR-0010 establishes RunaDB Client and RunaDB Server as two **independent products** with versioned RunaDB protocol and RunaDB SQL contracts, separate build artifacts, versions, and release lifecycles. This ADR **retains that product-boundary principle**.
 
 Separate repositories nevertheless create maintenance costs:
 
@@ -16,9 +16,9 @@ Separate repositories nevertheless create maintenance costs:
 
 ## Decision
 
-Store Pico Client source **inside the Pico Server repository** under `clint/`, while retaining these boundaries:
+Store RunaDB Client source **inside the RunaDB Server repository** under `clint/`, while retaining these boundaries:
 
-- **Independent artifacts**: `pico` and `pico-cli` are separate binaries with no runtime-link dependency.
+- **Independent artifacts**: `runadb` and `runa-cli` are separate binaries with no runtime-link dependency.
 - **Independent versions**: server and client may declare separate versions in the same repository.
 - **Protocol contract**: both sides interact only through shared messages defined in `clint/proto/`; neither side calls the other’s internal code.
 - **Independent releases**: server and client can be chosen, released, and rolled back independently.
@@ -42,4 +42,4 @@ Store Pico Client source **inside the Pico Server repository** under `clint/`, w
 
 1. Create `clint/proto/`, `clint/zig/`, and `clint/main.zig`.
 2. Use the minimum CLI for end-to-end tests covering connection, one statement, transactions, and errors.
-3. Remove the PostgreSQL migration adapter and its documentation/test dependencies after core Pico Client workflows are covered.
+3. Remove the PostgreSQL migration adapter and its documentation/test dependencies after core RunaDB Client workflows are covered.

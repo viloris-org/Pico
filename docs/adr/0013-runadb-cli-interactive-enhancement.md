@@ -1,4 +1,4 @@
-# Pico CLI Interactive Experience Enhancement
+# RunaDB CLI Interactive Experience Enhancement
 
 ## Status
 
@@ -6,11 +6,11 @@ Accepted
 
 ## Context
 
-The current `pico-cli` (`clint/main.zig`, about 170 lines) is a minimal REPL with one mode: it reads all stdin, has no line editor, persistent history, Tab completion, multiline statements, color, or useful meta-commands beyond `\q` and `\h`. Under ADR-0009, the official CLI is the primary user entry point, so it must meet modern database-tool expectations without depending on readline or curses.
+The current `runa-cli` (`clint/main.zig`, about 170 lines) is a minimal REPL with one mode: it reads all stdin, has no line editor, persistent history, Tab completion, multiline statements, color, or useful meta-commands beyond `\q` and `\h`. Under ADR-0009, the official CLI is the primary user entry point, so it must meet modern database-tool expectations without depending on readline or curses.
 
 ## Decision
 
-Refactor `pico-cli` into a multi-command binary with a feature-rich interactive experience.
+Refactor `runa-cli` into a multi-command binary with a feature-rich interactive experience.
 
 ### 1. Interactive Line Editing
 
@@ -18,11 +18,11 @@ Use terminal raw mode for left/right arrows, Home/End, Backspace/Delete, Ctrl+U,
 
 ### 2. Persistent History
 
-Use `~/.pico_history` or `$PICO_HISTFILE`, retain 1000 entries by default, deduplicate consecutive duplicates, and preserve input casing. Up/down arrows browse history.
+Use `~/.runadb_history` or `$RUNADB_HISTFILE`, retain 1000 entries by default, deduplicate consecutive duplicates, and preserve input casing. Up/down arrows browse history.
 
 ### 3. Tab Completion
 
-Complete SQL keywords, table names from `PICO TABLES` or a future catalog query, and `/` meta-commands. Context-sensitive column completion is a future enhancement.
+Complete SQL keywords, table names from `RUNADB TABLES` or a future catalog query, and `/` meta-commands. Context-sensitive column completion is a future enhancement.
 
 ### 4. Colored Output
 
@@ -30,7 +30,7 @@ Enable colors by default, with `--no-color` and `\set COLOR off`. Use blue/cyan 
 
 ### 5. Multiline Statements
 
-Use `;` as the terminator. Enter continues incomplete statements with `pico->`; pasted blocks end at the semicolon. Ctrl+C cancels the current input.
+Use `;` as the terminator. Enter continues incomplete statements with `runadb->`; pasted blocks end at the semicolon. Ctrl+C cancels the current input.
 
 ### 6. Meta-Commands
 
@@ -49,11 +49,11 @@ Use `;` as the terminator. Enter continues incomplete statements with `pico->`; 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HISTFILE` | `~/.pico_history` | History path |
+| `HISTFILE` | `~/.runadb_history` | History path |
 | `HISTSIZE` | `1000` | History length |
 | `COLOR` | `on` | Colored output |
-| `PROMPT1` | `"pico> "` | Primary prompt |
-| `PROMPT2` | `"pico-> "` | Continuation prompt |
+| `PROMPT1` | `"runadb> "` | Primary prompt |
+| `PROMPT2` | `"runadb-> "` | Continuation prompt |
 | `NULL` | `"NULL"` | NULL display text |
 | `TIMING` | `off` | Execution timing |
 
@@ -61,27 +61,27 @@ Use `;` as the terminator. Enter continues incomplete statements with `pico->`; 
 
 Keep aligned tables with adaptive widths as the default. Add `/x` expanded output, `/format csv`, and `(0 rows)` / `No rows` for empty results. `/timing on` prints `Time: 12.345 ms`, measured from query send to `command_complete`.
 
-### 9. `pico create instance`
+### 9. `runadb create instance`
 
 Offline initialization writes the admin public key before the server listens:
 
 ```bash
-ssh-keygen -t ed25519 -f ~/.pico/mydb1
-pico create instance mydb1 \
+ssh-keygen -t ed25519 -f ~/.runadb/mydb1
+runadb create instance mydb1 \
   --data-dir ./data \
-  --admin-public-key-file ~/.pico/mydb1.pub
-pico create instance mydb1 --dev
+  --admin-public-key-file ~/.runadb/mydb1.pub
+runadb create instance mydb1 --dev
 ```
 
-The flow creates the data directory, initializes `pico_catalog.users`, writes the SSH-format Ed25519 key, commits the bootstrap transaction to WAL, and optionally starts the listener with `--start`.
+The flow creates the data directory, initializes `runadb_catalog.users`, writes the SSH-format Ed25519 key, commits the bootstrap transaction to WAL, and optionally starts the listener with `--start`.
 
-### 10. `pico rotate-key`
+### 10. `runadb rotate-key`
 
 Online rotation authenticates with the old key, sends `ALTER USER alice ADD PUBLIC KEY <new>;`, confirms persistence, then removes the old fingerprint. It also supports `begin` and `commit` phases and `--force`.
 
 ### 11. Authentication
 
-Use `~/.pico/id_ed25519` by default, support `--ca-public-key-file`, authenticate automatically on REPL entry, and expose the current fingerprint through `/key`. The handshake is:
+Use `~/.runadb/id_ed25519` by default, support `--ca-public-key-file`, authenticate automatically on REPL entry, and expose the current fingerprint through `/key`. The handshake is:
 
 ```
 Client -> Server: HELLO (key_fingerprint)
@@ -127,13 +127,13 @@ clint/
 1. The CLI must present a modern, carefully designed product from the first interaction.
 2. Zig-native terminal control avoids external dependencies and preserves cross-platform consistency.
 3. The same binary supports rich interactive use and quiet pipeline and CI workflows.
-4. Help, completion, and errors teach Pico SQL during use.
+4. Help, completion, and errors teach RunaDB SQL during use.
 5. The CLI can evolve independently except for lightweight catalog-completion protocol extensions.
 
 ## Consequences
 
 - The implementation grows from about 170 to 2000–3000 lines of dependency-free Zig.
-- Add modules under `clint/cli/`; preserve the `pico-cli` build target.
+- Add modules under `clint/cli/`; preserve the `runa-cli` build target.
 - Handle UTF-8 navigation and document known Windows ANSI/VT support work.
 - Add CHALLENGE and CHALLENGE_RESPONSE in `clint/proto/`.
 - Preserve non-interactive behavior and test it, including formatting and PTY/mock-stdin interactive cases.

@@ -1,7 +1,7 @@
 .{
-    .name = .pico,
+    .name = .runadb,
     .version = "0.0.1",
-    .fingerprint = 0x9ea0cb82e3228db8, // Changing this has security and trust implications.
+    .fingerprint = 0xf6dbed268f8134c3, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zquic = .{

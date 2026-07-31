@@ -1,10 +1,10 @@
-# Pico Documentation Standard
+# RunaDB Documentation Standard
 
-This standard applies to Markdown that describes Pico's public contracts,
+This standard applies to Markdown that describes RunaDB's public contracts,
 operation, implementation design, or contributor workflow. It keeps technical
 documentation concise, factual, and easy to scan. Material Design informs only
 the use of clear hierarchy, related-content grouping, and explicit states; it
-does not prescribe Pico's technical content.
+does not prescribe RunaDB's technical content.
 
 ## Source Of Truth
 
@@ -13,7 +13,7 @@ does not prescribe Pico's technical content.
 - Accepted product and architecture decisions live in `docs/adr/`. Do not
   reverse an ADR in prose alone; add a new ADR.
 - Link to the document that owns a contract instead of copying it. In
-  particular, Pico SQL support belongs in `docs/sql-subset.md`, Pico Wire
+  particular, RunaDB SQL support belongs in `docs/sql-subset.md`, RunaDB Wire
   Protocol definitions in `clint/proto/` and `docs/wire-protocol.md`, and
   architecture invariants in `docs/ARCHITECTURE.md` and its linked pages.
 
@@ -24,8 +24,8 @@ State whether a behavior is **Implemented**, **Supported and tested**,
 planned capability as current behavior. A public support claim should identify
 its version, condition, or regression location when practical.
 
-Use Pico terminology precisely. In particular, write **Pico Server**, **Pico
-Client**, **Pico Wire Protocol**, **Pico SQL**, **Connection**, **durability
+Use RunaDB terminology precisely. In particular, write **RunaDB Server**, **RunaDB
+Client**, **RunaDB Wire Protocol**, **RunaDB SQL**, **Connection**, **durability
 level**, and **checkpoint** as defined in `CONTEXT.md`. Do not imply
 PostgreSQL compatibility, cluster semantics, or that a checkpoint is a backup.
 

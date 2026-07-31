@@ -2,7 +2,7 @@
 
 ## Status and Scope
 
-This document defines the target shape of Pico's **statement execution layer**.
+This document defines the target shape of RunaDB's **statement execution layer**.
 
 The current Phase 0/1 implementation is **direct interpretation** in `src/sql/exec.zig`:
 it calls `storage/engine` table operations immediately after parsing the AST, with no
@@ -10,13 +10,13 @@ bytecode, register file, or pausable program counter. `BEGIN` / `COMMIT` / `ROLL
 still compatibility tags and there is no cross-statement write set yet (see the
 [concurrency control contract](concurrency-control.md)).
 
-VDBE is an internal shorthand, not a public API. The fixed boundary is **Pico SQL -> inspectable execution program -> effects through transaction/storage boundaries**, so planning, execution, cancellation, explanation, and testing remain layered instead of accumulating in one `execStmt`. Pico does not expose a bytecode format, opcode numbering, or an executor-node compatibility promise.
+VDBE is an internal shorthand, not a public API. The fixed boundary is **RunaDB SQL -> inspectable execution program -> effects through transaction/storage boundaries**, so planning, execution, cancellation, explanation, and testing remain layered instead of accumulating in one `execStmt`. RunaDB does not expose a bytecode format, opcode numbering, or an executor-node compatibility promise.
 
-## Pico Execution Boundary
+## RunaDB Execution Boundary
 
 Each bound statement produces an **execution program**: an inspectable operation sequence with bounded registers and cursor workspace. Transaction entry/exit, control flow, scans, projections, result rows, write-set construction, and cancellation points are explicit operations. Cursors sit over ordered LSM or memtable iteration and snapshot visibility. Writes form a write set or issue a commit request; execution code never publishes a manifest, changes `published_commit_seq`, or makes WAL durability decisions directly.
 
-This gives Pico one place to explain a statement's effects. A read program can yield rows incrementally while preserving its snapshot. A write program can validate values, construct a private write set, and stop at a cancellation point before commit without exposing partial table state. A commit program can hand work to the single writer, after which cancellation changes only response delivery—not the already ordered durable effect. The program boundary therefore makes backpressure, cancellation, observability, and recovery testable at statement granularity.
+This gives RunaDB one place to explain a statement's effects. A read program can yield rows incrementally while preserving its snapshot. A write program can validate values, construct a private write set, and stop at a cancellation point before commit without exposing partial table state. A commit program can hand work to the single writer, after which cancellation changes only response delivery—not the already ordered durable effect. The program boundary therefore makes backpressure, cancellation, observability, and recovery testable at statement granularity.
 
 ## Position in the System
 
@@ -59,7 +59,7 @@ references pin storage pages/blocks until `release` (when the read path uses Pag
 
 ### Opcode Groups (Target Minimum)
 
-Pico introduces only the opcode groups needed by the supported SQL subset, in stages according to
+RunaDB introduces only the opcode groups needed by the supported SQL subset, in stages according to
 the SQL subset:
 
 | Group | Examples (conceptual names) | Purpose |
@@ -73,7 +73,7 @@ the SQL subset:
 | Metadata | `OpenCatalog`, `CreateTable`, ... | Catalog changes also enter the write set/commit and do not write files directly |
 
 Each opcode document must state whether it performs I/O, is a cancellation point, may enter
-the commit queue, and how transaction state changes on failure. Pico's authoritative
+the commit queue, and how transaction state changes on failure. RunaDB's authoritative
 description is this architecture and adjacent code comments, not a public opcode manual.
 
 ### Main-Loop Invariants

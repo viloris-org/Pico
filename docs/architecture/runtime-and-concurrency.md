@@ -2,7 +2,7 @@
 
 ## Status and Scope
 
-This is the target Pico v1 runtime design, not a claim that Phase 0 implements it. The
+This is the target RunaDB v1 runtime design, not a claim that Phase 0 implements it. The
 current `src/net/server.zig` handles connections in `accept -> handleConnection` order and
 exists only to validate the migration adapter's minimal working loop. Concurrent admission,
 commit queues, and I/O scheduling become implementation guarantees only after the relevant
@@ -10,7 +10,7 @@ modules and regressions land.
 
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 
-1. Pico is a single-machine, single-instance service entered through the versioned Pico wire protocol.
+1. RunaDB is a single-machine, single-instance service entered through the versioned RunaDB wire protocol.
 2. SQL is an explicit subset; a parseable protocol message does not imply supported semantics.
 3. Only the single writer performs commit ordering and publication of committed state; reads may run in parallel.
 4. At the default durability level, a commit response waits for the corresponding WAL persistence boundary.
@@ -19,9 +19,9 @@ Version visibility, isolation levels, pre-commit conflict validation, and versio
 are defined by the [concurrency control contract](concurrency-control.md). This document
 defines their ownership and scheduling boundaries in the connection, queue, and I/O runtime.
 
-## Pico Runtime Boundary
+## RunaDB Runtime Boundary
 
-Each Pico **connection** owns protocol, cancellation, session, and input/output quota state. The runtime owns connection registration, admission, bounded queues, and controlled callback execution. A cancellation mark applies only to the current statement and is observed at defined cancellation points. The single writer serializes commit publication and watermark advancement; snapshot and reclamation boundaries remain independently verifiable. Pico does not expose an embedded API threading model, a multi-process lock manager, or a platform-specific I/O runtime as product contracts.
+Each RunaDB **connection** owns protocol, cancellation, session, and input/output quota state. The runtime owns connection registration, admission, bounded queues, and controlled callback execution. A cancellation mark applies only to the current statement and is observed at defined cancellation points. The single writer serializes commit publication and watermark advancement; snapshot and reclamation boundaries remain independently verifiable. RunaDB does not expose an embedded API threading model, a multi-process lock manager, or a platform-specific I/O runtime as product contracts.
 
 The ownership split gives connection loss a deterministic meaning. Before the irreversible commit point, closing a connection abandons its statement and private write set. After that point, the single writer finishes the WAL and publication work even if there is no connection left to receive the result. This avoids both false success (a response without durable publication) and false rollback (claiming that a confirmed change was undone because the client disconnected).
 
@@ -31,7 +31,7 @@ Connection quotas are likewise not transaction semantics. They decide how much i
 
 ```mermaid
 flowchart LR
-  client["Pico client"] --> reactor["net/reactor\nreceive, send, frames, backpressure"]
+  client["RunaDB client"] --> reactor["net/reactor\nreceive, send, frames, backpressure"]
   reactor --> connection["net/connection\nconnection state and statement order"]
   connection --> sql["sql + txn\nparse, execute, snapshots, write sets"]
   sql -->|"bounded commit request"| commit["commit\ncommit order and publication"]
@@ -63,8 +63,8 @@ generation, cancellation flag, and a weak reference to the connection execution 
 must not own socket write buffers or result sets, so slow or closed readers cannot be kept alive
 by the registry.
 
-Cancellation credentials are defined by the Pico wire protocol and must not use a fixed value.
-After startup, Pico generates an unpredictable credential unique within the connection
+Cancellation credentials are defined by the RunaDB wire protocol and must not use a fixed value.
+After startup, RunaDB generates an unpredictable credential unique within the connection
 lifetime and maps it to the internal connection ID. A cancellation request performs only a
 constant-time lookup and marks cancellation: it does not create an execution context, write
 the original connection, or wait for the statement. Missing, mismatched, closed, or expired
@@ -105,7 +105,7 @@ order. Only `txn` supplies wire-protocol transaction state; `net` must not infer
 last message.
 
 Length, format, message-order, and startup violations are protocol errors: send a feasible
-error frame and close. Unsupported Pico SQL, binding, and execution errors end only the current
+error frame and close. Unsupported RunaDB SQL, binding, and execution errors end only the current
 statement and return to the protocol's next-statement state. Transport EOF performs shutdown
 cleanup without attempting an error. Protocol extensions such as batching or prepared queries
 must define recovery states and frames explicitly rather than scattering state through socket
@@ -155,7 +155,7 @@ share the same commit-sequence domain:
 3. Active snapshots register their minimum required sequence; compaction/reclamation deletes only versions/files strictly below that lower bound.
 4. Uncommitted write sets and connection state are discarded after a crash; recovery replays only complete, verified, committed WAL records.
 
-No snapshot may fall between dependent commit publications. Pico achieves that with one published watermark, not a multi-process active-transaction array or a heavy-lock wait graph for ordinary DML. DDL, cancellation, isolation levels, and extended queries still need their own conflict and state-transition rules.
+No snapshot may fall between dependent commit publications. RunaDB achieves that with one published watermark, not a multi-process active-transaction array or a heavy-lock wait graph for ordinary DML. DDL, cancellation, isolation levels, and extended queries still need their own conflict and state-transition rules.
 
 For a future strict-OCC transaction, the runtime admits the connection's work and checks its
 input and operation budgets before issuing `read_seq`. `txn` enforces conflict-range budgets as
@@ -184,7 +184,7 @@ after disconnect.
 
 ## Evolution Order
 
-1. Define Pico wire-protocol startup, state, error, and cancellation semantics, including frame limits and official-client regressions.
+1. Define RunaDB wire-protocol startup, state, error, and cancellation semantics, including frame limits and official-client regressions.
 2. Extract the `net/connection` state machine and add connection/buffer limits; execution may remain single-task.
 3. Add the runtime reactor and bounded task queues; parallelize network I/O and read-only statements without changing commit.
 4. Extract the `commit` single-writer queue and commit sequence; connect WAL group commit and MVCC snapshot registration.

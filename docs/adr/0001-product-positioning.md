@@ -1,6 +1,6 @@
 # Product Positioning: Lightweight Single-Node Network OLTP, Not Embedded or Distributed
 
-Pico is positioned as a **single-node server** database: a single-binary deployment with low resource usage, fast startup, network access for multiple clients, and predictable write-path behavior under high contention.
+RunaDB is positioned as a **single-node server** database: a single-binary deployment with low resource usage, fast startup, network access for multiple clients, and predictable write-path behavior under high contention.
 
 **Explicit non-goals (at least until a new ADR is introduced)**: a purely embedded library form, a multi-node consensus cluster, a full analytical (OLAP) engine, and feature breadth equivalent to the PostgreSQL server.
 

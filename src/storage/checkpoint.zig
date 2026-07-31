@@ -108,7 +108,7 @@ fn makeTable(gpa: Allocator, name: []const u8) !table_mod.Table {
 test "checkpoint emits current schema and rows, with set_serial after the inserts" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-ckpt-order";
+    const dir_name = "zig-cache/runadb-test-ckpt-order";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -152,7 +152,7 @@ test "checkpoint emits current schema and rows, with set_serial after the insert
 test "checkpoint of an empty instance still yields a replayable wal" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-ckpt-empty";
+    const dir_name = "zig-cache/runadb-test-ckpt-empty";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 

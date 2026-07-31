@@ -1,6 +1,6 @@
 # Implementation Language: Zig
 
-The Pico server and storage engine are implemented in **Zig** and delivered as a single static (or minimally dependent) binary. This provides control over memory, I/O, and startup, matching the goals of a lightweight product with a self-managed runtime.
+The RunaDB server and storage engine are implemented in **Zig** and delivered as a single static (or minimally dependent) binary. This provides control over memory, I/O, and startup, matching the goals of a lightweight product with a self-managed runtime.
 
 ## Considered Options
 

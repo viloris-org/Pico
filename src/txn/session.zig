@@ -429,7 +429,7 @@ test "session begin commit rollback state machine" {
 test "session write set insert is private until commit" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-txn-private";
+    const dir_name = "zig-cache/runadb-test-txn-private";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -465,7 +465,7 @@ test "session write set insert is private until commit" {
 test "session rollback discards write set" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-txn-rollback";
+    const dir_name = "zig-cache/runadb-test-txn-rollback";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 

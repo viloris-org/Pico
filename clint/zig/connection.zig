@@ -1,4 +1,4 @@
-//! Pico connection — manages a TCP connection to a Pico Server.
+//! RunaDB connection — manages a TCP connection to a RunaDB Server.
 //! Handles handshake, message framing, and lifecycle.
 
 const std = @import("std");

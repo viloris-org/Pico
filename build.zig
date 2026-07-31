@@ -11,14 +11,14 @@ pub fn build(b: *std.Build) void {
     });
     const zquic_mod = zquic_dep.module("zquic");
 
-    // Shared Pico wire protocol definitions (used by both server and client).
+    // Shared RunaDB wire protocol definitions (used by both server and client).
     const clint_proto_mod = b.addModule("clint_proto", .{
         .root_source_file = b.path("clint/proto/def.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const mod = b.addModule("pico", .{
+    const mod = b.addModule("runadb", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -42,13 +42,13 @@ pub fn build(b: *std.Build) void {
     // ── Server binary ──
 
     const exe = b.addExecutable(.{
-        .name = "pico",
+        .name = "runa",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "pico", .module = mod },
+                .{ .name = "runadb", .module = mod },
                 .{ .name = "clint_proto", .module = clint_proto_mod },
                 .{ .name = "zquic", .module = zquic_mod },
             },
@@ -58,13 +58,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const bench_exe = b.addExecutable(.{
-        .name = "pico-bench",
+        .name = "runa-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "pico", .module = mod },
+                .{ .name = "runadb", .module = mod },
             },
         }),
     });
@@ -77,13 +77,13 @@ pub fn build(b: *std.Build) void {
     }
 
     const wal_bench_exe = b.addExecutable(.{
-        .name = "pico-wal-bench",
+        .name = "runa-wal-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wal_bench.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "pico", .module = mod },
+                .{ .name = "runadb", .module = mod },
             },
         }),
     });
@@ -94,7 +94,7 @@ pub fn build(b: *std.Build) void {
     // ── CLI binary ──
 
     const cli_exe = b.addExecutable(.{
-        .name = "pico-cli",
+        .name = "runa-cli",
         .root_module = b.createModule(.{
             .root_source_file = b.path("clint/main.zig"),
             .target = target,
@@ -109,7 +109,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(cli_exe);
 
-    const run_cli_step = b.step("cli", "Run Pico CLI (REPL)");
+    const run_cli_step = b.step("cli", "Run RunaDB CLI (REPL)");
     const run_cli = b.addRunArtifact(cli_exe);
     run_cli_step.dependOn(&run_cli.step);
     run_cli.step.dependOn(b.getInstallStep());
@@ -117,7 +117,7 @@ pub fn build(b: *std.Build) void {
         run_cli.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run Pico server");
+    const run_step = b.step("run", "Run RunaDB server");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -154,8 +154,8 @@ pub fn build(b: *std.Build) void {
     const run_clint_integration_tests = b.addRunArtifact(clint_integration_tests);
     run_clint_integration_tests.step.dependOn(b.getInstallStep());
     run_clint_integration_tests.setEnvironmentVariable(
-        "PICO_TEST_SERVER",
-        b.getInstallPath(.bin, "pico"),
+        "RUNA_TEST_SERVER",
+        b.getInstallPath(.bin, "runa"),
     );
 
     const test_step = b.step("test", "Run unit tests");

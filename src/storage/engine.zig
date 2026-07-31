@@ -440,7 +440,7 @@ test "engine create insert select roundtrip with wal" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    const dir_name = "zig-cache/pico-test-engine";
+    const dir_name = "zig-cache/runadb-test-engine";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
     {
@@ -481,7 +481,7 @@ test "engine create insert select roundtrip with wal" {
 test "engine update delete with wal recovery" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-engine-ud";
+    const dir_name = "zig-cache/runadb-test-engine-ud";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
     {
@@ -543,7 +543,7 @@ test "engine update delete with wal recovery" {
 test "engine rejects invalid writes before they enter the wal" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-engine-preflight";
+    const dir_name = "zig-cache/runadb-test-engine-preflight";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
     {
@@ -591,7 +591,7 @@ test "engine rejects invalid writes before they enter the wal" {
 test "checkpoint preserves rows, altered schema, and serial counter across restart" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-engine-ckpt";
+    const dir_name = "zig-cache/runadb-test-engine-ckpt";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -649,7 +649,7 @@ test "checkpoint preserves rows, altered schema, and serial counter across resta
 test "writes after a checkpoint survive restart" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-engine-ckpt-append";
+    const dir_name = "zig-cache/runadb-test-engine-ckpt-append";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -685,7 +685,7 @@ test "writes after a checkpoint survive restart" {
 test "an aborted checkpoint leaves the original wal intact" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-engine-ckpt-abort";
+    const dir_name = "zig-cache/runadb-test-engine-ckpt-abort";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -722,7 +722,7 @@ test "an aborted checkpoint leaves the original wal intact" {
 test "engine recovers only the committed prefix after a torn wal tail" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-engine-torn";
+    const dir_name = "zig-cache/runadb-test-engine-torn";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 

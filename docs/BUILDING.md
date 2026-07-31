@@ -1,6 +1,6 @@
-# Pico Agent Build Guide
+# RunaDB Agent Build Guide
 
-This guide defines how agents build Pico quickly without weakening Pico's public
+This guide defines how agents build RunaDB quickly without weakening RunaDB's public
 contracts, recovery guarantees, or product boundaries. It is an implementation
 and delivery guide, not an architecture decision record (ADR).
 
@@ -12,12 +12,15 @@ define the intended constraints.
 
 ## Purpose and Non-Goals
 
-Pico is a lightweight, single-node, network-accessible OLTP database. Pico
-Server and Pico Client are independent products that share a repository. Pico
-Client delivers the official CLI, drivers, developer tools, and SDKs. Their
-only shared implementation contract is the versioned Pico Wire Protocol under
-`clint/proto/`; their public contracts are the Pico Wire Protocol, Pico SQL, and
-the public error model.
+This guide governs RunaDB's **current engineering baseline**: a lightweight,
+single-node, network-accessible OLTP database. RunaDB's long-horizon direction is
+defined separately by ADR-0016; this guide does not authorize future
+distributed, multi-model, AI, or security capabilities without their focused
+contracts and evidence. RunaDB Server and RunaDB Client are independent products
+that share a repository. RunaDB Client delivers the official CLI, drivers,
+developer tools, and SDKs. Their only shared implementation contract is the
+versioned RunaDB Wire Protocol under `clint/proto/`; their public contracts are
+the RunaDB Wire Protocol, RunaDB SQL, and the public error model.
 
 This guide optimizes for small, independently reviewable vertical slices. A
 slice is complete only when its behavior and failure modes have evidence. A
@@ -36,7 +39,7 @@ This guide does not authorize any of the following:
 
 ## Build and Test Commands
 
-Pico requires Zig 0.16 or newer. The repository vendors its current Zig
+RunaDB requires Zig 0.16 or newer. The repository vendors its current Zig
 dependencies, so a standard build does not require an additional package
 manager or system library setup.
 
@@ -47,14 +50,14 @@ zig build
 zig build test
 ```
 
-The default build installs the independently deployable `pico` server and
-`pico-cli` client into `zig-out/bin/`. The available development entry points
+The default build installs the independently deployable `runadb` server and
+`runa-cli` client into `zig-out/bin/`. The available development entry points
 are:
 
 | Command | Result |
 | --- | --- |
-| `zig build run -- [server options]` | Build and run Pico Server. |
-| `zig build cli -- [client options]` | Build and run Pico Client. |
+| `zig build run -- [server options]` | Build and run RunaDB Server. |
+| `zig build cli -- [client options]` | Build and run RunaDB Client. |
 | `zig build bench -Doptimize=ReleaseFast -- [benchmark options]` | Run the SQL-path benchmark. |
 | `zig build wal-bench -Doptimize=ReleaseFast` | Run WAL microbenchmarks. |
 
@@ -63,28 +66,28 @@ the checked-out revision. Benchmarks are measurements, not correctness
 evidence. In particular, a result collected with WAL synchronization disabled
 must be labeled as non-durable.
 
-## Pico Client and SDK Goals
+## RunaDB Client and SDK Goals
 
 SDK implementation is a first-class delivery goal, not a server-side utility
-or a later wrapper around private APIs. The initial target is the **Pico Zig
+or a later wrapper around private APIs. The initial target is the **RunaDB Zig
 SDK** in `clint/zig/`. Additional official language SDKs belong in their own
 `clint/<language>/` directories after their language, package layout, version
-policy, and supported Pico Server/protocol versions are explicitly scoped.
+policy, and supported RunaDB Server/protocol versions are explicitly scoped.
 
 Every official SDK must:
 
-- Use only the versioned Pico Wire Protocol and documented Pico SQL behavior.
+- Use only the versioned RunaDB Wire Protocol and documented RunaDB SQL behavior.
   It must never open a data directory or import server implementation modules.
 - Expose Connection lifecycle, statement execution, result consumption,
   transaction control, timeout/cancellation behavior when supported by the
   protocol, and stable client-facing errors for the capabilities it claims.
 - Preserve protocol framing, version negotiation, backpressure, and error
   semantics rather than recreating server behavior locally.
-- Declare the Pico Wire Protocol versions and Pico Server versions it supports.
+- Declare the RunaDB Wire Protocol versions and RunaDB Server versions it supports.
   SDK, CLI, and server releases may move independently; compatibility must be
   tested rather than inferred from a shared repository revision.
 - Provide an end-to-end compatibility suite that exercises the SDK against a
-  real Pico Server through the public protocol boundary.
+  real RunaDB Server through the public protocol boundary.
 
 An SDK may offer language-idiomatic APIs, but it must not invent SQL semantics,
 transaction guarantees, retry behavior, or durability claims. A client-side
@@ -110,19 +113,19 @@ smallest necessary ADR or documentation update before changing the behavior.
 
 ### Product and Public Contracts
 
-- Refer to the public contracts as **Pico Wire Protocol** and **Pico SQL**.
-  Pico does not promise PostgreSQL compatibility.
-- Pico Client code belongs under `clint/`; Pico Server code belongs under
+- Refer to the public contracts as **RunaDB Wire Protocol** and **RunaDB SQL**.
+  RunaDB does not promise PostgreSQL compatibility.
+- RunaDB Client code belongs under `clint/`; RunaDB Server code belongs under
   `src/`. They may share only definitions in `clint/proto/`. There are no other
   cross-directory implementation imports or runtime calls.
 - A temporary PostgreSQL Frontend/Backend adapter is a migration aid. It is not
-  a product acceptance target and must not define Pico behavior, error mapping,
+  a product acceptance target and must not define RunaDB behavior, error mapping,
   SQL scope, or compatibility claims.
-- Every supported Pico SQL feature must be represented accurately in
+- Every supported RunaDB SQL feature must be represented accurately in
   [docs/sql-subset.md](sql-subset.md). Unsupported syntax must return a stable,
   explicit error rather than a partial success.
 - Any public protocol change must define the protocol-version behavior,
-  compatibility result, error behavior, and official Pico Client coverage at
+  compatibility result, error behavior, and official RunaDB Client coverage at
   the same time as its implementation.
 
 ### Commit, Durability, and Recovery
@@ -167,9 +170,9 @@ an operation from the owner; it must not reproduce the owner's policy.
 | --- | --- | --- | --- |
 | `clint/proto/` | Versioned shared message definitions and wire-level constants | Shared protocol-only utilities | Server or client implementation internals |
 | `clint/` | Official CLI, drivers, developer tools, SDKs, local interaction, client Connection state, and protocol encoding/decoding | `clint/proto/` | Data-directory access, server storage, server transaction implementation |
-| `clint/zig/` | Pico Zig SDK public API, Zig Connection lifecycle, protocol client, result/error mapping, and SDK integration tests | `clint/proto/`, Zig-local client modules | `src/` internals, data-directory access, server-side transaction or durability policy |
+| `clint/zig/` | RunaDB Zig SDK public API, Zig Connection lifecycle, protocol client, result/error mapping, and SDK integration tests | `clint/proto/`, Zig-local client modules | `src/` internals, data-directory access, server-side transaction or durability policy |
 | `src/net/` | Connection lifecycle, frame decoding and encoding, connection backpressure, protocol error mapping | `src/sql/`, `src/util/`, `clint/proto/` | WAL, table, catalog, LSM, VFS, or SQL storage policy |
-| `src/sql/` | Pico SQL tokenization, parsing, binding, semantic validation, and execution scheduling | Transaction/catalog facade, `src/util/` | Wire frames, WAL records, data-directory files, SSTable formats |
+| `src/sql/` | RunaDB SQL tokenization, parsing, binding, semantic validation, and execution scheduling | Transaction/catalog facade, `src/util/` | Wire frames, WAL records, data-directory files, SSTable formats |
 | `src/txn/` | Transaction state, snapshots, private write sets, conflict inputs, commit requests | Catalog/storage facade, `src/util/` | Direct protocol handling or independently publishing commits |
 | `src/commit` (target) | Commit sequence, bounded commit queue, group commit, conflict validation, publication | Transaction, catalog, storage, `src/util/` | SQL parsing or network framing |
 | `src/catalog` (target) | Database, table, column, constraint, and index definitions | Storage, `src/util/` | SQL text, network framing, direct client state |
@@ -197,7 +200,7 @@ validate -> WAL append -> apply -> recovery ownership.
 The allowed dependency direction is:
 
 ```text
-Pico Client --> clint/proto <-- src/net
+RunaDB Client --> clint/proto <-- src/net
                              |
 src/net --> src/sql --> src/txn, src/catalog --> src/storage
                       src/txn --> src/commit --> src/storage
@@ -218,7 +221,7 @@ description before writing production code:
 
 ```text
 IMPLEMENTATION PLAN
-  surface:       Pico SQL | Pico Wire Protocol | server internal | Pico Client | Pico SDK
+  surface:       RunaDB SQL | RunaDB Wire Protocol | server internal | RunaDB Client | RunaDB SDK
   user result:   <new behavior or explicit rejection>
   owner:         <module that owns new mutable state>
   invariants:    <behavior that must hold on success, failure, crash, and contention>
@@ -227,7 +230,7 @@ IMPLEMENTATION PLAN
   status:        Draft | Implemented | Verified | Blocked
 ```
 
-Use Pico's defined terms: **Connection**, **transaction**, **snapshot**,
+Use RunaDB's defined terms: **Connection**, **transaction**, **snapshot**,
 **commit**, **durability level**, **WAL**, **checkpoint**, **recovery**, and
 **contention**. Do not call a Connection a Session when the distinction
 matters, and do not call a checkpoint a backup.
@@ -249,7 +252,7 @@ Build in the smallest useful vertical slices, normally in this order:
    owner's state.
 5. Add error, cancellation, contention, resource-exhaustion, and malformed
    input behavior appropriate to the surface.
-6. Add Pico Client or SDK-to-server coverage for a public behavior.
+6. Add RunaDB Client or SDK-to-server coverage for a public behavior.
 7. For a persistent write path, add failure-injection and restart recovery
    coverage before advertising the behavior as supported.
 
@@ -275,7 +278,7 @@ task result:
 
 ```text
 IMPLEMENTATION STATUS
-  surface:     <Pico SQL / Pico Wire Protocol / internal / Pico Client / Pico SDK>
+  surface:     <RunaDB SQL / RunaDB Wire Protocol / internal / RunaDB Client / RunaDB SDK>
   state:       Draft | Implemented | Verified | Blocked
   owner:       <module that owns the state>
   evidence:    <test files and commands actually run>
@@ -302,10 +305,10 @@ recovery boundary.
 | Change class | Required evidence before `Verified` |
 | --- | --- |
 | Local utility or data structure | Deterministic unit tests for normal behavior, error behavior, and relevant resource limits. |
-| Pico SQL syntax or semantics | Parser tests, binding/execution tests, rejection tests, stable error mapping, and an updated SQL support matrix. |
-| Pico Wire Protocol | Frame codec tests, version-negotiation tests, malformed-frame tests, server behavior tests, and official Pico Client end-to-end coverage. |
-| Pico Client behavior | Client codec/connection tests and an end-to-end test against the public Pico Wire Protocol, without importing server internals. |
-| Pico SDK behavior | Public API tests for Connection lifecycle, result/error mapping, transaction behavior, cancellation or timeout where supported, and an SDK-to-server compatibility suite over the Pico Wire Protocol. |
+| RunaDB SQL syntax or semantics | Parser tests, binding/execution tests, rejection tests, stable error mapping, and an updated SQL support matrix. |
+| RunaDB Wire Protocol | Frame codec tests, version-negotiation tests, malformed-frame tests, server behavior tests, and official RunaDB Client end-to-end coverage. |
+| RunaDB Client behavior | Client codec/connection tests and an end-to-end test against the public RunaDB Wire Protocol, without importing server internals. |
+| RunaDB SDK behavior | Public API tests for Connection lifecycle, result/error mapping, transaction behavior, cancellation or timeout where supported, and an SDK-to-server compatibility suite over the RunaDB Wire Protocol. |
 | Transaction or contention behavior | Commit/rollback, failed-transaction state, visibility, conflict, cancellation, and bounded-queue tests as applicable. |
 | VFS, WAL, catalog, checkpoint, manifest, or LSM format | Format version and rejection tests, corruption tests, I/O-failure tests, truncated-tail tests where applicable, and restart recovery regressions. |
 | A path that can return successful `COMMIT` | WAL-first ordering, selected durability level, single-writer publication, and interruption at each persistence/publication point; restart must expose only the confirmed commit prefix. |
@@ -333,7 +336,7 @@ then verify any required post-error state.
 
 ## Public Contract Changes
 
-### Pico SQL
+### RunaDB SQL
 
 For every new SQL capability:
 
@@ -341,7 +344,7 @@ For every new SQL capability:
 2. Define how invalid, unsupported, and partially supported forms fail.
 3. Implement parsing, semantic validation, execution, and transaction behavior
    together; no stage may report successful completion while omitting effects.
-4. Add parser, execution, rejection, recovery, and official Pico Client tests
+4. Add parser, execution, rejection, recovery, and official RunaDB Client tests
    as applicable.
 5. Update [docs/sql-subset.md](sql-subset.md) only after the capability is
    `Verified`.
@@ -350,7 +353,7 @@ If the capability affects catalog state, indexes, constraints, transaction
 visibility, or commit, it is also a persistence change. Apply the WAL and
 recovery requirements even if the SQL parser change itself appears small.
 
-### Pico Wire Protocol
+### RunaDB Wire Protocol
 
 For every protocol change:
 
@@ -362,17 +365,17 @@ For every protocol change:
    allocation or corruption of shared server state.
 4. Keep protocol decoding separate from SQL execution and storage errors; map
    errors at the network boundary.
-5. Test both sides of the protocol independently and together through Pico
-   Client and Pico Server.
+5. Test both sides of the protocol independently and together through RunaDB
+   Client and RunaDB Server.
 
 Do not make a server-internal struct, storage format, or Zig API a protocol
 contract by serializing it directly.
 
-### Pico SDKs
+### RunaDB SDKs
 
-The Pico Zig SDK is built in `clint/zig/` and is the reference implementation
+The RunaDB Zig SDK is built in `clint/zig/` and is the reference implementation
 for the official SDK delivery process. An SDK task must state its language,
-public package/module entry point, supported protocol versions, supported Pico
+public package/module entry point, supported protocol versions, supported RunaDB
 Server versions, and compatibility test command before implementation begins.
 
 Build SDK work in this order:
@@ -385,8 +388,8 @@ Build SDK work in this order:
    already supports. Do not expose a method that reports success for an
    unsupported server capability.
 4. Add transaction APIs only when their begin, commit, rollback, error, and
-   Connection-close behavior exactly match Pico Server semantics.
-5. Add end-to-end tests using a launched Pico Server and the SDK's public API.
+   Connection-close behavior exactly match RunaDB Server semantics.
+5. Add end-to-end tests using a launched RunaDB Server and the SDK's public API.
    Include supported behavior, server rejection, malformed peer data, version
    mismatch, and Connection-close cases.
 6. Publish or update the SDK compatibility matrix only after those tests are
@@ -467,9 +470,9 @@ Update documentation in the same change when behavior changes:
 
 | Changed surface | Documentation to inspect or update |
 | --- | --- |
-| Pico SQL support | `docs/sql-subset.md`, user examples, public errors |
-| Pico Wire Protocol | `clint/proto/` documentation, version/compatibility documentation, client examples |
-| Pico SDK public API or compatibility | SDK package/module documentation, version compatibility matrix, SDK examples, and SDK-to-server integration test instructions |
+| RunaDB SQL support | `docs/sql-subset.md`, user examples, public errors |
+| RunaDB Wire Protocol | `clint/proto/` documentation, version/compatibility documentation, client examples |
+| RunaDB SDK public API or compatibility | SDK package/module documentation, version compatibility matrix, SDK examples, and SDK-to-server integration test instructions |
 | Product boundary or terminology | `CONTEXT.md`, `docs/products.md`, applicable ADR |
 | Storage, transaction, or recovery contract | `docs/ARCHITECTURE.md`, relevant detailed architecture document, applicable ADR |
 | Build target, CLI, benchmark, or operator setting | `README.md`, `README.zh-CN.md` when the translated material is present, and command help |
@@ -484,14 +487,14 @@ feature as though it currently works.
 Reviewers and agents should answer every applicable question before marking a
 change `Verified`:
 
-- Does the change preserve the accepted ADRs and use Pico terminology?
+- Does the change preserve the accepted ADRs and use RunaDB terminology?
 - Is the new mutable state owned by one module, and is the dependency direction
   correct?
-- Does a public behavior cross only the Pico Wire Protocol and Pico SQL
+- Does a public behavior cross only the RunaDB Wire Protocol and RunaDB SQL
   boundaries, with no server/client internal import?
 - If the change affects an SDK, does that SDK declare its supported protocol and
   server versions, preserve Connection and error semantics, and prove behavior
-  through its public API against a real Pico Server?
+  through its public API against a real RunaDB Server?
 - Are success, rejection, malformed input, cancellation, I/O failure, resource
   exhaustion, contention, and Connection-close behavior defined where relevant?
 - If a write becomes visible, does WAL evidence exist first and does the default
@@ -511,5 +514,5 @@ change `Verified`:
 The operating style of this guide is informed by Bun's
 [Zig to Rust porting guide](https://github.com/oven-sh/bun/blob/46d3bc29f270fa881dd5730ef1549e88407701a5/docs/PORTING.md): establish hard
 rules and explicit mappings first, then advance work through staged,
-inspectable deliverables. Pico does not inherit Bun's language-porting, crate,
+inspectable deliverables. RunaDB does not inherit Bun's language-porting, crate,
 or Rust-specific rules.

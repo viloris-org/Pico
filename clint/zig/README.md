@@ -1,17 +1,17 @@
-# Pico Zig SDK
+# RunaDB Zig SDK
 
 Status: Draft. The public module entry point is `clint/zig/lib.zig`.
 
-The SDK uses only the Pico Wire Protocol and Pico SQL. It does not import Pico
+The SDK uses only the RunaDB Wire Protocol and RunaDB SQL. It does not import RunaDB
 Server modules or access an instance data directory. The current compatibility
 claim is intentionally narrow:
 
-| Client package | Pico Wire Protocol | Pico Server |
+| Client package | RunaDB Wire Protocol | RunaDB Server |
 | --- | --- | --- |
-| Checked-out Pico Zig SDK | `0.1` | `Pico 0.0.1` in this checked-out revision |
+| Checked-out RunaDB Zig SDK | `0.1` | `RunaDB 0.0.1` in this checked-out revision |
 
 Other server versions are unverified until they have a compatibility regression.
-Run `zig build test` to build the independently deployable `pico` binary and
+Run `zig build test` to build the independently deployable `runadb` binary and
 exercise the SDK against it over native TCP.
 
 `Connection.connect` performs version negotiation. `Connection.execute` returns

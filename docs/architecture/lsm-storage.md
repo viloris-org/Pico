@@ -2,7 +2,7 @@
 
 ## Overview
 
-Pico uses an **LSM-style** (Log-Structured Merge-Tree) organization as the primary storage layout for tables and indexes. LSM favors append-only writes and turns random writes into sequential writes, matching Pico's goal of strong write performance without collapsing under contention (see ADR-0004). The relational model (tables, rows, primary keys, and secondary indexes) is the user-facing view; LSM is the physical organization.
+RunaDB uses an **LSM-style** (Log-Structured Merge-Tree) organization as the primary storage layout for tables and indexes. LSM favors append-only writes and turns random writes into sequential writes, matching RunaDB's goal of strong write performance without collapsing under contention (see ADR-0004). The relational model (tables, rows, primary keys, and secondary indexes) is the user-facing view; LSM is the physical organization.
 
 This document records the target design and evolution path for the LSM storage engine. See [README](../../README.md) for the current implementation status.
 
@@ -275,7 +275,7 @@ During startup recovery:
 
 ---
 
-## Pico Decisions
+## RunaDB Decisions
 
 - [ADR-0004 LSM Storage Engine Decision](../adr/0004-lsm-storage-engine.md): tradeoffs behind choosing LSM over B-Tree.
 - [Pager and Static Page Cache](pager-and-static-cache.md): optional page-cache layer for SST files.

@@ -1,16 +1,16 @@
-# Pico Server
+# RunaDB Server
 
-Pico Server is a lightweight, single-node OLTP database built in Zig. It runs as a standalone network service. Pico Client is a separate, independently released Pico product that provides the CLI, drivers, and developer tools.
+RunaDB Server 是 RunaDB 当前的 OLTP 基础；RunaDB 的长期方向是一个使用 Zig 构建的高性能通用统一数据系统。它将把关系、文档、图、向量、时序、键值、空间和多模态数据纳入共同的查询、治理、历史与完整性契约。RunaDB Server 当前以独立的单实例网络服务运行。RunaDB Client 是独立发布的 RunaDB 产品，提供 CLI、驱动和开发者工具。
 
-Pico intentionally implements an OLTP-oriented SQL subset. It is not PostgreSQL-compatible: Pico defines the wire protocol, SQL dialect, types, errors, drivers, and tools as its own contracts. SQL outside the published support matrix fails with an explicit error.
+RunaDB intentionally implements an OLTP-oriented SQL subset. It is not PostgreSQL-compatible: RunaDB defines the wire protocol, SQL dialect, types, errors, drivers, and tools as its own contracts. SQL outside the published support matrix fails with an explicit error.
 
-Pico Server and Pico Client communicate only through the versioned Pico Wire Protocol, Pico SQL, and the public error model. See [product boundaries](docs/products.md).
+RunaDB Server and RunaDB Client communicate only through the versioned RunaDB Wire Protocol, RunaDB SQL, and the public error model. See [product boundaries](docs/products.md).
 
 ## Current Status
 
-Pico Server is still under active development. The current implementation provides:
+RunaDB Server is still under active development. The current implementation provides:
 
-- A native Pico Wire Protocol TCP listener and Pico Client CLI
+- A native RunaDB Wire Protocol TCP listener and RunaDB Client CLI
 - A temporary PostgreSQL Frontend/Backend Protocol adapter, which is not a product compatibility commitment
 - Single-node, single-instance operation with a local data directory
 - `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
@@ -21,15 +21,15 @@ Pico Server is still under active development. The current implementation provid
 - WAL frame versioning and CRC32 validation
 - Text primary keys, multi-statement scripts, and serial-style generated IDs
 
-The persistence format and execution architecture are still evolving. Persistent LSM tables, secondary indexes, MVCC isolation, group commit, and the extended query protocol are part of the target architecture; this does not imply that all of them are currently implemented.
+持久化格式和执行架构仍在演进。持久 LSM 表、二级索引、MVCC 隔离、组提交和扩展查询协议属于目标架构；这不代表它们都已经实现。多模型和多模态数据、AI 辅助执行、分布式部署、HTAP、流处理、历史查询、后量子密码学和自主运维属于长期目标设计，均不是当前支持承诺。参见 [ADR-0016](docs/adr/0016-long-horizon-unified-database.md)。
 
 The following capabilities are currently rejected explicitly: `CREATE INDEX`, foreign keys, table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`, `ON CONFLICT`, multi-column `ORDER BY`, aggregation, grouping, and the extended query messages `Parse`, `Bind`, `Describe`, and `Execute`.
 
-See the [SQL subset support matrix](docs/sql-subset.md) for the complete Pico SQL boundary. The target protocol and ecosystem decision are recorded in [ADR-0009](docs/adr/0009-pico-native-ecosystem.md).
+See the [SQL subset support matrix](docs/sql-subset.md) for the complete RunaDB SQL boundary. The target protocol and ecosystem decision are recorded in [ADR-0009](docs/adr/0009-runadb-native-ecosystem.md).
 
 ## Build
 
-Pico currently requires Zig 0.16 or newer.
+RunaDB currently requires Zig 0.16 or newer.
 
 ```bash
 zig build
@@ -69,14 +69,14 @@ Available options:
 | --- | --- | --- |
 | `--host <address>` | `127.0.0.1` | Listen address |
 | `--port <port>` | `5433` | Listen port |
-| `--pico-port <port>` | `5434` | Native Pico Wire Protocol TCP port (`0` disables it) |
+| `--runadb-port <port>` | `5434` | Native RunaDB Wire Protocol TCP port (`0` disables it) |
 | `--data-dir <path>` | `./data` | Instance data directory |
 | `--no-sync` | disabled | Disable WAL synchronization; development only |
 
-You can test the current development adapter with `psql`, but this does not constitute a Pico client compatibility commitment. It will eventually be replaced by the Pico Wire Protocol:
+You can test the current development adapter with `psql`, but this does not constitute a RunaDB client compatibility commitment. It will eventually be replaced by the RunaDB Wire Protocol:
 
 ```bash
-psql -h 127.0.0.1 -p 5433 -U pico -d pico
+psql -h 127.0.0.1 -p 5433 -U runadb -d runadb
 ```
 
 Example SQL:
@@ -102,17 +102,17 @@ DELETE FROM users WHERE id = 1;
 
 ## Durability and Recovery
 
-Pico writes changes to a write-ahead log (WAL) before applying them to table state. WAL synchronization is enabled by default. `--no-sync` weakens this guarantee and should be used only in development environments.
+RunaDB writes changes to a write-ahead log (WAL) before applying them to table state. WAL synchronization is enabled by default. `--no-sync` weakens this guarantee and should be used only in development environments.
 
-During recovery, Pico replays only complete, supported, checksum-valid WAL frames. It truncates an incomplete final frame and persists the logical end of the WAL before accepting new writes. If a complete frame is corrupt, the WAL format is unknown, or a middle section is invalid, the instance refuses to start rather than silently discarding evidence.
+During recovery, RunaDB replays only complete, supported, checksum-valid WAL frames. It truncates an incomplete final frame and persists the logical end of the WAL before accepting new writes. If a complete frame is corrupt, the WAL format is unknown, or a middle section is invalid, the instance refuses to start rather than silently discarding evidence.
 
 ## Architecture
 
-Pico is designed around a single-node, single-writer commit path, WAL-first durability, MVCC snapshots, and LSM-style ordered storage. The implementation is divided into small modules with explicit ownership boundaries:
+RunaDB is designed around a single-node, single-writer commit path, WAL-first durability, MVCC snapshots, and LSM-style ordered storage. The implementation is divided into small modules with explicit ownership boundaries:
 
 | Directory | Responsibility |
 | --- | --- |
-| `src/net/` | TCP connections and the Pico Wire Protocol (the current PG adapter is transitional) |
+| `src/net/` | TCP connections and the RunaDB Wire Protocol (the current PG adapter is transitional) |
 | `src/sql/` | Tokenization, parsing, and execution for the SQL subset |
 | `src/storage/` | Tables, WAL, VFS, pager, value types, and recovery |
 | `src/txn/` | Transaction boundaries and connection state |
@@ -124,7 +124,7 @@ See the [architecture document](docs/ARCHITECTURE.md) for the target boundaries 
 
 - [文档规范](docs/DOCUMENTATION.md)
 - [SQL subset support matrix](docs/sql-subset.md)
-- [Pico Wire Protocol v0.1](docs/wire-protocol.md)
+- [RunaDB Wire Protocol v0.1](docs/wire-protocol.md)
 - [Architecture document](docs/ARCHITECTURE.md)
 - [Architecture decision records](docs/adr/)
 - [Domain terminology and product constraints](CONTEXT.md)

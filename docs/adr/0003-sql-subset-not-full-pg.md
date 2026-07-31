@@ -1,6 +1,6 @@
 # Use an OLTP SQL Subset; Do Not Promise the Full PostgreSQL Dialect
 
-Pico’s external offering is **the PostgreSQL wire protocol plus a common OLTP SQL subset**. The parser and executor implement only the promised statements and types; all others fail explicitly.
+RunaDB’s external offering is **the PostgreSQL wire protocol plus a common OLTP SQL subset**. The parser and executor implement only the promised statements and types; all others fail explicitly.
 
 The intended v1 capabilities include multiple tables, primary and secondary indexes, `INSERT` / `UPDATE` / `DELETE` / `SELECT` (including basic `WHERE`), transaction blocks, and a limited type set. Stored procedures, triggers, extensions, a full optimizer, and analytical syntax are outside the initial scope.
 

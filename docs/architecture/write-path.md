@@ -4,10 +4,10 @@
 
 ## Overview
 
-Pico uses **single-writer commit ordering** (see ADR-0005): one writer serializes the commit and
+RunaDB uses **single-writer commit ordering** (see ADR-0005): one writer serializes the commit and
 application of every change. A write is validated against constraints, persisted to WAL, and
 then applied to the in-memory table (or a future LSM structure). Multiple operations in an
-explicit transaction are bundled as an atomic `WriteBatch`, represented in Pico by a
+explicit transaction are bundled as an atomic `WriteBatch`, represented in RunaDB by a
 `txn_batch` WAL record.
 
 This document describes the write-path API, the WriteBatch representation and semantics, the two
@@ -124,9 +124,9 @@ Rollback performs no WAL or engine operation; it discards the private in-memory 
 
 ## WriteBatch Model
 
-### `txn_batch` in Pico
+### `txn_batch` in RunaDB
 
-Pico represents one explicit transaction as one atomic **`txn_batch` WAL record**:
+RunaDB represents one explicit transaction as one atomic **`txn_batch` WAL record**:
 
 ```
 WAL frame:
@@ -144,13 +144,13 @@ WAL frame:
 
 ### `txn_batch` Contract
 
-| Field or property | Pico contract |
+| Field or property | RunaDB contract |
 |------|----------------|
 | Commit order | No explicit sequence in Phase 0; operations are serialized by `Engine`. The target single writer allocates `commit_seq` at publication. |
 | Operation count | `n_ops` is a 2-byte count. |
-| Object identity | Every operation identifies its table by name; Pico has no storage namespace field in the record. |
+| Object identity | Every operation identifies its table by name; RunaDB has no storage namespace field in the record. |
 | Integrity | One frame-level CRC32 protects the complete payload; keys are not protected independently. |
-| Supported operations | Nested `insert`, `update`, and `delete` operations only. Merge and range-deletion operations are not part of Pico SQL. |
+| Supported operations | Nested `insert`, `update`, and `delete` operations only. Merge and range-deletion operations are not part of RunaDB SQL. |
 
 ### WriteBatch Atomicity Boundary
 
@@ -252,19 +252,19 @@ the writer had processed them as separate rounds in that order.
 
 ### Write-Intensive Admission and Progress
 
-The commit queue is a protection boundary, not an unbounded waiting room. It has explicit limits for request count and staged bytes; a request also has limits for operation count, encoded WAL size, conflict-range count, and conflict-range bytes. Connection and operation admission occurs before a strict transaction is issued a snapshot whenever possible; range limits are enforced as dependencies are collected and before a request enters the queue. When a limit is reached, Pico applies bounded backpressure and then rejects new work with an explicit retryable overload outcome rather than accepting unlimited memory growth or allowing a hot connection to monopolize the writer.
+The commit queue is a protection boundary, not an unbounded waiting room. It has explicit limits for request count and staged bytes; a request also has limits for operation count, encoded WAL size, conflict-range count, and conflict-range bytes. Connection and operation admission occurs before a strict transaction is issued a snapshot whenever possible; range limits are enforced as dependencies are collected and before a request enters the queue. When a limit is reached, RunaDB applies bounded backpressure and then rejects new work with an explicit retryable overload outcome rather than accepting unlimited memory growth or allowing a hot connection to monopolize the writer.
 
 Group commit amortizes WAL sync only. It must not merge independent transactions, reorder accepted requests, skip per-transaction conflict/constraint validation, or make a group visible atomically as though it were one user transaction. Within a round, validate and assign commit sequences one request at a time, then write one or more complete transaction records before their shared strict durability round. A failed request does not prevent later independent requests from being considered, and never consumes a visible commit sequence.
 
-Under sustained write load, Pico prioritizes predictable degradation:
+Under sustained write load, RunaDB prioritizes predictable degradation:
 
 1. Keep a small bounded batching window and a maximum batch byte/count budget, so queueing delay has an upper bound under normal admission.
 2. Reserve queue capacity and WAL/I/O progress for commit, recovery, and manifest publication; compaction may prepare files concurrently but must yield before it exhausts the resources needed to make commits durable.
 3. Reject oversized write sets before they can monopolize a group-commit round. Clients split independently valid work only when their application semantics permit it.
 4. Measure hot primary-key, unique-index, and future strict-OCC range conflicts separately from queue or WAL saturation. Retries cannot fix a saturated device, and extra batching cannot fix a single hot logical key.
-5. Return conflict and overload outcomes promptly. Pico Client drivers should retry only transactions declared retryable, using capped exponential backoff with jitter and an idempotency strategy for externally visible effects; the server never retries a transaction on the client's behalf.
+5. Return conflict and overload outcomes promptly. RunaDB Client drivers should retry only transactions declared retryable, using capped exponential backoff with jitter and an idempotency strategy for externally visible effects; the server never retries a transaction on the client's behalf.
 
-Hot-key contention is primarily a data-model and workflow problem. Where application semantics allow it, distribute independently accumulated values across multiple rows and aggregate them later, or append independent work records and process their order-sensitive effects separately. These techniques preserve the normal strict path because they reduce overlap in logical write ranges; they are not permission to use stale reads, omit conflict ranges, or silently weaken constraints. Any future atomic-update syntax or server-side aggregation must define its conflict ranges, interaction with reset/constraint operations, WAL representation, and recovery behavior before it is advertised in Pico SQL.
+Hot-key contention is primarily a data-model and workflow problem. Where application semantics allow it, distribute independently accumulated values across multiple rows and aggregate them later, or append independent work records and process their order-sensitive effects separately. These techniques preserve the normal strict path because they reduce overlap in logical write ranges; they are not permission to use stale reads, omit conflict ranges, or silently weaken constraints. Any future atomic-update syntax or server-side aggregation must define its conflict ranges, interaction with reset/constraint operations, WAL representation, and recovery behavior before it is advertised in RunaDB SQL.
 
 The first implementation should expose queue depth/bytes, admission rejections, queue wait, batch count/bytes, successful commits, conflict outcomes by kind, WAL append and sync latency, write-set size, and compaction backlog. Report these by durability level and at least p50/p95/p99, so a low-latency async workload cannot mask strict-durability tail latency. Any per-connection quota or fairness policy is runtime scheduling, not a change to commit order.
 
@@ -306,7 +306,7 @@ application is a pure data-structure operation, so failure is currently expected
 | Write stall | None | Bounded admission and explicit retryable overload; LSM/compaction pressure feeds back before resource exhaustion |
 | Write amplification metrics | None | Write amplification, queue/admission, conflict, commit-latency, and batch-size metrics |
 
-## Pico Decisions
+## RunaDB Decisions
 
 - [ADR-0005 Single writer + MVCC concurrency model](../adr/0005-single-writer-mvcc.md): concurrency-model tradeoffs.
 - [ADR-0006 WAL durability decision](../adr/0006-wal-durability-defaults.md): sync policy.
