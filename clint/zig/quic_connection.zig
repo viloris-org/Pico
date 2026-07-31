@@ -1,4 +1,4 @@
-//! Pico QUIC connection — manages a QUIC connection to a Pico Server using zquic.
+//! RunaDB QUIC connection — manages a QUIC connection to a RunaDB Server using zquic.
 //!
 //! Mirrors the TCP `Connection` interface (`connect`, `execute`, `close`),
 //! but uses zquic's embedder Client API for QUIC transport.
@@ -15,7 +15,7 @@ const MAX_DATAGRAM_SIZE: usize = 1500;
 /// Maximum time (ms) to wait for handshake completion.
 const HANDSHAKE_POLL_MS: i64 = 5000;
 
-/// A QUIC-based Pico protocol connection.
+/// A QUIC-based RunaDB protocol connection.
 pub const QuicConnection = struct {
     allocator: Allocator,
     client: *zquic.transport.io.Client,
@@ -29,7 +29,7 @@ pub const QuicConnection = struct {
     /// Maximum event-loop drive ticks before timing out.
     max_drive_ticks: usize,
 
-    /// Connect to a Pico QUIC server.
+    /// Connect to a RunaDB QUIC server.
     pub fn connect(allocator: Allocator, host: []const u8, port: u16) !QuicConnection {
         // ── 1. Create UDP socket ──
         const sock = try std.posix.socket(
@@ -53,7 +53,7 @@ pub const QuicConnection = struct {
         try zquic.transport.io.Client.initFromSocketInPlace(allocator, .{
             .host = host,
             .port = port,
-            .alpn = "pico",
+            .alpn = "runadb",
             .raw_application_streams = true,
         }, sock, true, client);
         errdefer client.deinit();
@@ -75,7 +75,7 @@ pub const QuicConnection = struct {
         // ── 5. Drive handshake to completion ──
         try self.driveUntilHandshakeComplete();
 
-        // ── 6. Open a bidirectional stream for Pico protocol ──
+        // ── 6. Open a bidirectional stream for RunaDB protocol ──
         self.stream_id = try client.rawAllocateNextLocalBidiStream();
 
         // ── 7. Send HELLO ──
@@ -194,7 +194,7 @@ pub const QuicConnection = struct {
         }
     }
 
-    /// Check if a complete Pico protocol frame is available in recv_buf.
+    /// Check if a complete RunaDB protocol frame is available in recv_buf.
     fn hasCompleteMessage(self: *QuicConnection) bool {
         const avail = self.recv_buf.items.len -| self.recv_pos;
         if (avail < proto.HEADER_SIZE) return false;
@@ -206,7 +206,7 @@ pub const QuicConnection = struct {
         return avail >= proto.HEADER_SIZE + body_len;
     }
 
-    /// Read one Pico protocol message from the received buffer.
+    /// Read one RunaDB protocol message from the received buffer.
     fn readOneMessage(self: *QuicConnection) !codec.Message {
         try self.driveUntilDataAvailable();
 

@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const pico = @import("pico");
+const runadb = @import("runadb");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -18,10 +18,10 @@ fn elapsed(start: Io.Clock.Timestamp, io: Io) u64 {
 }
 
 fn runEngine(gpa: std.mem.Allocator, io: Io, n: usize) !void {
-    const dir = "zig-cache/pico-wal-micro-eng";
+    const dir = "zig-cache/runadb-wal-micro-eng";
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    var eng = try pico.engine.Engine.open(gpa, io, dir, true);
+    var eng = try runadb.engine.Engine.open(gpa, io, dir, true);
     defer eng.deinit();
     const id_name = try gpa.dupe(u8, "id");
     defer gpa.free(id_name);
@@ -40,10 +40,10 @@ fn runEngine(gpa: std.mem.Allocator, io: Io, n: usize) !void {
 }
 
 fn runWal(gpa: std.mem.Allocator, io: Io, n: usize, sync: bool, label: []const u8) !void {
-    const dir = if (sync) "zig-cache/pico-wal-micro-s" else "zig-cache/pico-wal-micro-ns";
+    const dir = if (sync) "zig-cache/runadb-wal-micro-s" else "zig-cache/runadb-wal-micro-ns";
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    var wal = try pico.wal.Wal.open(gpa, io, dir, sync);
+    var wal = try runadb.wal.Wal.open(gpa, io, dir, sync);
     defer wal.deinit();
     const t0 = Io.Clock.Timestamp.now(io, .awake);
     for (0..n) |i| {
@@ -58,16 +58,16 @@ fn runWal(gpa: std.mem.Allocator, io: Io, n: usize, sync: bool, label: []const u
 }
 
 fn runGroup(gpa: std.mem.Allocator, io: Io, n: usize) !void {
-    const dir = "zig-cache/pico-wal-micro-gc";
+    const dir = "zig-cache/runadb-wal-micro-gc";
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    var wal = try pico.wal.Wal.open(gpa, io, dir, true);
+    var wal = try runadb.wal.Wal.open(gpa, io, dir, true);
     defer wal.deinit();
     const workers = 8;
     const per = n / workers;
     var start = std.atomic.Value(bool).init(false);
     const Ctx = struct {
-        wal: *pico.wal.Wal,
+        wal: *runadb.wal.Wal,
         start: *std.atomic.Value(bool),
         first: u32,
         count: u32,

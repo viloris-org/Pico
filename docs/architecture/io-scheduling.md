@@ -2,15 +2,15 @@
 
 ## Status and Scope
 
-This document refines the I/O scheduling rules in [Runtime, Connections, and Concurrency Control](runtime-and-concurrency.md). It is the Pico v1 target design; it does not claim that Phase 0 implements an asynchronous reactor, separate queues, or background compaction. Until that work lands, the current `accept -> handleConnection` sequential loop remains the only implementation fact.
+This document refines the I/O scheduling rules in [Runtime, Connections, and Concurrency Control](runtime-and-concurrency.md). It is the RunaDB v1 target design; it does not claim that Phase 0 implements an asynchronous reactor, separate queues, or background compaction. Until that work lands, the current `accept -> handleConnection` sequential loop remains the only implementation fact.
 
 This document makes no platform commitment to `io_uring`, `epoll`, kqueue, IOCP, or a thread pool. Any platform backend is acceptable if it observes the submission, completion, and callback boundaries defined here. It does not change ADR-0005's single-writer commit ordering or ADR-0006's WAL-first, default-durable commit.
 
-## Pico Scheduling Boundary
+## RunaDB Scheduling Boundary
 
-Pico separates platform completion from callback execution so completion handling cannot re-enter SQL, storage, or protocol code while it holds scheduler state. It derives fixed capacity from admitted connections, commit batches, recovery, manifest publication, and shutdown rather than growing queues under load. This is a single-instance service contract: no platform backend, replication queue, or external runtime model is part of the Pico product surface.
+RunaDB separates platform completion from callback execution so completion handling cannot re-enter SQL, storage, or protocol code while it holds scheduler state. It derives fixed capacity from admitted connections, commit batches, recovery, manifest publication, and shutdown rather than growing queues under load. This is a single-instance service contract: no platform backend, replication queue, or external runtime model is part of the RunaDB product surface.
 
-The scheduler's job is to preserve the meaning of Pico's other boundaries while work is concurrent. A completed socket write is not permission to reorder a connection's responses. A completed file write is not a commit until the single writer publishes it. A cancelled statement cannot revoke WAL work that has crossed the irreversible point. Separating completion from callbacks makes these decisions occur at owned state transitions rather than incidentally inside a platform event loop.
+The scheduler's job is to preserve the meaning of RunaDB's other boundaries while work is concurrent. A completed socket write is not permission to reorder a connection's responses. A completed file write is not a commit until the single writer publishes it. A cancelled statement cannot revoke WAL work that has crossed the irreversible point. Separating completion from callbacks makes these decisions occur at owned state transitions rather than incidentally inside a platform event loop.
 
 Capacity is an admission decision, not a hint. Every operation reserves a slot, bytes, and an owner before it enters the platform. When the reservation is unavailable, the owner pauses or rejects new work at the earliest safe boundary. This protects the WAL and recovery paths from a slow result consumer, and it lets operators distinguish a saturated resource from logical **contention** on the write path.
 

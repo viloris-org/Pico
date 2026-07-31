@@ -15,9 +15,9 @@ VFS does **not** own the WAL format, page cache, transactions, SQL, wire protoco
 compression policy, or checkpoint semantics. It owns only how names within the data
 directory are resolved, how handles are managed, and which I/O primitives callers may use.
 
-## Pico Boundary
+## RunaDB Boundary
 
-Pico's VFS is a **safety and ownership boundary**. It prevents storage modules from escaping an instance's data directory and isolates platform I/O without making replaceable filesystems a product feature. It provides positioned reads and writes, sync, size, truncation, close, deletion, and atomic publication. It does not provide page-level multi-process locks, shared-memory indexes, dynamic extensions, or implicit write buffering. The [I/O scheduling contract](io-scheduling.md) assigns future VFS work a category and capacity; VFS itself never owns unbounded queues or business callbacks.
+RunaDB's VFS is a **safety and ownership boundary**. It prevents storage modules from escaping an instance's data directory and isolates platform I/O without making replaceable filesystems a product feature. It provides positioned reads and writes, sync, size, truncation, close, deletion, and atomic publication. It does not provide page-level multi-process locks, shared-memory indexes, dynamic extensions, or implicit write buffering. The [I/O scheduling contract](io-scheduling.md) assigns future VFS work a category and capacity; VFS itself never owns unbounded queues or business callbacks.
 
 The boundary gives recovery a small, auditable file vocabulary. WAL, manifest, immutable-table, and page-file code can decide *what* bytes mean, but none of them can turn a malformed table name, a compaction bug, or a future SQL value into an arbitrary host path. They also cannot claim that a renamed file is durable without the required file and directory syncs. This keeps the fault question precise: a caller either receives a completed I/O operation under the data directory, or an error it must surface or recover from.
 
@@ -53,7 +53,7 @@ Required invariants:
 
 ## Interface Contract
 
-| Pico VFS operation | Contract |
+| RunaDB VFS operation | Contract |
 | --- | --- |
 | `openFile` / `createAtomicFile` | Accept logical names only; map storage intent to `OpenOptions`. |
 | `deleteFile` / `exists` | Deletion syncs the directory afterward; existence is advisory. |

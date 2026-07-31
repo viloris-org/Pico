@@ -66,7 +66,7 @@ pub fn handleConnection(
     // AuthenticationOk
     try sendAuthOk(w);
     // ParameterStatus (minimal)
-    try sendParameterStatus(w, "server_version", "pico 0.0.1");
+    try sendParameterStatus(w, "server_version", "runadb 0.0.1");
     try sendParameterStatus(w, "client_encoding", "UTF8");
     try sendParameterStatus(w, "server_encoding", "UTF8");
     try sendParameterStatus(w, "DateStyle", "ISO, MDY");
@@ -165,7 +165,7 @@ fn execErrorMessage(err: anyerror) []const u8 {
         error.UniqueViolation => "unique constraint violated",
         error.ColumnExists => "column already exists",
         error.CannotDropPrimaryKey => "cannot drop primary-key column",
-        error.UnsupportedSyntax => "unsupported SQL syntax (Pico subset)",
+        error.UnsupportedSyntax => "unsupported SQL syntax (RunaDB subset)",
         error.UnexpectedToken => "syntax error",
         error.NotImplemented => "feature not implemented",
         error.InFailedTransaction => "current transaction is aborted, commands ignored until end of transaction block",

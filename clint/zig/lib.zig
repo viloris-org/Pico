@@ -1,6 +1,6 @@
-//! Pico Client — Zig client library.
+//! RunaDB Client — Zig client library.
 //!
-//! Provides a high-level API for connecting to a Pico Server,
+//! Provides a high-level API for connecting to a RunaDB Server,
 //! executing SQL, and processing results.
 //!
 //! Usage:

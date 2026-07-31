@@ -1,6 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
-const pico = @import("pico");
+const runadb = @import("runadb");
 
 const Config = struct {
     rows: usize = 10_000,
@@ -17,17 +17,17 @@ pub fn main(init: std.process.Init) !void {
     const cfg = try parseArgs(init);
     const gpa = init.gpa;
     const io = init.io;
-    const data_dir = "zig-cache/pico-bench";
+    const data_dir = "zig-cache/runa-bench";
 
     Io.Dir.cwd().deleteTree(io, data_dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, data_dir) catch {};
 
-    var eng = try pico.engine.Engine.open(gpa, io, data_dir, cfg.sync_wal);
+    var eng = try runadb.engine.Engine.open(gpa, io, data_dir, cfg.sync_wal);
     defer eng.deinit();
-    var connection = pico.txn.session.Session.init(gpa);
+    var connection = runadb.txn.session.Session.init(gpa);
     defer connection.deinit();
 
-    var create = try pico.sql.exec.execute(
+    var create = try runadb.sql.exec.execute(
         gpa,
         &eng,
         &connection,
@@ -36,7 +36,7 @@ pub fn main(init: std.process.Init) !void {
     defer create.deinit();
 
     std.debug.print(
-        "Pico SQL-path benchmark: rows={d}, WAL sync={s}\n",
+        "RunaDB SQL-path benchmark: rows={d}, WAL sync={s}\n",
         .{ cfg.rows, if (cfg.sync_wal) "on" else "off" },
     );
 
@@ -71,8 +71,8 @@ fn parseArgs(init: std.process.Init) !Config {
 fn benchmarkAutocommitInsert(
     gpa: std.mem.Allocator,
     io: Io,
-    eng: *pico.engine.Engine,
-    connection: *pico.txn.session.Session,
+    eng: *runadb.engine.Engine,
+    connection: *runadb.txn.session.Session,
     rows: usize,
 ) !Measurement {
     const start = Io.Clock.Timestamp.now(io, .awake);
@@ -84,7 +84,7 @@ fn benchmarkAutocommitInsert(
             "INSERT INTO bench_items VALUES ({d}, 'item-{d}')",
             .{ id, id },
         );
-        var result = try pico.sql.exec.execute(gpa, eng, connection, query);
+        var result = try runadb.sql.exec.execute(gpa, eng, connection, query);
         result.deinit();
     }
     return .{
@@ -97,8 +97,8 @@ fn benchmarkAutocommitInsert(
 fn benchmarkPrimaryKeySelect(
     gpa: std.mem.Allocator,
     io: Io,
-    eng: *pico.engine.Engine,
-    connection: *pico.txn.session.Session,
+    eng: *runadb.engine.Engine,
+    connection: *runadb.txn.session.Session,
     rows: usize,
 ) !Measurement {
     const start = Io.Clock.Timestamp.now(io, .awake);
@@ -109,7 +109,7 @@ fn benchmarkPrimaryKeySelect(
             "SELECT name FROM bench_items WHERE id = {d}",
             .{index + 1},
         );
-        var result = try pico.sql.exec.execute(gpa, eng, connection, query);
+        var result = try runadb.sql.exec.execute(gpa, eng, connection, query);
         if (result != .rows or result.rows.cells.len != 1) {
             result.deinit();
             return error.BenchmarkDataMissing;
@@ -126,12 +126,12 @@ fn benchmarkPrimaryKeySelect(
 fn benchmarkTransactionInsert(
     gpa: std.mem.Allocator,
     io: Io,
-    eng: *pico.engine.Engine,
-    connection: *pico.txn.session.Session,
+    eng: *runadb.engine.Engine,
+    connection: *runadb.txn.session.Session,
     rows: usize,
 ) !Measurement {
     const start = Io.Clock.Timestamp.now(io, .awake);
-    var begin = try pico.sql.exec.execute(gpa, eng, connection, "BEGIN");
+    var begin = try runadb.sql.exec.execute(gpa, eng, connection, "BEGIN");
     begin.deinit();
     errdefer connection.rollback();
 
@@ -143,11 +143,11 @@ fn benchmarkTransactionInsert(
             "INSERT INTO bench_items VALUES ({d}, 'batched-{d}')",
             .{ id, id },
         );
-        var result = try pico.sql.exec.execute(gpa, eng, connection, query);
+        var result = try runadb.sql.exec.execute(gpa, eng, connection, query);
         result.deinit();
     }
 
-    var commit = try pico.sql.exec.execute(gpa, eng, connection, "COMMIT");
+    var commit = try runadb.sql.exec.execute(gpa, eng, connection, "COMMIT");
     commit.deinit();
     return .{
         .name = "transactional INSERT + COMMIT",

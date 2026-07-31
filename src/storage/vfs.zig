@@ -187,7 +187,7 @@ fn validateName(name: []const u8) !void {
 
 test "vfs confines storage files to its data directory" {
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-vfs";
+    const dir_name = "zig-cache/runadb-test-vfs";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -199,7 +199,7 @@ test "vfs confines storage files to its data directory" {
 
     var file = try vfs.openFile("wal", .{ .create = true });
     defer file.close();
-    try file.writeAtAll("pico", 0);
+    try file.writeAtAll("runa", 0);
     try std.testing.expectEqual(@as(u64, 4), try file.size());
     try file.truncate(2);
     try std.testing.expectEqual(@as(u64, 2), try file.size());
@@ -207,7 +207,7 @@ test "vfs confines storage files to its data directory" {
 
 test "vfs atomically publishes and durably removes storage files" {
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-vfs-publish";
+    const dir_name = "zig-cache/runadb-test-vfs-publish";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 

@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Pico needs a lightweight but secure authentication and authorization system instead of traditional database passwords.
+RunaDB needs a lightweight but secure authentication and authorization system instead of traditional database passwords.
 
 ### Goals
 
@@ -19,11 +19,11 @@ Pico needs a lightweight but secure authentication and authorization system inst
 
 ## Decision
 
-Adopt **Ed25519 public-key authentication + an operation-level permission bitmap**, storing all data in `pico_catalog.users`.
+Adopt **Ed25519 public-key authentication + an operation-level permission bitmap**, storing all data in `runadb_catalog.users`.
 
 ### 1. Authentication Protocol
 
-Store OpenSSH-compatible Ed25519 public keys and SHA256 Base64 fingerprints. Clients read `~/.pico/id_ed25519` by default.
+Store OpenSSH-compatible Ed25519 public keys and SHA256 Base64 fingerprints. Clients read `~/.runadb/id_ed25519` by default.
 
 The HELLO exchange uses a four-message challenge-response:
 
@@ -39,13 +39,13 @@ Each connection stores `current_user` and `permissions`; authentication failure 
 
 #### 1.1 CA Certificate Mode
 
-Short-lived CA-signed certificates may coexist with self-managed keys. The certificate contains an Ed25519 public key, `principal`, `valid_after`, `valid_before`, and optional `extensions`; the CA signs these fields. The server verifies the CA signature, expiry, principal in `pico_catalog.users`, and then performs the nonce challenge.
+Short-lived CA-signed certificates may coexist with self-managed keys. The certificate contains an Ed25519 public key, `principal`, `valid_after`, `valid_before`, and optional `extensions`; the CA signs these fields. The server verifies the CA signature, expiry, principal in `runadb_catalog.users`, and then performs the nonce challenge.
 
 ### 2. System Table
 
 ```sql
 -- Conceptual schema; users manage it through CREATE/ALTER/DROP USER and GRANT/REVOKE.
-pico_catalog.users (
+runadb_catalog.users (
   id            INTEGER PRIMARY KEY AUTO_INCREMENT,
   name          TEXT NOT NULL UNIQUE,
   keys          TEXT[] NOT NULL,
@@ -66,16 +66,16 @@ pico_catalog.users (
 | 5 | `CREATE` | `CREATE TABLE`, `CREATE DATABASE`, `CREATE USER` |
 | 6 | `DROP` | `DROP TABLE`, `DROP DATABASE`, `DROP USER` |
 | 7 | `ALTER` | `ALTER TABLE`, `ALTER USER` |
-| 8 | `PICO_STATUS` | `PICO STATUS` |
-| 9 | `PICO_CONFIG_READ` | Read `PICO CONFIG` |
-| 10 | `PICO_CONFIG_WRITE` | Set `PICO CONFIG` |
-| 11 | `PICO_SHUTDOWN` | `PICO SHUTDOWN` |
+| 8 | `RUNADB_STATUS` | `RUNADB STATUS` |
+| 9 | `RUNADB_CONFIG_READ` | Read `RUNADB CONFIG` |
+| 10 | `RUNADB_CONFIG_WRITE` | Set `RUNADB CONFIG` |
+| 11 | `RUNADB_SHUTDOWN` | `RUNADB SHUTDOWN` |
 
 `admin` uses `0xFFF` (4095), `readonly` uses `0x003`, and `dml_user` uses `0x01F`. The bitmap is returned in HELLO_OK and checked before every statement.
 
 ### 3. SQL Administration
 
-```picosql
+```runadbsql
 CREATE USER alice;
 CREATE USER alice WITH KEY 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...';
 DROP USER alice;
@@ -91,7 +91,7 @@ REVOKE INSERT FROM alice;
 SHOW GRANTS FOR alice;
 ```
 
-Offline bootstrap creates `pico_catalog.users`, inserts the first admin key, grants `permissions = 0xFFF`, commits through WAL, and only then starts the listener. `--dev` generates a key pair and prints the private key. Once the system table is non-empty, unauthenticated connections are rejected unless `--insecure` is used for development.
+Offline bootstrap creates `runadb_catalog.users`, inserts the first admin key, grants `permissions = 0xFFF`, commits through WAL, and only then starts the listener. `--dev` generates a key pair and prints the private key. Once the system table is non-empty, unauthenticated connections are rejected unless `--insecure` is used for development.
 
 ### 4. Execution-Time Permission Checks
 
@@ -101,7 +101,7 @@ Parse AST -> Determine statement type -> Check permission -> Execute
                             missing -> PERMISSION_DENIED
 ```
 
-The checker passes when `(current_user.permissions & required_bit) != 0`; otherwise it returns `server_error(code="PERMISSION_DENIED", message="permission 'SELECT' required, but not granted to 'alice'")`. `Stmt.select`, `Stmt.insert`, `Stmt.update`, `Stmt.delete`, `Stmt.create_table`, `Stmt.alter_table`, `Stmt.drop_table`, user administration, PICO statements, and transaction statements map to the corresponding bits.
+The checker passes when `(current_user.permissions & required_bit) != 0`; otherwise it returns `server_error(code="PERMISSION_DENIED", message="permission 'SELECT' required, but not granted to 'alice'")`. `Stmt.select`, `Stmt.insert`, `Stmt.update`, `Stmt.delete`, `Stmt.create_table`, `Stmt.alter_table`, `Stmt.drop_table`, user administration, RUNADB statements, and transaction statements map to the corresponding bits.
 
 ### 5. Security Model
 
@@ -122,13 +122,13 @@ The checker passes when `(current_user.permissions & required_bit) != 0`; otherw
 3. SSH-format keys can be registered directly from `~/.ssh/id_ed25519.pub`.
 4. Multiple keys and CA mode support small teams and larger deployments.
 5. Permission-bit checks are O(1) and fit the single-writer execution path.
-6. `pico rotate-key` makes rotation operationally simple.
+6. `runadb rotate-key` makes rotation operationally simple.
 
 ## Consequences
 
 - Add `CHALLENGE` (0x04) and `CHALLENGE_RESPONSE` (0x05) to `clint/proto/def.zig`.
-- Extend HELLO handling in `src/net/pico.zig` and add permission checks to `src/sql/exec/`.
-- Create `pico_catalog.users` during engine initialization before accepting users.
+- Extend HELLO handling in `src/net/runadb.zig` and add permission checks to `src/sql/exec/`.
+- Create `runadb_catalog.users` during engine initialization before accepting users.
 - Add Ed25519 certificate and SSH public-key parsing.
 - Test handshake, every permission bit, rotation, CA mode, and bootstrap.
 
@@ -137,5 +137,5 @@ The checker passes when `(current_user.permissions & required_bit) != 0`; otherw
 1. Add protocol messages and implement the challenge handshake.
 2. Initialize the system table and add CREATE/DROP/ALTER USER, GRANT, and REVOKE parsing/execution.
 3. Add `src/sql/exec/auth.zig` and permission checks.
-4. Implement offline `pico create instance`, `pico rotate-key`, and CA validation.
+4. Implement offline `runadb create instance`, `runadb rotate-key`, and CA validation.
 5. Add end-to-end authentication and authorization tests.

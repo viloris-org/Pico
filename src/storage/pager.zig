@@ -171,7 +171,7 @@ pub const DefaultPager = Pager(default_page_size, default_cache_pages);
 
 test "pager zero-fills new pages and writes page-aligned data" {
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-pager-write";
+    const dir_name = "zig-cache/runadb-test-pager-write";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -182,7 +182,7 @@ test "pager zero-fills new pages and writes page-aligned data" {
 
     const page = try pager.acquire(3);
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 16, &page.data);
-    @memcpy(page.data[0..4], "pico");
+    @memcpy(page.data[0..4], "runa");
     try pager.markDirty(page);
     try pager.release(page);
     try pager.sync();
@@ -191,7 +191,7 @@ test "pager zero-fills new pages and writes page-aligned data" {
 
 test "pager evicts least recently used unpinned page after writeback" {
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-pager-evict";
+    const dir_name = "zig-cache/runadb-test-pager-evict";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -216,7 +216,7 @@ test "pager evicts least recently used unpinned page after writeback" {
 
 test "pager does not evict pinned pages or truncate through them" {
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-pager-pins";
+    const dir_name = "zig-cache/runadb-test-pager-pins";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 

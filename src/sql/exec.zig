@@ -23,7 +23,7 @@ pub const executeScript = exec_core.executeScript;
 test "exec create insert select" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec";
+    const dir_name = "zig-cache/runadb-test-exec";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
     var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
@@ -65,7 +65,7 @@ test "exec create insert select" {
 test "exec select order by sorts before limit and offset" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-order-by";
+    const dir_name = "zig-cache/runadb-test-exec-order-by";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -94,7 +94,7 @@ test "exec select order by sorts before limit and offset" {
 test "exec multi-row insert is atomic and reports its row count" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-multi-insert";
+    const dir_name = "zig-cache/runadb-test-exec-multi-insert";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -122,7 +122,7 @@ test "exec multi-row insert is atomic and reports its row count" {
 test "exec multi-row insert survives WAL recovery as one batch" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-multi-insert-recovery";
+    const dir_name = "zig-cache/runadb-test-exec-multi-insert-recovery";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -152,7 +152,7 @@ test "exec multi-row insert survives WAL recovery as one batch" {
 test "exec comparison operators filter results correctly" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-cmp";
+    const dir_name = "zig-cache/runadb-test-exec-cmp";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -213,7 +213,7 @@ test "exec comparison operators filter results correctly" {
 test "exec in and like predicates filter rows" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-in-like";
+    const dir_name = "zig-cache/runadb-test-exec-in-like";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -264,7 +264,7 @@ test "exec in and like predicates filter rows" {
 test "exec or_group in where clause" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-or";
+    const dir_name = "zig-cache/runadb-test-exec-or";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -306,7 +306,7 @@ test "exec or_group in where clause" {
 test "exec sub2api-shaped settings and users" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-sub2api";
+    const dir_name = "zig-cache/runadb-test-sub2api";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
     var eng = try engine_mod.Engine.open(gpa, io, dir_name, false);
@@ -381,7 +381,7 @@ test "exec sub2api-shaped settings and users" {
 test "exec rejects syntax whose semantics are not implemented" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-rejections";
+    const dir_name = "zig-cache/runadb-test-exec-rejections";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -406,7 +406,7 @@ test "exec rejects syntax whose semantics are not implemented" {
 test "alter table changes survive WAL recovery" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-alter-recovery";
+    const dir_name = "zig-cache/runadb-test-alter-recovery";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -449,7 +449,7 @@ test "alter table changes survive WAL recovery" {
 test "exec begin commit publishes write set; rollback discards" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-txn";
+    const dir_name = "zig-cache/runadb-test-exec-txn";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -496,7 +496,7 @@ test "exec begin commit publishes write set; rollback discards" {
 test "exec statement error fails transaction until rollback" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-txn-failed";
+    const dir_name = "zig-cache/runadb-test-exec-txn-failed";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
@@ -526,7 +526,7 @@ test "exec statement error fails transaction until rollback" {
 test "exec committed transaction survives WAL recovery; rolled back does not" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = "zig-cache/pico-test-exec-txn-recovery";
+    const dir_name = "zig-cache/runadb-test-exec-txn-recovery";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 

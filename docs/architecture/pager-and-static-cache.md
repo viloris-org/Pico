@@ -2,7 +2,7 @@
 
 ## Status and Scope
 
-This document describes Pico's **Pager** and **static page cache** contract.
+This document describes RunaDB's **Pager** and **static page cache** contract.
 
 The current implementation is defined by `src/storage/pager.zig`:
 
@@ -11,9 +11,9 @@ The current implementation is defined by `src/storage/pager.zig`:
 - `acquire` / `release` references (pinning), dirty marking, writeback before LRU eviction, `flush` / `sync`, and page-granular truncation;
 - **no** transactions, rollback journal, file locking, or WAL policy.
 
-Pico's Pager is fixed-capacity page frames plus a file backend. Crash safety remains the responsibility of **WAL + checkpoints + immutable LSM files** (ADR-0004, ADR-0006). The Pager provides predictable cache bounds only for files that need fixed-size page I/O (future block indexes, free-page structures, some metadata page files, and so on).
+RunaDB's Pager is fixed-capacity page frames plus a file backend. Crash safety remains the responsibility of **WAL + checkpoints + immutable LSM files** (ADR-0004, ADR-0006). The Pager provides predictable cache bounds only for files that need fixed-size page I/O (future block indexes, free-page structures, some metadata page files, and so on).
 
-## Pico Boundary
+## RunaDB Boundary
 
 The Pager owns pinning, dirty marking, whole-page I/O, writeback, and a hard cache limit. It does not own transactions, rollback, WAL policy, file locking, row/version layout, or heap fallback when capacity is exhausted. The primary user-table path is ordered LSM storage through VFS; it does not depend on in-place page updates.
 
@@ -49,7 +49,7 @@ flowchart TB
 
 ### Why It Is Static
 
-Pico uses a hard static limit, for the capacity-derivation reasons described in [I/O Scheduling](io-scheduling.md):
+RunaDB uses a hard static limit, for the capacity-derivation reasons described in [I/O Scheduling](io-scheduling.md):
 
 1. **Computable limit**: cache bytes = `page_size * cache_pages`, exposed in the type for deployment budgeting and downsizing tests.
 2. **Explicit failure mode**: when the cache is full and every page is pinned, return `CacheFull` instead of allocating implicitly on the commit or read path and leaving a partial update after OOM.

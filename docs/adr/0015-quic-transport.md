@@ -6,20 +6,20 @@ Accepted
 
 ## Context
 
-Pico currently uses TCP plus custom binary frames (`[4-byte length][1-byte type][payload]`). With the native ecosystem in ADR-0009, TCP imposes three constraints: serialized requests prevent query pipelining, transport encryption must be implemented above the transport, and TCP head-of-line blocking prevents stream multiplexing.
+RunaDB currently uses TCP plus custom binary frames (`[4-byte length][1-byte type][payload]`). With the native ecosystem in ADR-0009, TCP imposes three constraints: serialized requests prevent query pipelining, transport encryption must be implemented above the transport, and TCP head-of-line blocking prevents stream multiplexing.
 
-An initial PQUIC design would have implemented an OLTP-specific QUIC subset, but review identified unacceptable costs: no forward secrecy, custom congestion control and retransmission, and a custom TLS replacement. Switching to Cloudflare’s `quiche` would add C and BoringSSL dependencies, conflicting with Pico’s zero-external-dependency strategy.
+An initial PQUIC design would have implemented an OLTP-specific QUIC subset, but review identified unacceptable costs: no forward secrecy, custom congestion control and retransmission, and a custom TLS replacement. Switching to Cloudflare’s `quiche` would add C and BoringSSL dependencies, conflicting with RunaDB’s zero-external-dependency strategy.
 
-The decision is therefore to vendor the mature pure-Zig implementation [zigstack/zquic](https://github.com/zigstack/zquic) under `lib/zquic/`. It implements RFC 9000/9001/9002, uses the Zig 0.16.x toolchain, and has no external dependencies. QUIC owns transport security, multiplexing, and reliability; Pico continues to define the application protocol and authentication.
+The decision is therefore to vendor the mature pure-Zig implementation [zigstack/zquic](https://github.com/zigstack/zquic) under `lib/zquic/`. It implements RFC 9000/9001/9002, uses the Zig 0.16.x toolchain, and has no external dependencies. QUIC owns transport security, multiplexing, and reliability; RunaDB continues to define the application protocol and authentication.
 
 ## Decision
 
-**Switch transport from TCP to zquic (QUIC).** Vendor zquic in `lib/zquic/` as a Git submodule and import it as a Zig module. Pico messages such as SQL query, RowData, and CommandComplete run over QUIC streams.
+**Switch transport from TCP to zquic (QUIC).** Vendor zquic in `lib/zquic/` as a Git submodule and import it as a Zig module. RunaDB messages such as SQL query, RowData, and CommandComplete run over QUIC streams.
 
 ### 1. Architecture
 
 ```
-Pico application protocol
+RunaDB application protocol
   Authentication (ADR-0014): Ed25519 challenge-response + permission bitmap
   Message layer (`clint/proto/def.zig`): Query | RowDescription | RowData | ...
 QUIC transport (zquic)
@@ -47,8 +47,8 @@ Message types and serialization remain unchanged and reuse `clint/proto/def.zig`
 |---|---|---|
 | Transport encryption | zquic (TLS 1.3) | AEAD encryption and forward secrecy |
 | Server identity | zquic (TLS certificate) | Self-signed or CA-issued certificate |
-| User authentication | Pico application | Ed25519 challenge-response on Stream 0 (ADR-0014) |
-| Permission checks | Pico application | Bitmap check before every statement |
+| User authentication | RunaDB application | Ed25519 challenge-response on Stream 0 (ADR-0014) |
+| Permission checks | RunaDB application | Bitmap check before every statement |
 
 ```text
 Client -> Server: Stream 0 CLIENT_HELLO (key_fingerprint)
@@ -76,7 +76,7 @@ The embedder API is pure Zig:
 var server = try zquic.Server.init(allocator, .{
     .cert_pem = cert_data,
     .key_pem = key_data,
-    .alpn = &.{"pico"},
+    .alpn = &.{"runadb"},
 });
 var conn = try server.accept();
 defer conn.deinit();
@@ -89,14 +89,14 @@ No C bindings or BoringSSL are required.
 ### 5. TCP Compatibility
 
 ```text
-Pico Server listens on two ports during migration:
-  TCP :5434 — existing Pico protocol
+RunaDB Server listens on two ports during migration:
+  TCP :5434 — existing RunaDB protocol
   UDP :5435 — QUIC / zquic (primary protocol)
 ```
 
 ```bash
-pico-cli                  # QUIC by default (UDP 5435)
-pico-cli --tcp            # TCP fallback (5434)
+runa-cli                  # QUIC by default (UDP 5435)
+runa-cli --tcp            # TCP fallback (5434)
 ```
 
 Remove TCP after the transition period.
@@ -113,7 +113,7 @@ The first transition uses UDP and TLS 1.3; the second is the Ed25519 handshake o
 
 1. QUIC provides multiplexing, TLS 1.3 with forward secrecy, congestion control, and loss recovery.
 2. Pure Zig avoids BoringSSL and C compiler dependencies.
-3. Authentication remains Pico’s Ed25519 application-layer system.
+3. Authentication remains RunaDB’s Ed25519 application-layer system.
 4. Existing `clint/proto/def.zig` codecs require no message changes.
 5. TCP remains available during a gradual migration.
 6. Vendoring `lib/zquic/` permits exact version pinning and local patches.

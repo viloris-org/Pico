@@ -1,4 +1,4 @@
-//! Pico Client compatibility tests against the independently built server.
+//! RunaDB Client compatibility tests against the independently built server.
 //! This module imports only the public client package and communicates over TCP.
 
 const std = @import("std");
@@ -7,12 +7,12 @@ const clint = @import("clint");
 
 const server_port: u16 = 64334;
 const pg_port: u16 = 64333;
-const data_dir = "zig-cache/pico-client-protocol-integration";
+const data_dir = "zig-cache/runa-client-protocol-integration";
 
-test "Pico Client executes a statement and consumes a streamed result" {
+test "RunaDB Client executes a statement and consumes a streamed result" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const server_path = std.mem.span(std.c.getenv("PICO_TEST_SERVER") orelse return error.ServerPathMissing);
+    const server_path = std.mem.span(std.c.getenv("RUNA_TEST_SERVER") orelse return error.ServerPathMissing);
 
     Io.Dir.cwd().deleteTree(io, data_dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, data_dir) catch {};
@@ -23,7 +23,7 @@ test "Pico Client executes a statement and consumes a streamed result" {
         server_path,
         "--port",
         pg_port_text,
-        "--pico-port",
+        "--runa-port",
         port_text,
         "--data-dir",
         data_dir,
@@ -38,7 +38,7 @@ test "Pico Client executes a statement and consumes a streamed result" {
 
     var conn = try connectWhenReady(gpa, io);
     defer conn.deinit(io);
-    try std.testing.expectEqualStrings("Pico 0.0.1", conn.server_version);
+    try std.testing.expectEqualStrings("RunaDB 0.0.1", conn.server_version);
 
     try expectCommandComplete(&conn, gpa, "CREATE TABLE t (id INT PRIMARY KEY, value TEXT)", "CREATE TABLE", 0);
 

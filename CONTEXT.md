@@ -1,26 +1,35 @@
-# Pico
+# RunaDB
 
-Pico is a **lightweight, single-node, network-accessible** OLTP database built in Zig. It is easy to deploy, uses few resources, and starts quickly. Its write path remains predictable under high contention, it provides the fault recovery and durability expected of a public product, and it supports an independent ecosystem built around the Pico Wire Protocol and Pico SQL without promising PostgreSQL compatibility.
+RunaDB is a high-performance, general-purpose **unified data system** built in
+Zig. Its long-horizon direction is to manage relational, document, graph,
+vector, time-series, key-value, spatial, and multimodal data under common
+query, governance, history, and integrity contracts. The current implementation
+is a lightweight, single-instance, network-accessible OLTP baseline. Its write
+path remains predictable under contention and it provides recoverable durable
+storage. Runa Flow is the target formal data language; the currently
+implemented RunaDB SQL path is legacy-only during the protocol transition.
 
 ## Language
 
 ### Product and Deployment
 
-**Pico**:
-The database product ecosystem consisting of **Pico Server** and **Pico Client**. The two products work together through the Pico Wire Protocol and Pico SQL.
-_Avoid_: Equating Pico with a single binary, engine, or kernel (unless specifically referring to the storage subsystem)
+**RunaDB**:
+The database product ecosystem consisting of **RunaDB Server** and **RunaDB Client**. The two products work together through the RunaDB Wire Protocol and, in the target contract, Runa Flow.
+_Avoid_: Equating RunaDB with a single binary, engine, or kernel (unless specifically referring to the storage subsystem)
 
-**Pico Server**:
+**RunaDB Server**:
 The independently deployable database server process built in this repository. It owns the data and defines transaction, durability, and recovery semantics.
 _Avoid_: Built-in client, database engine (unless specifically referring to the storage subsystem)
 
-**Pico Client**:
+**RunaDB Client**:
 The independently released product that provides the official CLI, drivers, and developer tools. It does not read the data directory or depend on internal server modules.
 _Avoid_: Server CLI, built-in driver, server SDK
 
 **Instance**:
-A running Pico process and its associated data directory. The current product is **single-node, single-instance** and is not a cluster.
-_Avoid_: Node (before replication/clustering is introduced), cluster member
+A running RunaDB Server deployment and its associated persistent state. The
+current baseline is **single-node, single-instance**; future distributed
+deployments must define their own topology, placement, and consistency terms.
+_Avoid_: Treating an instance as a cluster member before a distributed contract exists
 
 **Data Directory**:
 The local directory containing an instance's persistent state, including the WAL, data files, and catalog metadata. Each instance corresponds to one data directory.
@@ -32,12 +41,12 @@ _Avoid_: Database file (which implies a single file), repository
 A network session between a client and an instance. It carries authentication, session state, and requests and responses.
 _Avoid_: Session (prefer Connection when it could be confused with a transaction session), Socket (an implementation detail)
 
-**Pico Wire Protocol**:
-The versioned message contract defined by Pico and exchanged over a connection. It is Pico's external interface and does not promise compatibility with the PostgreSQL Frontend/Backend Protocol.
+**RunaDB Wire Protocol**:
+The versioned message contract defined by RunaDB and exchanged over a connection. It is RunaDB's external interface and does not promise compatibility with the PostgreSQL Frontend/Backend Protocol.
 _Avoid_: API, RPC (unless referring to an internal module boundary), "PostgreSQL-compatible protocol"
 
-**Pico Client**:
-An official CLI, driver, or tool in the Pico Client product. Pico Client releases its language coverage, version policy, and support scope separately and declares its support for Pico Server through a compatibility matrix.
+**RunaDB Client**:
+An official CLI, driver, or tool in the RunaDB Client product. RunaDB Client releases its language coverage, version policy, and support scope separately and declares its support for RunaDB Server through a compatibility matrix.
 _Avoid_: Driver compatibility, `psql` / libpq / pgx compatibility, dedicated SDK (until a specific tool is defined)
 
 ### Data Model
@@ -47,8 +56,24 @@ A named namespace within an instance that holds a set of **relations** and catal
 _Avoid_: Schema (until a PG-style schema hierarchy is introduced), Catalog (use only when specifically referring to the system catalog)
 
 **Relation / Table**:
-A named set of rows with fixed column definitions. It is the primary user-visible storage object. The terms are interchangeable in informal speech, but documentation should prefer **table**.
+A named set of rows with declared column definitions. It is the current primary
+user-visible storage object. The terms are interchangeable in informal speech,
+but documentation should prefer **table**.
 _Avoid_: Collection, Bucket, Namespace (when referring to a table)
+
+**Data Model**:
+The semantic representation used for a class of data and operations, such as
+relational, document, graph, vector, time-series, key-value, or spatial. A
+model is not a separate database product; when supported, it participates in
+RunaDB's common catalog, governance, history, and query semantics.
+_Avoid_: Multi-model as a claim that all listed models are already implemented
+
+**Multimodal Value**:
+A typed value representing or referring to text, image, audio, video, sensor,
+or other non-tabular content, together with declared metadata and ownership.
+Its interpretation, embedding, and derived features are not interchangeable
+with the source value.
+_Avoid_: Blob when the type, provenance, or semantic role is relevant
 
 **Row**:
 A record in a table composed of column values. Under MVCC, it may correspond to multiple **versions**.
@@ -68,21 +93,54 @@ _Avoid_: Schema definition (which is easily confused with an SQL schema)
 
 ### Queries and Transactions
 
-**Statement**:
-An SQL text submitted by a client, or its parsed form. It is executed sequentially on a connection or according to protocol rules.
-_Avoid_: Request (too broad), Query (use Query only for SELECT when a distinction is needed)
+**Request**:
+A client-submitted operation, represented as Runa Flow source, Runa Query IR,
+or a validated administrative form. It is executed sequentially on a Connection
+or according to protocol rules.
+_Avoid_: Statement (SQL-specific), Query (use Query only for a read operation)
 
-**Pico SQL**:
-The intentionally supported, OLTP-oriented scope of the Pico SQL dialect. Only the statements, types, and semantics in the published support matrix are promised; PostgreSQL SQL is not the compatibility target.
-_Avoid_: PostgreSQL-compatible, PostgreSQL SQL subset, complete dialect
+**Runa Flow**:
+RunaDB's target native formal data language. It expresses requests as typed,
+ordered pipelines that bind semantic names before physical planning.
+_Avoid_: RunaDB SQL, SQL dialect, SQL-compatible
+
+**Runa Query IR**:
+The canonical, versioned, serializable typed representation of a Runa Flow
+request after semantic binding and validation.
+_Avoid_: AST (which is source-oriented), execution plan (a physical artifact)
+
+**Semantic Model**:
+Versioned catalog metadata that declares entities, relationships, attributes,
+measures, constraints, policy references, and temporal meanings independently
+from physical storage bindings.
+_Avoid_: Physical schema, table schema, ontology (unless a dedicated contract defines it)
+
+**Natural-Language Request**:
+Advisory input that may compile into candidate Runa Flow and Runa Query IR. It
+does not execute until the same validation boundary as a formal request accepts
+the resulting IR.
+_Avoid_: Natural-language query (which implies direct execution), prompt as an execution contract
 
 **Transaction**:
-An atomic unit of work consisting of a group of statements, delimited by **BEGIN / COMMIT / ROLLBACK**, or by a single autocommitted statement.
+An atomic unit of work consisting of a group of Requests, or one autocommitted
+Request. Its language surface is a versioned protocol contract.
 _Avoid_: Batch (a write-path implementation technique, not user transaction semantics)
 
 **Snapshot**:
 The view of data visible to a transaction at a point in time. Reads operate on snapshots, making non-blocking reads possible.
 _Avoid_: Backup snapshot (in physical backup contexts, explicitly say "backup point")
+
+**Historical Version**:
+A retained, immutable representation of a committed value or object state that
+can be addressed by valid time, transaction time, or a declared version
+identifier. Retention and time-travel visibility must be explicit; they are not
+implied by MVCC alone.
+
+**Provenance**:
+Metadata and evidence describing the origin, transformations, ownership, and
+derivations of data or a result. Provenance is verifiable only when its
+integrity mechanism, retention, and trust boundary are defined.
+_Avoid_: Lineage as a vague synonym when the required evidence is unclear
 
 **Commit**:
 The successful completion of a transaction. Its write set becomes visible to later snapshots and enters the persistence path according to the current **durability level**.
@@ -112,12 +170,43 @@ _Avoid_: Snapshot (to distinguish it from an MVCC snapshot), backup
 ### Concurrency and the Write Path
 
 **Write Path**:
-The path from a statement producing a modification to its entry in the WAL and storage structures. The product prioritizes predictable throughput under high contention and must not crash because of lock storms.
-_Avoid_: Insert path (which covers only one kind of statement)
+The path from a Request producing a modification to its entry in the WAL and
+storage structures. The product prioritizes predictable throughput under high
+contention and must not crash because of lock storms.
+_Avoid_: Insert path (which covers only one kind of Request)
 
 **Contention**:
 Competition that occurs when multiple transactions modify the same or adjacent data simultaneously. The design goal is **predictable degradation**, not silent hangs on hot spots.
 _Avoid_: Lock (an implementation mechanism), conflict (usable for a narrower write-write conflict)
+
+### AI, Governance, and Evolution
+
+**AI-Assisted Execution**:
+Use of learned models to retrieve, rank, interpret, optimize, or operate on
+data. It must preserve the same authorization and auditable execution boundary
+as direct Runa Flow. A learned output does not override declared constraints or
+transaction semantics.
+_Avoid_: Autonomous when an operator policy, approval, or rollback path is absent
+
+**Neuro-Symbolic Execution**:
+Execution that combines learned interpretation with symbolic predicates,
+constraints, or reasoning. Symbolic results remain the source of truth for
+precise logic and access decisions.
+
+**Consistency Level**:
+The declared visibility and ordering guarantees for reads and writes across an
+identified scope. Strong consistency, eventual consistency, and any intermediate
+level are distinct contracts; a deployment topology does not imply one.
+
+**Cryptographic Agility**:
+The ability to version, migrate, and retire cryptographic algorithms and keys
+without making protected data unreadable or weakening its declared protection.
+It includes planning for post-quantum cryptography, but does not claim it is
+currently implemented.
+
+**Energy Efficiency**:
+The measured resource cost of storing, moving, and computing over data. It is a
+product metric alongside latency, throughput, durability, and recovery time.
 
 **Single Writer**:
 A concurrency model in which only one execution flow applies changes and orders commits at a time (see the ADR). Readers may run in parallel.
@@ -142,7 +231,10 @@ A cache with a fixed number and size of page frames determined at compile time (
 _Avoid_: A soft limit that recommends `cache_size` and mallocs when insufficient; treating cache hits as a source of correctness
 
 **Execution Program / VDBE**:
-The sequence of operations compiled from a bound statement, together with one execution instance of that sequence (registers, cursors, and program counter). External compatibility with SQLite bytecode is not promised; product descriptions should primarily discuss execution of the SQL subset.
+The sequence of operations compiled from a bound Request, together with one
+execution instance of that sequence (registers, cursors, and program counter).
+External compatibility with SQLite bytecode is not promised; product
+descriptions should primarily discuss Runa Flow execution when it is supported.
 _Avoid_: Virtual machine (easily confused with the whole instance or an OS VM), treating direct AST interpretation as the long-term architectural endpoint without stating the boundary
 
 **Opcode**:
@@ -155,8 +247,8 @@ _Avoid_: Declarative SQL cursor syntax (do not present it as a product feature b
 
 ## Example dialogue
 
-> **Developer**: The current implementation can connect with `psql`. Does that count as a Pico product compatibility commitment?
-> **Domain**: No. That is an implementation detail of the migration adapter; the external contracts are the versioned **Pico Wire Protocol** and **Pico SQL**. The adapter must not define SQL, type, or transaction semantics.
+> **Developer**: The current implementation can connect with `psql`. Does that count as a RunaDB product compatibility commitment?
+> **Domain**: No. That is an implementation detail of the migration adapter. The target external contracts are the versioned **RunaDB Wire Protocol** and **Runa Flow**; the current RunaDB SQL path is legacy-only. The adapter must not define language, type, or transaction semantics.
 >
 > **Developer**: If two connections modify the same primary key at the same time, is that **contention** or a fault?
 > **Domain**: It is **contention**. One **transaction** will **commit**; the other waits according to isolation rules or fails with a write conflict. The **write path** must remain predictable and must not lock up the entire instance.
@@ -170,20 +262,20 @@ _Avoid_: Declarative SQL cursor syntax (do not present it as a product feature b
 > **Developer**: Can one **instance** serve as three "databases"?
 > **Domain**: Yes, an instance can contain multiple **databases**, each with its own **tables** and **catalog** objects. However, there is currently no cluster semantics involving multiple instances.
 >
-> **Developer**: Can storage directly call `open("/var/pico/../other/wal")`?
+> **Developer**: Can storage directly call `open("/var/runadb/../other/wal")`?
 > **Domain**: No. It must go through **VFS** and use only logical filenames within the **data directory**. Path traversal is an error, not something to "normalize" for you.
 >
 > **Developer**: Does Pager `sync` mean **COMMIT** succeeded?
 > **Domain**: No. The durability boundary of a user **commit** is WAL plus single-writer publication; Pager only manages cached writeback for a page file.
 >
 > **Developer**: Should we provide external compatibility with SQLite VDBE bytecode?
-> **Domain**: No. Internally there may be an **execution program** and opcodes; that is an implementation layer. Externally, the product is the **wire protocol** plus the **SQL subset**.
+> **Domain**: No. Internally there may be an **execution program** and opcodes; that is an implementation layer. Externally, the target product is the **RunaDB Wire Protocol** plus **Runa Flow**.
 
 ## Flagged ambiguities
 
-- **Session**: Frequently mixed with Connection at the protocol layer. Pico documentation uses **Connection** by default; when referring to session-level state outside transaction boundaries (time zone, search_path, and so on), write "session state" and do not introduce an undefined Session entity by itself.
-- **Schema**: Has a namespace meaning in PostgreSQL; until Pico introduces an equivalent, avoid using schema to mean "table structure" or "database." Say "table definition / column definition" for table structure.
-- **Query**: Can mean any statement in informal speech; where documentation needs a distinction, Query means a read-only statement and Statement means any statement.
+- **Session**: Frequently mixed with Connection at the protocol layer. RunaDB documentation uses **Connection** by default; when referring to session-level state outside transaction boundaries (time zone, search_path, and so on), write "session state" and do not introduce an undefined Session entity by itself.
+- **Schema**: Has a namespace meaning in PostgreSQL; until RunaDB introduces an equivalent, avoid using schema to mean "table structure" or "database." Say "table definition / column definition" for table structure.
+- **Query**: Can mean any Request in informal speech; where documentation needs a distinction, Query means a read-only Request and Request means any operation.
 - **Security**: In product discussions, "secure enough" means **fault and durability** (crash recovery, validation, and durability level), not access control or encryption. Authentication and authorization are separate capabilities and must not be conflated with durability as "security."
 - **VDBE**: Usable when comparing with SQLite; in product documentation, prefer **execution program** and state that SQLite bytecode is not compatible.
-- **Pager**: Do not assume it means "SQLite pager with a journal"; Pico's Pager is a static page cache plus a file backend, and the primary recovery path remains the WAL.
+- **Pager**: Do not assume it means "SQLite pager with a journal"; RunaDB's Pager is a static page cache plus a file backend, and the primary recovery path remains the WAL.

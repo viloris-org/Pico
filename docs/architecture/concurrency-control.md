@@ -2,17 +2,17 @@
 
 ## Status and Scope
 
-This document refines ADR-0005's "single-writer commit ordering + MVCC reads" and defines the semantic boundaries Pico must satisfy when implementing transactions, versioned storage, and background reclamation. It describes the target architecture; it does not claim that Phase 0 already provides these capabilities.
+This document refines ADR-0005's "single-writer commit ordering + MVCC reads" and defines the semantic boundaries RunaDB must satisfy when implementing transactions, versioned storage, and background reclamation. It describes the target architecture; it does not claim that Phase 0 already provides these capabilities.
 
 In Phase 0, `BEGIN`, `COMMIT`, and `ROLLBACK` are compatibility labels in the wire protocol/SQL subset. Each DML statement directly modifies an in-memory table and writes to the WAL; there are no cross-statement write sets, MVCC versions, or transaction-isolation guarantees yet. The only promise about current behavior is the support matrix in [README](../../README.md). Until the implementation reaches the phase described here, these labels must not be advertised as transaction support.
 
-This document constrains concurrency within a single Pico **instance**. It does not define cross-instance coordination, replication, distributed transactions, user-visible lock syntax, `SAVEPOINT`, `SELECT FOR UPDATE`, or complete PostgreSQL isolation levels. The wire protocol's ability to carry related SQL does not mean that the Pico SQL subset supports its semantics.
+This document constrains concurrency within a single RunaDB **instance**. It does not define cross-instance coordination, replication, distributed transactions, user-visible lock syntax, `SAVEPOINT`, `SELECT FOR UPDATE`, or complete PostgreSQL isolation levels. The wire protocol's ability to carry related SQL does not mean that the RunaDB SQL subset supports its semantics.
 
 ## Design Conclusions
 
-Pico uses MVCC so readers see only stable versions without waiting on the write path. A write transaction first operates on the connection's private write set, then is revalidated and published at the sole commit-ordering point. A single writer prevents multiple committers from changing committed state simultaneously, but it does **not** automatically eliminate contention between write sets formed from old snapshots. Pre-commit validation is therefore a correctness boundary; serially queueing requests is not enough.
+RunaDB uses MVCC so readers see only stable versions without waiting on the write path. A write transaction first operates on the connection's private write set, then is revalidated and published at the sole commit-ordering point. A single writer prevents multiple committers from changing committed state simultaneously, but it does **not** automatically eliminate contention between write sets formed from old snapshots. Pre-commit validation is therefore a correctness boundary; serially queueing requests is not enough.
 
-Pico's snapshot-consistency requirement is local: if one published commit depends on another published commit, no snapshot may see the former without seeing the latter. Pico publishes a commit watermark through the single writer, avoiding an active-transaction array and heavyweight locks while preserving that visibility closure.
+RunaDB's snapshot-consistency requirement is local: if one published commit depends on another published commit, no snapshot may see the former without seeing the latter. RunaDB publishes a commit watermark through the single writer, avoiding an active-transaction array and heavyweight locks while preserving that visibility closure.
 
 ## Time and Version Model
 
@@ -62,7 +62,7 @@ stateDiagram-v2
 
 An autocommit statement owns a temporary transaction and returns to `idle` through `commit_wait` after success; on failure it discards its write set. An explicit transaction accumulates a private write set in `active`. After an execution error or commit conflict it enters `failed`; every SQL statement other than `ROLLBACK` must be rejected rather than silently continuing with a partial write set. Closing a connection is equivalent to rolling back any transaction that has not crossed the irreversible commit point.
 
-The initial deliverable isolation level is **Read Committed**: each statement takes a fresh snapshot watermark at the start and always sees earlier private modifications from the same transaction. It prohibits dirty reads, but two `SELECT` statements in one explicit transaction may see commits made by other transactions between them. Pico does not accept `READ UNCOMMITTED` as a weaker promise, nor does it treat PostgreSQL's mapping for it as supported syntax.
+The initial deliverable isolation level is **Read Committed**: each statement takes a fresh snapshot watermark at the start and always sees earlier private modifications from the same transaction. It prohibits dirty reads, but two `SELECT` statements in one explicit transaction may see commits made by other transactions between them. RunaDB does not accept `READ UNCOMMITTED` as a weaker promise, nor does it treat PostgreSQL's mapping for it as supported syntax.
 
 "Optional snapshot reads" may be enabled only when explicitly listed in the SQL support matrix. Their snapshot must be fixed before the transaction's first read/write and retained until commit or rollback; this still does not equal `SERIALIZABLE`. Until predicate-dependency tracking, a read/write conflict graph, and a rollback-retry protocol exist, `REPEATABLE READ`, `SERIALIZABLE`, and imported/exported snapshots must return an explicit "unsupported" error rather than being downgraded.
 
@@ -78,22 +78,22 @@ While building a write set, a write transaction records the "observed version" o
 | Update/delete a row that no longer exists | The target was deleted or did not appear after the transaction's snapshot | Write-write conflict; transaction fails |
 | Secondary unique key | Every affected index key is unique within the commit batch and published state | Unique-constraint error |
 
-Conflict outcomes must be deterministic and observable: the same commit-queue order and write sets must produce the same success, unique-constraint error, or write-write-conflict result. Pico v1 does not wait on row locks, re-execute `WHERE` predicates at commit, or silently implement "last writer wins." Cases requiring a client retry must use an explicit SQL error category; error codes and wire-protocol mapping are defined together with the SQL subset/protocol.
+Conflict outcomes must be deterministic and observable: the same commit-queue order and write sets must produce the same success, unique-constraint error, or write-write-conflict result. RunaDB v1 does not wait on row locks, re-execute `WHERE` predicates at commit, or silently implement "last writer wins." Cases requiring a client retry must use an explicit SQL error category; error codes and wire-protocol mapping are defined together with the SQL subset/protocol.
 
-Neither Read Committed nor future snapshot reads prevent write skew from multi-row or range predicates. For example, two transactions can read the same set and then update different primary keys, both passing the version checks above. Applications must use a single conditional update or a retry protocol for such workloads; until serializability is implemented, Pico must not claim to prevent phantoms or serialization anomalies.
+Neither Read Committed nor future snapshot reads prevent write skew from multi-row or range predicates. For example, two transactions can read the same set and then update different primary keys, both passing the version checks above. Applications must use a single conditional update or a retry protocol for such workloads; until serializability is implemented, RunaDB must not claim to prevent phantoms or serialization anomalies.
 
 DDL and catalog changes also enter the same single-writer queue. Each statement is bound to the catalog version used during parsing/binding; if the catalog changes before commit so that object identity, column definitions, or constraint interpretation becomes ambiguous, the statement fails and must be reparsed. Background compaction may change physical layout, but must not create a new `commit_seq` or change logical conflict outcomes.
 
 ## Deferred: Strictly Consistent OCC
 
-Strict serializability is not a Pico v1 isolation promise. This section records the design to adopt only after a new ADR, a Pico SQL support-matrix entry, and wire-protocol error mapping make that promise explicit. It defines optimistic conflict validation for Pico's single-instance commit path; it does not introduce distributed transaction roles, resolver sharding, replication, or a fixed transaction lifetime.
+Strict serializability is not a RunaDB v1 isolation promise. This section records the design to adopt only after a new ADR, a RunaDB SQL support-matrix entry, and wire-protocol error mapping make that promise explicit. It defines optimistic conflict validation for RunaDB's single-instance commit path; it does not introduce distributed transaction roles, resolver sharding, replication, or a fixed transaction lifetime.
 
 The design has four non-negotiable properties:
 
 1. A transaction validates logical dependencies formed from one read watermark; it does not validate storage files, page numbers, or an execution plan's transient details.
 2. The single writer is the only authority that accepts or rejects a transaction and assigns its `commit_seq`. Work may be prepared concurrently, but validation decisions are ordered exactly as publication decisions.
-3. A retryable serialization conflict, a non-retryable constraint error, and retryable overload are distinct outcomes. They have different causes and must remain distinct in Pico SQL and Pico Wire Protocol error mapping.
-4. Range history and active snapshots are bounded resources. Pico must reject work that exceeds an announced age or resource limit rather than retaining conflict metadata indefinitely or weakening isolation.
+3. A retryable serialization conflict, a non-retryable constraint error, and retryable overload are distinct outcomes. They have different causes and must remain distinct in RunaDB SQL and RunaDB Wire Protocol error mapping.
+4. Range history and active snapshots are bounded resources. RunaDB must reject work that exceeds an announced age or resource limit rather than retaining conflict metadata indefinitely or weakening isolation.
 
 ### Range Collection Lifecycle
 
@@ -127,27 +127,27 @@ The single writer keeps an in-memory, commit-sequence-ordered history of publish
 2. Validate primary-key, unique-key, foreign-key, and catalog invariants against the state produced by all earlier accepted requests in the same group-commit round.
 3. On success, allocate `commit_seq`, append the complete WAL record, publish its versions, and add its write ranges to the history before validating a later queued request.
 
-The first rule detects read-write and predicate conflicts, including phantoms. The second is still necessary: SQL constraints and modifications derived from observed rows cannot be weakened to unconditional blind-write behavior. A rejected transaction creates no WAL record, publishes nothing, and returns a distinct retryable serialization-conflict outcome. A constraint violation remains a non-retryable constraint error. The client must rerun the full transaction against a new snapshot; Pico Server does not rerun SQL statements, repeat external side effects, or silently change the transaction's isolation.
+The first rule detects read-write and predicate conflicts, including phantoms. The second is still necessary: SQL constraints and modifications derived from observed rows cannot be weakened to unconditional blind-write behavior. A rejected transaction creates no WAL record, publishes nothing, and returns a distinct retryable serialization-conflict outcome. A constraint violation remains a non-retryable constraint error. The client must rerun the full transaction against a new snapshot; RunaDB Server does not rerun SQL statements, repeat external side effects, or silently change the transaction's isolation.
 
-The history is retained until no active strict transaction can have a `read_seq` that needs it. Before admitting or validating a transaction, Pico may reject it with a distinct retryable "transaction too old" outcome when its snapshot falls behind the retained history horizon or its age/resource limits. The future Pico Wire Protocol error code remains to be designed. This bounds memory and avoids turning long-running snapshots into unbounded conflict metadata retention. The exact maximum age, range count, and range-byte limits are configuration and observability concerns, not SQL semantics.
+The history is retained until no active strict transaction can have a `read_seq` that needs it. Before admitting or validating a transaction, RunaDB may reject it with a distinct retryable "transaction too old" outcome when its snapshot falls behind the retained history horizon or its age/resource limits. The future RunaDB Wire Protocol error code remains to be designed. This bounds memory and avoids turning long-running snapshots into unbounded conflict metadata retention. The exact maximum age, range count, and range-byte limits are configuration and observability concerns, not SQL semantics.
 
 ### Strictness Boundary
 
-The read watermark must be issued from the same publication order as commits. Therefore, if Pico has responded successfully to commit A before connection B starts a strict transaction, B's `read_seq` is at least A's `commit_seq`; B cannot read a state preceding A. Commit responses remain ordered after WAL durability and publication. Together with range validation, this supplies a single-instance strict serial order without locks on ordinary reads or writes.
+The read watermark must be issued from the same publication order as commits. Therefore, if RunaDB has responded successfully to commit A before connection B starts a strict transaction, B's `read_seq` is at least A's `commit_seq`; B cannot read a state preceding A. Commit responses remain ordered after WAL durability and publication. Together with range validation, this supplies a single-instance strict serial order without locks on ordinary reads or writes.
 
-Snapshot or explicitly non-conflicting reads would weaken this guarantee. They must be a separately named, explicitly documented future Pico SQL feature; the normal strict mode cannot quietly omit their conflict ranges.
+Snapshot or explicitly non-conflicting reads would weaken this guarantee. They must be a separately named, explicitly documented future RunaDB SQL feature; the normal strict mode cannot quietly omit their conflict ranges.
 
-### Why Pico Uses Logical Ranges
+### Why RunaDB Uses Logical Ranges
 
 SQL dependencies are logical, not physical. A predicate may be satisfied by a memtable today and an immutable table after compaction, but it is still a dependency on the same table/index keys. Recording physical files, page numbers, or a selected access path would make the isolation result change when compaction changes layout. A canonical logical range keeps the result stable across recovery, checkpoints, and query-plan changes.
 
-The conservative rule is intentional. If Pico cannot prove that an index interval covers every row that could change a predicate result, it records the whole table's logical range. This can cause an avoidable retry under high contention, but it cannot admit a phantom-dependent commit. Improving the optimizer may narrow a range only when it preserves that proof; it may never make a transaction silently less isolated.
+The conservative rule is intentional. If RunaDB cannot prove that an index interval covers every row that could change a predicate result, it records the whole table's logical range. This can cause an avoidable retry under high contention, but it cannot admit a phantom-dependent commit. Improving the optimizer may narrow a range only when it preserves that proof; it may never make a transaction silently less isolated.
 
 ### Contention and Workload Shape
 
-The single writer orders commits; it does not make a repeatedly modified logical key inexpensive. A hot primary key, unique key, or strict read range can create conflicts even when WAL and CPU capacity are available. Pico must report those outcomes separately from commit-queue saturation and device latency, because the remedies differ.
+The single writer orders commits; it does not make a repeatedly modified logical key inexpensive. A hot primary key, unique key, or strict read range can create conflicts even when WAL and CPU capacity are available. RunaDB must report those outcomes separately from commit-queue saturation and device latency, because the remedies differ.
 
-For application work that permits it, distribute independently accumulated values across separate rows and combine them in a later read, or append independent work records and apply their order-sensitive effects in a controlled transaction. These are data-model choices, not a hidden weakening of Pico SQL. A future atomic-update operation, snapshot read, or range-conflict exception requires a Pico SQL definition, logical conflict ranges, WAL representation, recovery rules, metrics, and an ADR before it becomes available.
+For application work that permits it, distribute independently accumulated values across separate rows and combine them in a later read, or append independent work records and apply their order-sensitive effects in a controlled transaction. These are data-model choices, not a hidden weakening of RunaDB SQL. A future atomic-update operation, snapshot read, or range-conflict exception requires a RunaDB SQL definition, logical conflict ranges, WAL representation, recovery rules, metrics, and an ADR before it becomes available.
 
 ### Required Strict-OCC Tests
 
@@ -182,7 +182,7 @@ Before implementing concurrency control, at least the following deterministic te
 
 At minimum record commit-queue wait, commit batch size, WAL durability latency, conflict type, active snapshot count, oldest snapshot watermark, unreclaimable version count, and compaction wait time. Group metrics by durability level so latency under different crash guarantees is not combined into one percentile.
 
-## Pico Decisions
+## RunaDB Decisions
 
 - [ADR-0005](../adr/0005-single-writer-mvcc.md) is the adoption decision for this design.
 - [Runtime, Connections, and Concurrency Control](runtime-and-concurrency.md) defines the runtime boundaries for the commit queue, cancellation, and I/O.

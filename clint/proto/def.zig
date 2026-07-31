@@ -1,5 +1,5 @@
-//! Pico Wire Protocol — shared message type definitions.
-//! Used by both Pico Server (src/net/pico.zig) and Pico Client (clint/).
+//! RunaDB Wire Protocol — shared message type definitions.
+//! Used by both RunaDB Server (src/net/runadb.zig) and RunaDB Client (clint/).
 //! Version: v0.1 (draft — not yet stable).
 
 pub const PROTOCOL_VERSION_MAJOR: u16 = 0;

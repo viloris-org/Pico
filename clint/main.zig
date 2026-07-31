@@ -1,7 +1,7 @@
-//! Pico CLI — interactive REPL for Pico Server.
+//! RunaDB CLI — interactive REPL for RunaDB Server.
 //!
 //! Usage:
-//!   pico-cli [--host <addr>] [--port <port>]
+//!   runa-cli [--host <addr>] [--port <port>]
 
 const std = @import("std");
 const Io = std.Io;
@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Connect
-    std.log.info("connecting to Pico at {s}:{d}...", .{ host, port });
+    std.log.info("connecting to RunaDB at {s}:{d}...", .{ host, port });
     var conn = clint.Connection.connect(gpa, io, host, port) catch |err| {
         std.log.err("connection failed: {s}", .{@errorName(err)});
         return err;
@@ -50,7 +50,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = stdout_file.writer(io, &stdout_buf);
     const w = &stdout_writer.interface;
 
-    try w.print("Connected to Pico (server version: {s})\n", .{conn.server_version});
+    try w.print("Connected to RunaDB (server version: {s})\n", .{conn.server_version});
     try w.print("Type SQL statements, or \\q to quit.\n\n", .{});
     try w.flush();
 
@@ -150,9 +150,9 @@ fn readStdinBlocking(buf: []u8) usize {
 
 fn printUsage() !void {
     std.debug.print(
-        \\Pico CLI — interactive REPL for Pico Server
+        \\RunaDB CLI — interactive REPL for RunaDB Server
         \\
-        \\Usage: pico-cli [options]
+        \\Usage: runa-cli [options]
         \\
         \\Options:
         \\  --host <addr>    Server address (default 127.0.0.1)

@@ -38,7 +38,7 @@ pub const TxnOp = union(enum) {
 /// where crc32 covers `payload_len` (as raw LE bytes) concatenated with `payload`.
 /// Covering the length prevents a flipped length field from being accepted as a
 /// different complete frame; only an incomplete tail may be truncated.
-const file_magic = "PICO_WAL";
+const file_magic = "RUNADB_WAL";
 /// Version written into every new or rewritten WAL file.
 const format_version: u32 = 2;
 /// Oldest version this build still replays. Version 1 files contain no
@@ -1094,7 +1094,7 @@ fn removeDir(name: []const u8) void {
 test "synchronous concurrent append group recovers every successful frame" {
     const gpa = std.heap.page_allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-group-commit");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-group-commit");
     defer removeDir(dir_name);
 
     const workers = 8;
@@ -1139,7 +1139,7 @@ test "synchronous concurrent append group recovers every successful frame" {
 test "wal rejects a complete frame with a bad checksum" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-checksum");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-checksum");
     defer removeDir(dir_name);
 
     {
@@ -1161,7 +1161,7 @@ test "wal rejects a complete frame with a bad checksum" {
 test "wal truncates a torn tail and keeps the committed prefix" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-torn");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-torn");
     defer removeDir(dir_name);
 
     var prefix_end: u64 = 0;
@@ -1211,7 +1211,7 @@ test "wal truncates a torn tail and keeps the committed prefix" {
 test "wal truncates a partial frame header at EOF" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-partial-header");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-partial-header");
     defer removeDir(dir_name);
 
     var prefix_end: u64 = 0;
@@ -1238,7 +1238,7 @@ test "wal truncates a partial frame header at EOF" {
 test "wal rejects a flipped length on an otherwise complete frame" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-bad-len");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-bad-len");
     defer removeDir(dir_name);
 
     {
@@ -1271,7 +1271,7 @@ test "wal rejects a flipped length on an otherwise complete frame" {
 test "wal replays a version 1 file and a checkpoint upgrades it in place" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-v1");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-v1");
     defer removeDir(dir_name);
 
     {
@@ -1308,7 +1308,7 @@ test "wal replays a version 1 file and a checkpoint upgrades it in place" {
 test "a rewritten wal accepts appends at its own offsets" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-rewrite");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-rewrite");
     defer removeDir(dir_name);
 
     {
@@ -1344,7 +1344,7 @@ test "a rewritten wal accepts appends at its own offsets" {
 test "set_serial survives an encode and replay roundtrip" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-set-serial");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-set-serial");
     defer removeDir(dir_name);
 
     {
@@ -1380,7 +1380,7 @@ const SerialSink = struct {
 test "wal rejects a set_serial record with a truncated counter" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-serial-trunc");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-serial-trunc");
     defer removeDir(dir_name);
 
     {
@@ -1408,7 +1408,7 @@ test "wal rejects a set_serial record with a truncated counter" {
 test "wal rejects unknown magic and format version" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const dir_name = try openCleanDir("zig-cache/pico-test-wal-format");
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-format");
     defer removeDir(dir_name);
 
     {

@@ -1,4 +1,4 @@
-//! Pico wire protocol codec — read/write protocol messages to a stream.
+//! RunaDB wire protocol codec — read/write protocol messages to a stream.
 //! Used by the client library. The server handler uses its own read/write
 //! but consumes clint_proto type definitions.
 

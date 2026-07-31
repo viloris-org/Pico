@@ -4,7 +4,7 @@
 
 ## Overview
 
-The WAL (Write-Ahead Log) is Pico's source of truth for crash recovery. **WAL before
+The WAL (Write-Ahead Log) is RunaDB's source of truth for crash recovery. **WAL before
 MemTable** is an invariant: every write must be fully persisted to WAL before it is applied
 to memory state. Recovery replays confirmed writes from WAL to rebuild the in-memory tables.
 
@@ -27,13 +27,13 @@ explicitly accepted risk (see ADR-0006).
 ```
 Offset  Size  Field
 ──────────────────────────────
-0       7     Magic: "PICO_WAL"
+0       7     Magic: "RUNADB_WAL"
 7       4     Format version: u32 LE
 ──────────────────────────────
         11    Total header size = file_header_len
 ```
 
-- `PICO_WAL` identifies a Pico WAL file quickly.
+- `RUNADB_WAL` identifies a RunaDB WAL file quickly.
 - `format_version` is currently **2**. Version 1 files (no `set_serial` record) are still replayed by this build; a build older than this one rejects version-2 files with `UnsupportedWalFormat`. The checkpoint path upgrades version-1 files in place when it rewrites the WAL.
 - Open validates magic + version; mismatch returns `error.UnsupportedWalFormat` and preserves the file as evidence.
 
@@ -203,7 +203,7 @@ flowchart TD
 
 ### Why CRC Matters
 
-Pico's WAL CRC covers both `payload_len` and `payload`. A payload-only CRC would allow damage,
+RunaDB's WAL CRC covers both `payload_len` and `payload`. A payload-only CRC would allow damage,
 or an attacker, to change the length and reinterpret a valid payload as a different record size
 or type. Covering the length detects this corruption immediately.
 
@@ -249,7 +249,7 @@ An explicit transaction's write set is stored in a `txn_batch` frame:
 | WAL tracking | None | Manifest records size and position of closed WALs |
 | WAL checksum chain | None | Each new WAL record includes the previous WAL checksum |
 
-## Pico Decisions
+## RunaDB Decisions
 
 - [ADR-0006 WAL durability defaults](../adr/0006-wal-durability-defaults.md): sync policy and durability-level selection.
 - [Write path and WriteBatch](write-path.md): `txn_batch` and write-set commit path.

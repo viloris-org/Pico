@@ -1,8 +1,8 @@
-//! Pico QUIC transport — server-side listener using zquic.
+//! RunaDB QUIC transport — server-side listener using zquic.
 //!
 //! Runs an external-drive event loop over a UDP socket, feeding packets into
-//! zquic's Server.  Received STREAM data is dispatched to the same Pico wire
-//! protocol handler used by the TCP listener (`pico.handleConnection`-style
+//! zquic's Server.  Received STREAM data is dispatched to the same RunaDB wire
+//! protocol handler used by the TCP listener (`runadb.handleConnection`-style
 //! logic, but adapted to QUIC streams).
 //!
 //! Architecture:
@@ -74,14 +74,14 @@ pub fn runListener(gpa: Allocator, cfg: Config, eng: *engine_mod.Engine) !void {
         .key_pem = cfg.key_pem,
         .cert_path = cfg.cert_path,
         .key_path = cfg.key_path,
-        .alpn = "pico",
+        .alpn = "runadb",
         .raw_application_streams = true,
         .cubic = cfg.cubic,
         .migrate = false,
     }, sock, true);
     defer server.deinit();
 
-    std.log.info("Pico QUIC protocol listening on udp://{s}:{d}", .{ cfg.host, cfg.port });
+    std.log.info("RunaDB QUIC protocol listening on udp://{s}:{d}", .{ cfg.host, cfg.port });
 
     // ── 3. Event loop (poll-based, no busy-wait) ──
     var recv_buf: [MAX_DATAGRAM_SIZE]u8 = undefined;
@@ -132,12 +132,12 @@ pub fn runListener(gpa: Allocator, cfg: Config, eng: *engine_mod.Engine) !void {
         // Run pending recovery / flush work.
         server.processPendingWork();
 
-        // Dispatch received stream data to Pico protocol handlers.
+        // Dispatch received stream data to RunaDB protocol handlers.
         dispatchConnections(gpa, server, eng);
     }
 }
 
-/// Scan all connections for received STREAM data and dispatch to the Pico
+/// Scan all connections for received STREAM data and dispatch to the RunaDB
 /// protocol handler.
 fn dispatchConnections(gpa: Allocator, server: *zquic.transport.io.Server, eng: *engine_mod.Engine) void {
     _ = gpa;
@@ -145,6 +145,6 @@ fn dispatchConnections(gpa: Allocator, server: *zquic.transport.io.Server, eng: 
     _ = eng;
     // TODO: implement stream dispatch in follow-up step.
     // For each connected connection, iterate raw_app_streams slots,
-    // extract Pico protocol frames, execute SQL, send response via
+    // extract RunaDB protocol frames, execute SQL, send response via
     // server.sendRawStreamData().
 }

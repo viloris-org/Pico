@@ -1,9 +1,12 @@
-# Pico Wire Protocol v0.1
+# RunaDB Wire Protocol v0.1
 
-Status: Draft. This document specifies the currently implemented native TCP
-transport framing and message sequence. The Pico Wire Protocol is Pico's public
-contract; it does not promise compatibility with the PostgreSQL
-Frontend/Backend Protocol.
+Status: Draft legacy implementation reference. This document specifies the
+currently implemented native TCP transport framing and message sequence. The
+RunaDB Wire Protocol is RunaDB's public contract; it does not promise compatibility
+with the PostgreSQL Frontend/Backend Protocol. ADR-0017 defines Runa Flow and
+Runa Query IR as the target query contract for the next incompatible protocol
+major version; this v0.1 document continues to describe the current SQL-text
+payload only.
 
 ## Compatibility
 
@@ -13,14 +16,14 @@ accepts any minor version in that major line. A different major version receives
 `HELLO_ERROR` with the reason `unsupported protocol version`, after which the
 Connection closes.
 
-Pico Client and Pico Server versions are independent. A released client or
+RunaDB Client and RunaDB Server versions are independent. A released client or
 server must declare the protocol versions it supports and verify that support
 through the public protocol boundary.
 
-The checked-out Pico Zig SDK supports protocol version `0.1` and uses the native
+The checked-out RunaDB Zig SDK supports protocol version `0.1` and uses the native
 TCP transport described here. Its current server-version compatibility claim and
-API lifecycle are in [Pico Zig SDK](../clint/zig/README.md). `zig build test`
-launches the independently built `pico` server and exercises Connection setup,
+API lifecycle are in [RunaDB Zig SDK](../clint/zig/README.md). `zig build test`
+launches the independently built `runadb` server and exercises Connection setup,
 statement execution, result consumption, server errors, and Connection close
 through the public client package.
 
@@ -49,7 +52,7 @@ statement.
 2. The server replies with `HELLO_OK` (`0x02`) and its length-prefixed version
    string, or `HELLO_ERROR` (`0x03`) and a length-prefixed reason.
 3. An accepted client sends one `QUERY` (`0x10`) containing exactly one
-   length-prefixed Pico SQL statement. The server replies with either:
+   length-prefixed legacy RunaDB SQL statement. The server replies with either:
    `COMMAND_COMPLETE` (`0x13`), or `ROW_DESCRIPTION` (`0x11`), zero or more
    `ROW_DATA` (`0x12`) messages, then `COMMAND_COMPLETE`.
 4. Either peer can send `GOODBYE` (`0xff`). A client may send an empty body;
@@ -73,10 +76,15 @@ message. The current server emits:
 | Code | Meaning |
 | --- | --- |
 | `P0000` | Malformed query payload |
-| `P0001` | Pico SQL or execution failure; the message names the failure |
+| `P0001` | Legacy RunaDB SQL or execution failure; the message names the failure |
 | `P0002` | Unknown message type after the handshake |
 
 These codes are draft until the public error model is versioned separately.
 Clients must not infer retry safety from any v0.1 error. In particular, a
 Connection failure during a write leaves the commit outcome unknown to the
 client.
+
+The next protocol major will define separate request encodings for Runa Flow
+source and canonical Runa Query IR, together with their format-version and
+validation errors. It will not reuse this SQL-text payload as the new public
+query contract.

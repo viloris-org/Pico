@@ -2,11 +2,11 @@
 
 **Status: Accepted**
 **Date: 2026-07-28**
-**Owners and stakeholders: Pico maintainers**
+**Owners and stakeholders: RunaDB maintainers**
 
 ## Context and Rationale
 
-ADR-0003 decided that Pico provides an OLTP SQL subset over the PostgreSQL wire protocol rather than the full PostgreSQL dialect. The current implementation has basic table creation, index declarations, single-table CRUD, and a simple query protocol, but `BEGIN` / `COMMIT` / `ROLLBACK` remain compatibility placeholders and `CREATE INDEX` has no real access path or complete constraint semantics.
+ADR-0003 decided that RunaDB provides an OLTP SQL subset over the PostgreSQL wire protocol rather than the full PostgreSQL dialect. The current implementation has basic table creation, index declarations, single-table CRUD, and a simple query protocol, but `BEGIN` / `COMMIT` / `ROLLBACK` remain compatibility placeholders and `CREATE INDEX` has no real access path or complete constraint semantics.
 
 The first extensions must serve common migration-driven OLTP applications: establish table definitions, add columns, constraints, and indexes incrementally, and read and write transactionally through parameterized CRUD. They must not manufacture “success” by accepting syntax while ignoring its semantics.
 

@@ -1,8 +1,13 @@
-# SQL Subset Support Matrix
+# Legacy RunaDB SQL Support Matrix
+
+Status: Legacy implementation record. ADR-0017 replaces RunaDB SQL with RunaDB
+Flow as the target public language for the next incompatible RunaDB Wire Protocol
+major version. This document describes the checked-out server's current SQL
+behavior only; it is not a contract for new language work.
 
 This matrix is the executable scope list for ADR-0008. Only statements marked
-“Supported and tested” are part of Pico's SQL subset commitment. “Explicitly
-rejected” means that the Pico wire protocol returns an error instead of accepting
+“Supported and tested” are part of RunaDB's SQL subset commitment. “Explicitly
+rejected” means that the RunaDB wire protocol returns an error instead of accepting
 the statement and ignoring its effects. The current PostgreSQL adapter is only a
 migration aid and does not change this contract.
 
@@ -20,6 +25,6 @@ migration aid and does not change this contract.
 | Migration adapter | PostgreSQL extended-query messages `Parse` / `Bind` / `Describe` / `Execute` | Explicitly rejected | `net/pg.zig` |
 
 Whenever a capability changes from “Explicitly rejected” to “Supported and tested,”
-add parser, execution, recovery, and official Pico client regressions at the same time.
+add parser, execution, recovery, and official RunaDB client regressions at the same time.
 Changes involving commit must also cover WAL-first persistence and
 single-writer publication.

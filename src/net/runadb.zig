@@ -1,5 +1,5 @@
-//! Pico wire protocol server handler.
-//! Handles one client connection speaking the native Pico protocol.
+//! RunaDB wire protocol server handler.
+//! Handles one client connection speaking the native RunaDB protocol.
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,7 +19,7 @@ const ConnError = error{
     WriteFailed,
 } || Allocator.Error || Io.Cancelable || Io.UnexpectedError;
 
-/// Handle one Pico protocol connection until terminate or error.
+/// Handle one RunaDB protocol connection until terminate or error.
 pub fn handleConnection(
     gpa: Allocator,
     io: Io,
@@ -147,7 +147,7 @@ fn sendFrameHeader(w: anytype, msg_type: proto.Type, payload_len: usize) !void {
 // ── Message helpers ──
 
 fn sendHelloOk(w: anytype) !void {
-    const s = "Pico 0.0.1";
+    const s = "RunaDB 0.0.1";
     try sendFrameHeader(w, .hello_ok, try stringPayloadLen(s));
     try sendString(w, s);
 }
