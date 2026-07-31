@@ -1,9 +1,10 @@
 //! RunaDB Wire Protocol — shared message type definitions.
 //! Used by both RunaDB Server (src/net/runadb.zig) and RunaDB Client (clint/).
-//! Version: v0.1 (draft — not yet stable).
+//! Version: v1.0 (development contract; incompatible with the retired v0.1 SQL endpoint).
 
-pub const PROTOCOL_VERSION_MAJOR: u16 = 0;
-pub const PROTOCOL_VERSION_MINOR: u16 = 1;
+pub const PROTOCOL_VERSION_MAJOR: u16 = 1;
+pub const PROTOCOL_VERSION_MINOR: u16 = 0;
+pub const IR_FORMAT_VERSION: u16 = 1;
 
 /// Message type identifiers.
 pub const Type = enum(u8) {
@@ -14,8 +15,10 @@ pub const Type = enum(u8) {
     /// Server → Client: rejects connection with a reason.
     hello_error = 0x03,
 
-    /// Client → Server: executes a SQL statement.
-    query = 0x10,
+    /// Client → Server: submits Runa Flow source for parse, binding, and execution.
+    flow_source = 0x10,
+    /// Client → Server: submits canonical Runa Query IR.
+    flow_ir = 0x15,
     /// Server → Client: column metadata for result rows.
     row_description = 0x11,
     /// Server → Client: a single row of data.
@@ -45,8 +48,11 @@ pub const Hello = packed struct {
 /// Payload of hello_error (server → client).
 /// Followed by a length-prefixed reason string.
 
-/// Payload of query (client → server).
-/// Followed by a length-prefixed SQL text.
+/// Payload of flow_source (client → server).
+/// Followed by a length-prefixed Runa Flow source string.
+///
+/// Payload of flow_ir (client → server).
+/// `u16` big-endian IR format version followed by canonical IR bytes.
 
 /// Payload of row_description (server → client).
 pub const RowDescription = packed struct {

@@ -3,7 +3,9 @@
 ## Status
 
 Accepted. This is the target public query contract for the next incompatible
-RunaDB Wire Protocol major version. The currently implemented RunaDB SQL path is a
+RunaDB Wire Protocol major version. ADR-0018 supersedes this ADR's future
+model-specific operation framing and table-oriented semantic-model binding with
+the World Continuum data model. The currently implemented RunaDB SQL path is a
 legacy implementation surface until that version is delivered; it is not a
 claim that Runa Flow is already supported.
 

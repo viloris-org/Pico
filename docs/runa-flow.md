@@ -1,8 +1,10 @@
 # Runa Flow
 
-Status: Target design. Runa Flow is defined by ADR-0017 and is not implemented
-by the checked-out RunaDB Server. The current `v0.1` RunaDB Wire Protocol still
-accepts RunaDB SQL text as a legacy implementation surface.
+Status: Partially implemented development contract. RunaDB Wire Protocol v1.0
+accepts the read-only relation slice below as Runa Flow source or Runa Query IR.
+SQL text is not an accepted protocol request. All other operation families
+remain target design until their semantic, policy, transaction, durability, and
+recovery contracts are delivered.
 
 ## Purpose
 
@@ -14,9 +16,15 @@ Protocol major version.
 ## Pipeline Shape
 
 Each line begins with `|` after the source. Names introduced by a stage are in
-scope only for its following stages. The syntax below is illustrative until the
-grammar is published; it specifies the intended reading order, not supported
-syntax.
+scope only for its following stages. The implemented read-only grammar is:
+
+```text
+from <relation>
+| emit { <field> [, <field> ...] }
+```
+
+Other stages shown below are illustrative until their grammar and semantics are
+published.
 
 ```runa-flow
 from customer
@@ -38,7 +46,7 @@ it consumes.
 
 ## Semantic Binding
 
-`from customer` names a semantic entity, not a physical table. The semantic
+`from customer` ultimately names a semantic entity, not a physical table. The semantic
 model owns the meanings of entities, relationships, attributes, measures,
 constraints, policy references, and time domains. A versioned binding maps
 those names to physical storage and indexes. The optimizer may change an
@@ -98,3 +106,8 @@ Until then, Runa Flow source, Runa Query IR, semantic-model layouts, and
 development storage formats may change destructively. An incompatible input or
 data directory must be rejected explicitly or migrated by a separately defined
 tool; RunaDB must not silently reinterpret it under changed semantics.
+
+The current implementation uses semantic-model revision `0`, an explicit
+development-only binding from relation names to the existing table catalog. It
+has no persisted semantic-model layout and must not be treated as a stable
+World Continuum binding. An unknown relation or field fails explicitly.

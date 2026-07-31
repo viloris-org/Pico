@@ -11,14 +11,11 @@ pub const engine = @import("storage/engine.zig");
 pub const txn = struct {
     pub const session = @import("txn/session.zig");
 };
-pub const sql = struct {
-    pub const token = @import("sql/token.zig");
-    pub const ast = @import("sql/ast.zig");
-    pub const parse = @import("sql/parse.zig");
-    pub const exec = @import("sql/exec.zig");
+pub const flow = struct {
+    pub const ast = @import("flow/ast.zig");
+    pub const ir = @import("flow/ir.zig");
+    pub const exec = @import("flow/exec.zig");
 };
-pub const pg = @import("net/pg.zig");
-pub const quic = @import("net/quic.zig");
 pub const server = @import("net/server.zig");
 
 test {
@@ -31,11 +28,8 @@ test {
     _ = checkpoint;
     _ = engine;
     _ = txn.session;
-    _ = sql.token;
-    _ = sql.ast;
-    _ = sql.parse;
-    _ = sql.exec;
-    _ = pg;
-    _ = quic;
+    _ = flow.ast;
+    _ = flow.ir;
+    _ = flow.exec;
     _ = server;
 }

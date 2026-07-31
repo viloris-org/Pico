@@ -65,18 +65,18 @@ pub const Connection = struct {
         }
     }
 
-    /// Execute a SQL statement. Returns a result iterator.
+    /// Submit Runa Flow source. Returns a result iterator.
     /// The caller must consume or drain the result before issuing another statement.
-    pub fn execute(self: *Connection, arena: Allocator, sql: []const u8) !QueryResult {
+    pub fn executeFlow(self: *Connection, arena: Allocator, source: []const u8) !QueryResult {
         _ = arena;
         // Write the query message
         {
-            const sl: u32 = @intCast(sql.len);
+            const sl: u32 = @intCast(source.len);
             var payload_buf: [4 + 64 * 1024]u8 = undefined;
             if (sl > 64 * 1024) return error.MessageTooLarge;
             std.mem.writeInt(u32, payload_buf[0..4], sl, .big);
-            @memcpy(payload_buf[4..][0..sl], sql);
-            try codec.writeMessage(&self.writer.interface, .query, payload_buf[0 .. 4 + sl]);
+            @memcpy(payload_buf[4..][0..sl], source);
+            try codec.writeMessage(&self.writer.interface, .flow_source, payload_buf[0 .. 4 + sl]);
             try self.writer.interface.flush();
         }
 
@@ -85,6 +85,17 @@ pub const Connection = struct {
             .reader = &self.reader.interface,
             .done = false,
         };
+    }
+
+    /// Submit canonical Runa Query IR with its explicit format version.
+    pub fn executeIr(self: *Connection, ir_format_version: u16, bytes: []const u8) !QueryResult {
+        if (bytes.len > 64 * 1024) return error.MessageTooLarge;
+        var payload_buf: [2 + 64 * 1024]u8 = undefined;
+        std.mem.writeInt(u16, payload_buf[0..2], ir_format_version, .big);
+        @memcpy(payload_buf[2..][0..bytes.len], bytes);
+        try codec.writeMessage(&self.writer.interface, .flow_ir, payload_buf[0 .. 2 + bytes.len]);
+        try self.writer.interface.flush();
+        return .{ .allocator = self.allocator, .reader = &self.reader.interface, .done = false };
     }
 
     /// Close the connection gracefully.

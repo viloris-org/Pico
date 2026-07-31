@@ -13,10 +13,7 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 1; // skip argv0
     while (i < raw_args.len) : (i += 1) {
         const a = raw_args[i];
-        if (std.mem.eql(u8, a, "--port") and i + 1 < raw_args.len) {
-            i += 1;
-            cfg.port = try std.fmt.parseInt(u16, raw_args[i], 10);
-        } else if (std.mem.eql(u8, a, "--runa-port") and i + 1 < raw_args.len) {
+        if (std.mem.eql(u8, a, "--runa-port") and i + 1 < raw_args.len) {
             i += 1;
             cfg.runa_port = try std.fmt.parseInt(u16, raw_args[i], 10);
         } else if (std.mem.eql(u8, a, "--data-dir") and i + 1 < raw_args.len) {
@@ -48,8 +45,7 @@ fn printUsage() !void {
         \\
         \\Options:
         \\  --host <addr>       Listen address (default 127.0.0.1)
-        \\  --port <port>       PG protocol port (default 5433)
-        \\  --runa-port <port>    Native RunaDB protocol port (default 5434, 0=disable)
+        \\  --runa-port <port>  RunaDB Wire Protocol port (default 5434, 0=disable)
         \\  --data-dir <path>   Data directory (default ./data)
         \\  --no-sync           Disable WAL fsync (dev only)
         \\  -h, --help          Show help

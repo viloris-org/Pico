@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     const w = &stdout_writer.interface;
 
     try w.print("Connected to RunaDB (server version: {s})\n", .{conn.server_version});
-    try w.print("Type SQL statements, or \\q to quit.\n\n", .{});
+    try w.print("Type Runa Flow requests, or \\q to quit.\n\n", .{});
     try w.flush();
 
     // Read all stdin via syscall
@@ -84,12 +84,29 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
 
-        // Execute SQL
         var stmt_arena = std.heap.ArenaAllocator.init(gpa);
         defer stmt_arena.deinit();
         const stmt_alloc = stmt_arena.allocator();
 
-        var result = conn.execute(stmt_alloc, line) catch |err| {
+        // A Flow request starts with `from` and owns its following pipeline
+        // stages, so a pasted multi-line request is submitted atomically.
+        var request = line;
+        if (std.mem.startsWith(u8, line, "from ")) {
+            var source: std.ArrayList(u8) = .empty;
+            try source.appendSlice(stmt_alloc, line);
+            while (line_start < all_input.items.len) {
+                var stage_end = line_start;
+                while (stage_end < all_input.items.len and all_input.items[stage_end] != '\n') : (stage_end += 1) {}
+                const stage = std.mem.trim(u8, all_input.items[line_start..stage_end], " \t\r");
+                if (!std.mem.startsWith(u8, stage, "|")) break;
+                try source.append(stmt_alloc, '\n');
+                try source.appendSlice(stmt_alloc, stage);
+                line_start = stage_end + 1;
+            }
+            request = try source.toOwnedSlice(stmt_alloc);
+        }
+
+        var result = conn.executeFlow(stmt_alloc, request) catch |err| {
             try w.print("ERROR: {s}\n", .{@errorName(err)});
             try w.flush();
             continue;

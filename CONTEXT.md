@@ -1,8 +1,8 @@
 # RunaDB
 
 RunaDB is a high-performance, general-purpose **unified data system** built in
-Zig. Its long-horizon direction is to manage relational, document, graph,
-vector, time-series, key-value, spatial, and multimodal data under common
+Zig. Its target data model is a verifiable **World Continuum**: observations,
+continuous state, representations, relationships, and hypotheses share common
 query, governance, history, and integrity contracts. The current implementation
 is a lightweight, single-instance, network-accessible OLTP baseline. Its write
 path remains predictable under contention and it provides recoverable durable
@@ -75,6 +75,53 @@ Its interpretation, embedding, and derived features are not interchangeable
 with the source value.
 _Avoid_: Blob when the type, provenance, or semantic role is relevant
 
+**World Continuum**:
+The target logical state of an instance: a versioned, governed continuum of
+Continuum Objects, Observation Evidence, State Fields, Representation Charts,
+and Counterfactual Branches. It is not a claim that a single learned coordinate
+system can replace factual evidence or declared semantics.
+_Avoid_: Vector database, file store plus embeddings, universal embedding
+
+**Continuum Object**:
+A stable logical identity in a World Continuum with declared kind, temporal
+extent, relationships, and state bindings. It replaces a table, document,
+key-value entry, or media item as the target primary user-visible data
+abstraction; those are views or bindings, not competing top-level models.
+_Avoid_: Row, document, record, entity when its continuum identity matters
+
+**Observation Evidence**:
+An immutable, attributed observation accepted as factual input to a World
+Continuum. It preserves the information, origin, time, coordinate reference,
+and declared interpretation needed to validate or re-project later state.
+_Avoid_: Raw file, blob, ground truth (unless independently established)
+
+**State Field**:
+A versioned, continuous or discretized estimate of state over one or more
+declared domains such as time, space, relationships, or latent coordinates.
+It is derived from Observation Evidence or a declared transition and is not
+silently interchangeable with factual evidence.
+_Avoid_: Embedding column, cache, truth
+
+**Representation Chart**:
+A versioned declaration of a coordinate domain, projection or decoding model,
+input coverage, uncertainty semantics, and compatibility rules for a State
+Field. It permits multiple evolving representations without silently
+reinterpreting existing state.
+_Avoid_: Model version when the coordinate and coverage contract matters
+
+**Causal Dynamics**:
+A declared, versioned transition and intervention contract for how a State
+Field may evolve under stated conditions. Its predictions are model-derived
+hypotheses, not Observation Evidence.
+_Avoid_: World model when the transition or intervention contract is relevant
+
+**Counterfactual Branch**:
+An isolated, versioned hypothetical World Continuum state produced under
+declared assumptions, interventions, and model versions. It cannot become
+factual state merely by being computed.
+_Avoid_: Prediction, simulation result, alternate reality when the assumptions
+and isolation boundary matter
+
 **Row**:
 A record in a table composed of column values. Under MVCC, it may correspond to multiple **versions**.
 _Avoid_: Document, Tuple (unless discussing the physical or algebraic layer)
@@ -120,6 +167,12 @@ Advisory input that may compile into candidate Runa Flow and Runa Query IR. It
 does not execute until the same validation boundary as a formal request accepts
 the resulting IR.
 _Avoid_: Natural-language query (which implies direct execution), prompt as an execution contract
+
+**Agent**:
+A Continuum Object that can hold declared goals, memory, observations,
+relationships, and action proposals. An Agent does not receive authority to
+change factual state except through validated Requests and ordinary policy.
+_Avoid_: Autonomous actor when policy, approval, or rollback is absent
 
 **Transaction**:
 An atomic unit of work consisting of a group of Requests, or one autocommitted

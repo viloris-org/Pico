@@ -57,25 +57,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    const bench_exe = b.addExecutable(.{
-        .name = "runa-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "runadb", .module = mod },
-            },
-        }),
-    });
-
-    const bench_step = b.step("bench", "Run SQL-path benchmarks");
-    const run_bench = b.addRunArtifact(bench_exe);
-    bench_step.dependOn(&run_bench.step);
-    if (b.args) |args| {
-        run_bench.addArgs(args);
-    }
-
     const wal_bench_exe = b.addExecutable(.{
         .name = "runa-wal-bench",
         .root_module = b.createModule(.{

@@ -10,19 +10,11 @@ contracts. RunaDB Server currently runs as a standalone, single-instance network
 service. It is one of two independently released RunaDB products; RunaDB Client
 provides the CLI, drivers, and developer tools.
 
-Runa Flow is RunaDB's target public request language. It is a typed,
-pipeline-oriented language that binds names through a semantic model and produces
-canonical, versioned Runa Query IR. The next incompatible RunaDB Wire Protocol
-major version will carry that contract. Runa Flow, Runa Query IR, the semantic
-model, and that protocol version are target designs; they are not yet supported
-product capabilities.
-
-The current implementation accepts an OLTP-oriented, legacy RunaDB SQL subset
-over the current RunaDB Wire Protocol. It is not PostgreSQL compatible: its
-protocol, SQL dialect, types, errors, drivers, and tools are RunaDB-owned
-contracts. Unsupported legacy SQL fails with an explicit error. RunaDB will not
-add new SQL syntax; SQL is retained only until Runa Flow provides a tested
-replacement for the required baseline workflows.
+Runa Flow is RunaDB's native public request language. The implemented Wire
+Protocol v1.0 development slice accepts `from <relation> | emit { <field> }`
+as source or canonical Runa Query IR. It is read-only and uses an explicit,
+development-only binding to the current table catalog. SQL text is not an
+accepted protocol request.
 
 RunaDB Server and RunaDB Client communicate only through versioned protocol
 definitions and the public error model. See [product boundaries](docs/products.md)
@@ -33,15 +25,9 @@ and [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 RunaDB Server is under active development. The current implementation provides:
 
 - A native RunaDB Wire Protocol TCP listener and RunaDB Client CLI
-- A temporary PostgreSQL Frontend/Backend Protocol adapter, which is not a
-  product compatibility commitment
 - Single-instance operation with a local data directory
-- `CREATE TABLE`, `ALTER TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE`
-- Single-column primary keys, column-level unique constraints, defaults, and
-  current SQL type aliases
-- `WHERE` predicates using `=`, `!=`/`<>`, `<`, `>`, `<=`, `>=`, `AND`, parenthesized `OR` groups, and `IS [NOT] NULL`; single-column
-  `ORDER BY [ASC|DESC]`; `LIMIT` and `OFFSET`
-- Autocommit and explicit `BEGIN` / `COMMIT` / `ROLLBACK` transactions
+- The read-only Runa Flow relation projection slice
+- Canonical Runa Query IR format version `1`
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
 - WAL checkpoint (compaction): bounded WAL size and bounded recovery time
@@ -59,14 +45,8 @@ operations remain long-horizon target designs. See
 [ADR-0016](docs/adr/0016-long-horizon-unified-database.md) and
 [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
-The following are currently rejected explicitly: `CREATE INDEX`, foreign keys,
-table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`,
-`ON CONFLICT`, multi-column `ORDER BY`, aggregation, grouping, and the extended query messages
-`Parse`, `Bind`, `Describe`, and `Execute`.
-
-See the [legacy SQL support matrix](docs/sql-subset.md) for the authoritative
-current SQL boundary. The target public language and protocol direction are
-recorded in [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
+Mutations, transactions, document and graph operations, semantic-model
+persistence, authorization, and World Continuum bindings are not implemented.
 
 ## Build
 
@@ -76,20 +56,6 @@ RunaDB currently requires Zig 0.16 or newer.
 zig build
 zig build test
 ```
-
-## Benchmark
-
-Run the SQL-path benchmark in an optimized build:
-
-```bash
-zig build bench -Doptimize=ReleaseFast -- --rows 100000
-```
-
-It reports autocommit `INSERT`, primary-key `SELECT`, and explicit-transaction
-`INSERT` plus `COMMIT` throughput. The default uses a temporary data directory
-and disables WAL synchronization so results emphasize the current SQL, table,
-and WAL append path. Add `--sync-wal` to include durable WAL synchronization in
-the measurement.
 
 ## Run
 
@@ -104,7 +70,7 @@ Configure the server with command-line options:
 ```bash
 zig build run -- \
   --host 127.0.0.1 \
-  --port 5433 \
+  --runa-port 5434 \
   --data-dir ./data
 ```
 
@@ -113,19 +79,18 @@ Available options:
 | Option | Default | Description |
 | --- | --- | --- |
 | `--host <address>` | `127.0.0.1` | Listen address |
-| `--port <port>` | `5433` | Listen port |
-| `--runadb-port <port>` | `5434` | Native RunaDB Wire Protocol TCP port (`0` disables it) |
+| `--runa-port <port>` | `5434` | RunaDB Wire Protocol TCP port (`0` disables it) |
 | `--data-dir <path>` | `./data` | Instance data directory |
 | `--no-sync` | disabled | Disable WAL synchronization; development only |
 
-The current development adapter can be exercised with `psql`, but this is not
-supported RunaDB client compatibility and will be replaced by the RunaDB protocol:
+The implemented Runa Flow source shape is:
 
-```bash
-psql -h 127.0.0.1 -p 5433 -U runadb -d runadb
+```runa-flow
+from users
+| emit { id, email }
 ```
 
-Example SQL:
+The following former SQL examples are historical implementation context only:
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -181,7 +146,7 @@ currently implemented components.
 - [Documentation standard](docs/DOCUMENTATION.md)
 - [Legacy SQL support matrix](docs/sql-subset.md)
 - [Runa Flow target design](docs/runa-flow.md)
-- [Legacy RunaDB Wire Protocol v0.1](docs/wire-protocol.md)
+- [RunaDB Wire Protocol v1.0](docs/wire-protocol.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Architecture decision records](docs/adr/)
 - [Domain terminology and product constraints](CONTEXT.md)

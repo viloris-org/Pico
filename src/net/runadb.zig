@@ -4,7 +4,8 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const exec = @import("../sql/exec.zig");
+const flow = @import("../flow/exec.zig");
+const flow_ir = @import("../flow/ir.zig");
 const engine_mod = @import("../storage/engine.zig");
 const proto = @import("clint_proto");
 
@@ -33,12 +34,6 @@ pub fn handleConnection(
     const r = &reader.interface;
     const w = &writer.interface;
 
-    var session = exec.Session.init(gpa);
-    defer {
-        session.rollback();
-        session.deinit();
-    }
-
     // ── Handshake: read HELLO ──
     {
         const msg_type, const payload = try readFrame(r);
@@ -66,38 +61,65 @@ pub fn handleConnection(
         };
 
         switch (msg_type) {
-            .query => {
+            .flow_source => {
                 var pos: usize = 0;
-                const sql = readStringFromPayload(payload, &pos) catch {
-                    try sendError(w, 2, "P0000", "invalid query message");
+                const source = readStringFromPayload(payload, &pos) catch {
+                    try sendError(w, 2, "RF1000", "invalid Runa Flow source payload");
                     try w.flush();
                     continue;
                 };
                 if (pos != payload.len) {
-                    try sendError(w, 2, "P0000", "invalid query message");
+                    try sendError(w, 2, "RF1000", "invalid Runa Flow source payload");
                     try w.flush();
                     continue;
                 }
-
-                var result = exec.execute(gpa, eng, &session, sql) catch |err| {
-                    try sendError(w, 2, "P0001", @errorName(err));
+                var request = flow.compile(gpa, source) catch |err| {
+                    try sendError(w, 2, "RF1001", @errorName(err));
+                    try w.flush();
+                    continue;
+                };
+                defer request.deinit(gpa);
+                var result = flow.execute(gpa, eng, &request) catch |err| {
+                    try sendError(w, 2, "RF1002", @errorName(err));
                     try w.flush();
                     continue;
                 };
                 defer result.deinit();
 
-                switch (result) {
-                    .empty => |tag| {
-                        try sendCommandComplete(w, tag, 0);
-                    },
-                    .rows => |rows| {
-                        try sendRowDescription(w, rows.col_names);
-                        for (rows.cells) |cell_row| {
-                            try sendRowData(w, cell_row);
-                        }
-                        try sendCommandComplete(w, "SELECT", rows.cells.len);
-                    },
+                try sendRowDescription(w, result.columns);
+                for (result.cells) |cell_row| {
+                    try sendRowData(w, cell_row);
                 }
+                try sendCommandComplete(w, "EMIT", result.cells.len);
+                try w.flush();
+            },
+            .flow_ir => {
+                if (payload.len < 2) {
+                    try sendError(w, 2, "RF1003", "invalid Runa Query IR payload");
+                    try w.flush();
+                    continue;
+                }
+                const format_version = std.mem.readInt(u16, payload[0..2], .big);
+                if (format_version != proto.IR_FORMAT_VERSION) {
+                    try sendError(w, 2, "RF1004", "unsupported Runa Query IR format version");
+                    try w.flush();
+                    continue;
+                }
+                var request = flow_ir.decode(gpa, payload[2..]) catch |err| {
+                    try sendError(w, 2, "RF1003", @errorName(err));
+                    try w.flush();
+                    continue;
+                };
+                defer request.deinit(gpa);
+                var result = flow.execute(gpa, eng, &request) catch |err| {
+                    try sendError(w, 2, "RF1002", @errorName(err));
+                    try w.flush();
+                    continue;
+                };
+                defer result.deinit();
+                try sendRowDescription(w, result.columns);
+                for (result.cells) |cell_row| try sendRowData(w, cell_row);
+                try sendCommandComplete(w, "EMIT", result.cells.len);
                 try w.flush();
             },
             .goodbye => {
@@ -107,7 +129,7 @@ pub fn handleConnection(
                 return;
             },
             else => {
-                try sendError(w, 2, "P0002", "unknown message type");
+                try sendError(w, 2, "RF1005", "unknown message type");
                 try w.flush();
                 return;
             },
@@ -275,7 +297,7 @@ test "row data encoding supports values larger than the old fixed buffer" {
 // ── Wire Protocol malformed-frame tests ──
 
 test "readFrame rejects zero body length" {
-    const bytes = [_]u8{ 0, 0, 0, 0, @intFromEnum(proto.Type.query) };
+    const bytes = [_]u8{ 0, 0, 0, 0, @intFromEnum(proto.Type.flow_source) };
     var reader: Io.Reader = .fixed(&bytes);
     try std.testing.expectError(error.Protocol, readFrame(&reader));
 }
@@ -283,7 +305,7 @@ test "readFrame rejects zero body length" {
 test "readFrame rejects body length exceeding maximum" {
     var bytes: [5]u8 = undefined;
     std.mem.writeInt(u32, bytes[0..4], @intCast(proto.MAX_BODY_LENGTH + 1), .big);
-    bytes[4] = @intFromEnum(proto.Type.query);
+    bytes[4] = @intFromEnum(proto.Type.flow_source);
     var reader: Io.Reader = .fixed(&bytes);
     try std.testing.expectError(error.MessageTooLarge, readFrame(&reader));
 }
@@ -292,7 +314,7 @@ test "readFrame returns error when payload bytes are missing" {
     // Header says 10-byte body (9-byte payload) but buffer ends after the header.
     var bytes: [5]u8 = undefined;
     std.mem.writeInt(u32, bytes[0..4], 10, .big);
-    bytes[4] = @intFromEnum(proto.Type.query);
+    bytes[4] = @intFromEnum(proto.Type.flow_source);
     var reader: Io.Reader = .fixed(&bytes);
     try std.testing.expectError(error.EndOfStream, readFrame(&reader));
 }
