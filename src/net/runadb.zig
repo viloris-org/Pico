@@ -271,3 +271,74 @@ test "row data encoding supports values larger than the old fixed buffer" {
     try std.testing.expectEqual(@as(u32, 5_008), std.mem.readInt(u32, encoded[0..4], .big));
     try std.testing.expectEqual(proto.Type.row_data, @as(proto.Type, @enumFromInt(encoded[4])));
 }
+
+// ── Wire Protocol malformed-frame tests ──
+
+test "readFrame rejects zero body length" {
+    const bytes = [_]u8{ 0, 0, 0, 0, @intFromEnum(proto.Type.query) };
+    var reader: Io.Reader = .fixed(&bytes);
+    try std.testing.expectError(error.Protocol, readFrame(&reader));
+}
+
+test "readFrame rejects body length exceeding maximum" {
+    var bytes: [5]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], @intCast(proto.MAX_BODY_LENGTH + 1), .big);
+    bytes[4] = @intFromEnum(proto.Type.query);
+    var reader: Io.Reader = .fixed(&bytes);
+    try std.testing.expectError(error.MessageTooLarge, readFrame(&reader));
+}
+
+test "readFrame returns error when payload bytes are missing" {
+    // Header says 10-byte body (9-byte payload) but buffer ends after the header.
+    var bytes: [5]u8 = undefined;
+    std.mem.writeInt(u32, bytes[0..4], 10, .big);
+    bytes[4] = @intFromEnum(proto.Type.query);
+    var reader: Io.Reader = .fixed(&bytes);
+    try std.testing.expectError(error.EndOfStream, readFrame(&reader));
+}
+
+test "validGoodbyePayload accepts empty payload" {
+    try std.testing.expect(validGoodbyePayload(&.{}));
+}
+
+test "validGoodbyePayload accepts a well-formed reason string" {
+    const payload = [_]u8{ 0, 0, 0, 2, 'o', 'k' };
+    try std.testing.expect(validGoodbyePayload(&payload));
+}
+
+test "validGoodbyePayload rejects a truncated string" {
+    // length prefix declares 5 bytes but only 3 follow
+    const payload = [_]u8{ 0, 0, 0, 5, 'b', 'y', 'e' };
+    try std.testing.expect(!validGoodbyePayload(&payload));
+}
+
+test "validGoodbyePayload rejects trailing bytes after reason string" {
+    const payload = [_]u8{ 0, 0, 0, 2, 'o', 'k', 0xff };
+    try std.testing.expect(!validGoodbyePayload(&payload));
+}
+
+test "sendHelloError encodes frame type and reason string" {
+    // Expected frame: [body_len u32 BE][type u8][str_len u32 BE][str bytes]
+    // reason = "bad version" (11 chars); body_len = 1 + 4 + 11 = 16
+    var output: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+    try sendHelloError(&writer, "bad version");
+    const encoded = writer.buffered();
+    try std.testing.expectEqual(@as(u32, 16), std.mem.readInt(u32, encoded[0..4], .big));
+    try std.testing.expectEqual(@as(u8, @intFromEnum(proto.Type.hello_error)), encoded[4]);
+    try std.testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, encoded[5..9], .big));
+    try std.testing.expectEqualStrings("bad version", encoded[9..20]);
+}
+
+test "sendError encodes severity, code, and message fields" {
+    // Expected layout after the 5-byte frame header:
+    //   [severity u8][code_len u32 BE][code][msg_len u32 BE][msg]
+    var output: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&output);
+    try sendError(&writer, 2, "P0001", "NotFound");
+    const encoded = writer.buffered();
+    try std.testing.expectEqual(@as(u8, @intFromEnum(proto.Type.server_error)), encoded[4]);
+    try std.testing.expectEqual(@as(u8, 2), encoded[5]);
+    try std.testing.expectEqual(@as(u32, 5), std.mem.readInt(u32, encoded[6..10], .big));
+    try std.testing.expectEqualStrings("P0001", encoded[10..15]);
+}
