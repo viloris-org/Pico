@@ -10,14 +10,23 @@ contracts. RunaDB Server currently runs as a standalone, single-instance network
 service. It is one of two independently released RunaDB products; RunaDB Client
 provides the CLI, drivers, and developer tools.
 
-RunaDB intentionally implements an OLTP SQL subset. It is not PostgreSQL
-compatible: its protocol, SQL dialect, types, errors, drivers, and tools are
-RunaDB-owned contracts. SQL outside the published support matrix is rejected with
-an explicit error.
+Runa Flow is RunaDB's target public request language. It is a typed,
+pipeline-oriented language that binds names through a semantic model and produces
+canonical, versioned Runa Query IR. The next incompatible RunaDB Wire Protocol
+major version will carry that contract. Runa Flow, Runa Query IR, the semantic
+model, and that protocol version are target designs; they are not yet supported
+product capabilities.
 
-RunaDB Server and RunaDB Client communicate only through the versioned RunaDB Wire
-Protocol, RunaDB SQL, and the public error model. See [product
-boundaries](docs/products.md).
+The current implementation accepts an OLTP-oriented, legacy RunaDB SQL subset
+over the current RunaDB Wire Protocol. It is not PostgreSQL compatible: its
+protocol, SQL dialect, types, errors, drivers, and tools are RunaDB-owned
+contracts. Unsupported legacy SQL fails with an explicit error. RunaDB will not
+add new SQL syntax; SQL is retained only until Runa Flow provides a tested
+replacement for the required baseline workflows.
+
+RunaDB Server and RunaDB Client communicate only through versioned protocol
+definitions and the public error model. See [product boundaries](docs/products.md)
+and [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
 ## Status
 
@@ -41,19 +50,23 @@ RunaDB Server is under active development. The current implementation provides:
 The storage format and execution architecture are still evolving. Persistent
 LSM tables, secondary indexes, MVCC isolation, group commit, and the extended
 query protocol are planned parts of the architecture, not all current product
-capabilities. Multi-model and multimodal data, AI-assisted execution,
-distributed deployments, HTAP, streaming, historical queries, post-quantum
-cryptography, and autonomous operations are long-horizon target designs; none
-is a current support claim. See [ADR-0016](docs/adr/0016-long-horizon-unified-database.md).
+capabilities. Runa Flow, Runa Query IR, and the semantic model are the next
+public-contract work; relation, document, and graph capabilities become support
+claims only when their complete semantics and evidence are published. Multi-model
+and multimodal data, AI-assisted execution, distributed deployments, HTAP,
+streaming, historical queries, post-quantum cryptography, and autonomous
+operations remain long-horizon target designs. See
+[ADR-0016](docs/adr/0016-long-horizon-unified-database.md) and
+[ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
 The following are currently rejected explicitly: `CREATE INDEX`, foreign keys,
 table-level unique constraints, composite primary keys, `CHECK`, `RETURNING`,
 `ON CONFLICT`, multi-column `ORDER BY`, aggregation, grouping, and the extended query messages
 `Parse`, `Bind`, `Describe`, and `Execute`.
 
-See the [SQL subset support matrix](docs/sql-subset.md) for the authoritative
-RunaDB SQL boundary. The target protocol and ecosystem decision is recorded in
-[ADR-0009](docs/adr/0009-runadb-native-ecosystem.md).
+See the [legacy SQL support matrix](docs/sql-subset.md) for the authoritative
+current SQL boundary. The target public language and protocol direction are
+recorded in [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
 ## Build
 
@@ -166,8 +179,9 @@ currently implemented components.
 ## Documentation
 
 - [Documentation standard](docs/DOCUMENTATION.md)
-- [SQL subset support matrix](docs/sql-subset.md)
-- [RunaDB Wire Protocol v0.1](docs/wire-protocol.md)
+- [Legacy SQL support matrix](docs/sql-subset.md)
+- [Runa Flow target design](docs/runa-flow.md)
+- [Legacy RunaDB Wire Protocol v0.1](docs/wire-protocol.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Architecture decision records](docs/adr/)
 - [Domain terminology and product constraints](CONTEXT.md)

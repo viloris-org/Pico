@@ -10,12 +10,15 @@ capability supported.
 RunaDB's long-horizon direction is a unified, verifiable data system spanning
 multiple data models, multimodal values, AI-assisted execution, continuum-scale
 deployment, long-lived history, privacy, and sustainable operation. This
-roadmap currently orders only the recoverable single-instance OLTP foundation.
-Its public contracts are RunaDB SQL, the versioned RunaDB Wire Protocol, and the
-public error model. RunaDB Client and RunaDB Server communicate only through those
-contracts. PostgreSQL compatibility and treating a checkpoint as a backup
-remain out of scope; distributed, analytical, and other future capabilities
-require dedicated ADRs before entering this roadmap.
+roadmap begins with the recoverable single-instance OLTP foundation, then moves
+the public request boundary to Runa Flow, Runa Query IR, and a semantic model as
+defined by ADR-0017. The current RunaDB SQL path and RunaDB Wire Protocol v0.1
+are legacy implementation surfaces until the next incompatible protocol major
+version is delivered. RunaDB Client and RunaDB Server communicate only through
+versioned protocol definitions and the public error model. PostgreSQL
+compatibility and treating a checkpoint as a backup remain out of scope;
+distributed, analytical, and other future capabilities require dedicated ADRs
+before entering this roadmap.
 
 The roadmap is ordered by technical dependencies, not calendar dates. A phase
 is complete only when its exit criteria are met and its public documentation
@@ -29,15 +32,17 @@ capabilities exist but are not collectively a release claim:
 
 | Area | Current baseline | Authoritative detail |
 | --- | --- | --- |
-| RunaDB SQL | Core table definition and DML, predicates, ordering, limits, and explicit transaction syntax | [SQL subset support matrix](docs/sql-subset.md) |
+| Legacy RunaDB SQL | Core table definition and DML, predicates, ordering, limits, and explicit transaction syntax; no new SQL syntax | [SQL subset support matrix](docs/sql-subset.md) |
 | Persistence | WAL-backed table changes, CRC32 validation, and recovery of a valid committed prefix | [WAL and crash recovery](docs/architecture/wal-and-recovery.md) |
-| Native client path | RunaDB Wire Protocol v0.1 over sequential TCP and a RunaDB Zig client integration suite | [RunaDB Wire Protocol v0.1](docs/wire-protocol.md) |
+| Legacy native client path | RunaDB Wire Protocol v0.1 over sequential TCP and a RunaDB Zig client integration suite | [RunaDB Wire Protocol v0.1](docs/wire-protocol.md) |
 | PostgreSQL adapter | Transitional development adapter only; not a product compatibility commitment | [ADR-0009](docs/adr/0009-runadb-native-ecosystem.md) |
 | Target architecture | LSM storage, MVCC, single-writer commits, group commit, VFS, Pager, execution programs, and asynchronous runtime boundaries are designed but not all implemented | [Architecture](docs/ARCHITECTURE.md) |
-| Accepted later work | RunaDB SQL administration, interactive RunaDB Client, Ed25519 authentication and permissions, and QUIC transport | [ADRs](docs/adr/) |
+| Target public contract | Runa Flow, Runa Query IR, semantic model, and the next incompatible RunaDB Wire Protocol major version | [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md) |
+| Accepted later work | Interactive RunaDB Client, Ed25519 authentication and permissions, and QUIC transport | [ADRs](docs/adr/) |
 
-The [README](README.md), SQL support matrix, and protocol specification own
-current support claims. This document intentionally does not duplicate them.
+The [README](README.md), legacy SQL support matrix, and legacy protocol
+specification own current implementation claims. This document intentionally
+does not duplicate them.
 
 ## Long-Horizon Direction
 
@@ -60,8 +65,8 @@ format migration, observability, recovery, and evidence requirements.
 - Keep the write path WAL-first. The default durability level must confirm
   persistence before a successful `COMMIT`; relaxed durability must remain
   explicit and non-default.
-- Reject unsupported RunaDB SQL and protocol input clearly. Never silently accept
-  a partially implemented semantic.
+- Reject unsupported legacy RunaDB SQL, Runa Flow, Runa Query IR, and protocol
+  input clearly. Never silently accept a partially implemented semantic.
 - Version every persistent or public format change and add compatibility,
   malformed-input, and recovery coverage before publishing support.
 - Maintain the RunaDB Client/RunaDB Server product boundary: no client access to a
@@ -74,15 +79,15 @@ format migration, observability, recovery, and evidence requirements.
 
 ## Roadmap
 
-### Phase 0: Stabilize the Public Baseline
+### Phase 0: Preserve the Legacy Baseline
 
-**Goal:** Make the existing native RunaDB path a dependable development and
-compatibility baseline before deep storage and concurrency changes.
+**Goal:** Keep the existing SQL and protocol v0.1 implementation dependable as
+a development baseline while its replacement is designed and delivered.
 
-- Complete the RunaDB Wire Protocol v0.1 error model, version-negotiation
+- Complete the legacy RunaDB Wire Protocol v0.1 error model, version-negotiation
   behavior, connection lifecycle, message-size handling, and malformed-frame
   tests.
-- Keep the SQL support matrix exact: document every supported statement,
+- Keep the legacy SQL support matrix exact: document every supported statement,
   type, constraint, error, and explicit rejection with its regression location.
 - Expand RunaDB Client-to-Server contract tests for successful statements,
   server errors, connection closure, unknown write outcomes, and compatibility
@@ -92,12 +97,57 @@ compatibility baseline before deep storage and concurrency changes.
 - Classify the PostgreSQL adapter as migration-only in code, tests, examples,
   and release material; remove it from RunaDB product acceptance criteria.
 
-**Exit criteria:** Protocol v0.1 and RunaDB SQL documentation agree with tests;
-the official RunaDB Client exercises the public contract; malformed input cannot
-change shared state; and a recovery regression covers the advertised WAL
-behavior.
+**Exit criteria:** Legacy protocol v0.1 and RunaDB SQL documentation agree with
+tests; the official RunaDB Client exercises the legacy contract; malformed input
+cannot change shared state; and a recovery regression covers the advertised WAL
+behavior. These criteria do not make the legacy contract the future public
+boundary.
 
-### Phase 1: Transaction Semantics and Commit Coordination
+### Phase 1: Runa Flow Contract and Protocol Major
+
+**Goal:** Define the replacement public boundary before treating new data-model
+capabilities or language syntax as deliverable work.
+
+- Publish the Runa Flow grammar, static type rules, canonical Runa Query IR
+  schema, semantic-model schema, and distinct parse, binding, type, policy,
+  resource, and execution errors.
+- Define the next incompatible RunaDB Wire Protocol major version, including
+  protocol-major and IR-format negotiation, rejection behavior, and official
+  RunaDB Client coverage.
+- Establish versioning and migration/rejection rules for Runa Flow source,
+  Query IR, semantic-model revisions, model bindings, and future persisted
+  values. An unsupported old form must leave the data directory unchanged.
+- Define the source-to-IR explanation boundary and the validation boundary for
+  natural-language requests. Generated requests remain advisory until validated
+  Runa Query IR is accepted for execution.
+- Stop expanding RunaDB SQL and prevent a silent SQL-to-Flow translation path.
+
+**Exit criteria:** The target language, IR, semantic model, error model, and
+protocol-major negotiation are published as coherent drafts with deterministic
+validation and rejection coverage. No capability is called supported merely
+because its source syntax or IR shape exists.
+
+### Phase 2: Read-Only Semantic-Model Vertical Slices
+
+**Goal:** Prove the new public boundary through narrow, end-to-end read paths
+before adding mutations or declaring multiple data models supported.
+
+- Build relation, document, and graph read-only vertical slices through the
+  official RunaDB Client, from Runa Flow source through binding and canonical
+  Runa Query IR to result explanation.
+- Define each operation's input and result shape, cardinality, ordering,
+  nullability, authorization requirements, resource accounting, and explicit
+  unsupported outcomes.
+- Keep semantic-model declarations distinct from physical table, index, and
+  value bindings so execution may evolve without changing language semantics.
+- Add deterministic source-to-IR, IR-to-result, malformed-input, authorization,
+  resource-limit, and Connection lifecycle coverage.
+
+**Exit criteria:** Each slice is supported and tested only for its published
+semantics; source and equivalent IR produce the same result or error; and no
+document, vector, temporal, or multimodal capability is implied by the slices.
+
+### Phase 3: Transaction Semantics and Commit Coordination
 
 **Goal:** Replace compatibility transaction labels with verified transaction
 semantics while retaining one commit order.
@@ -121,7 +171,7 @@ commit, rollback, failed transactions, visibility, conflicts, cancellation,
 and bounded contention. Failure injection at every WAL and publication boundary
 shows that restart exposes only the confirmed commit prefix.
 
-### Phase 2: Durable Storage Foundation
+### Phase 4: Durable Storage Foundation
 
 **Goal:** Establish the data-directory and file-management primitives required
 for durable LSM storage.
@@ -143,7 +193,7 @@ alignment/cache-full/pin tests, format-rejection tests, checkpoint recovery,
 and catalog recovery are verified. No persistent file is published outside the
 VFS or without a versioned validation path.
 
-### Phase 3: LSM Storage and MVCC Retention
+### Phase 5: LSM Storage and MVCC Retention
 
 **Goal:** Move table and index storage from the in-memory baseline to ordered,
 recoverable LSM structures while preserving snapshot visibility.
@@ -165,19 +215,20 @@ snapshot-visibility, concurrent-read/write, compaction, and delayed-reclamation
 regressions pass. Benchmark baselines identify workload, optimization level,
 machine context, and durability level.
 
-### Phase 4: Execution and Runtime Evolution
+### Phase 6: Execution and Runtime Evolution
 
 **Goal:** Scale execution and connection handling without crossing ownership
 boundaries or weakening commit correctness.
 
 - Introduce execution programs incrementally, preserving golden result and
-  error parity with direct RunaDB SQL interpretation during the transition.
+  error parity with validated Runa Query IR execution. Keep legacy SQL coverage
+  separate until the legacy path is removed.
 - Add streaming result production, cancellation points, result backpressure,
   and resource accounting at execution-program boundaries.
 - Implement the runtime I/O scheduler, connection lifecycle, and bounded work
   queues described by the target architecture.
 - Permit concurrent network and I/O work while routing all logical mutation
-  through the Phase 1 single-writer coordinator.
+  through the Phase 3 single-writer coordinator.
 - Add load and fault tests for slow consumers, cancellation, connection loss,
   queue saturation, and compaction pressure.
 
@@ -185,18 +236,19 @@ boundaries or weakening commit correctness.
 streaming backpressure, queue-bound, and concurrent-read/write regressions
 pass. Load tests show bounded resource use and predictable contention behavior.
 
-### Phase 5: RunaDB SQL Administration and Access Control
+### Phase 7: Administration and Access Control
 
-**Goal:** Deliver operable, authenticated instances through RunaDB SQL and the
-official RunaDB Client.
+**Goal:** Deliver operable, authenticated instances through the target protocol
+and official RunaDB Client.
 
-- Implement `RUNADB STATUS`, `RUNADB CONFIG`, and `RUNADB SHUTDOWN` with precise
-  permissions, runtime-only configuration semantics where specified, and safe
-  shutdown/checkpoint sequencing.
+- Define administration requests, including status, configuration, and shutdown,
+  in Runa Flow and Runa Query IR with precise permissions, runtime-only
+  configuration semantics where specified, and safe shutdown/checkpoint
+  sequencing.
 - Implement the Ed25519 challenge-response handshake, OpenSSH public-key
   parsing, key fingerprints, and `HELLO` protocol extensions.
-- Add `runadb_catalog.users`, user/key management statements, permission bitmap
-  enforcement for every statement, and durable bootstrap of the first admin.
+- Add `runadb_catalog.users`, user/key-management requests, permission bitmap
+  enforcement for every request, and durable bootstrap of the first admin.
 - Implement key rotation, development-only insecure mode, and CA certificate
   mode according to ADR-0014.
 - Audit all authentication failures, permission denials, configuration changes,
@@ -206,7 +258,7 @@ official RunaDB Client.
 every permission bit, authorization errors that keep a Connection usable, key
 rotation, CA expiration, safe shutdown, and recovery of the system catalog.
 
-### Phase 6: RunaDB Client Product Completion
+### Phase 8: RunaDB Client Product Completion
 
 **Goal:** Make RunaDB Client the practical default interface without coupling it
 to RunaDB Server internals.
@@ -228,7 +280,7 @@ or PTY coverage; client APIs have contract tests against RunaDB Server; and
 supported client/server version pairs are published and verified through the
 RunaDB Wire Protocol.
 
-### Phase 7: QUIC Transition and TCP Retirement
+### Phase 9: QUIC Transition and TCP Retirement
 
 **Goal:** Make zquic-based QUIC the primary RunaDB transport while retaining one
 RunaDB application protocol and a controlled TCP migration path.
@@ -258,7 +310,7 @@ Every phase and release must maintain these conditions:
 
 | Gate | Required evidence |
 | --- | --- |
-| Public contract | Versioned protocol or RunaDB SQL support-matrix update, explicit errors, and official RunaDB Client end-to-end coverage |
+| Public contract | Versioned protocol, Runa Flow, Runa Query IR, semantic-model, or legacy SQL support-matrix update; explicit errors; and official RunaDB Client end-to-end coverage |
 | Durable commit | WAL-first ordering, selected durability-level behavior, interruption testing, and restart recovery of only the confirmed prefix |
 | Persistent format | Versioning, malformed/corrupt-data rejection, I/O failure coverage, and recovery regression |
 | Concurrency | Commit order, snapshot visibility, conflict/cancellation behavior, bounded queues, and contention tests |
@@ -284,7 +336,7 @@ changes the product direction:
 - Multi-node consensus, replication, sharding, failover, and distributed
   transactions.
 - PostgreSQL protocol, SQL, driver, tool, type-system, or error compatibility.
-- OLAP execution, data warehousing, and broad analytical SQL features.
+- OLAP execution, data warehousing, and broad analytical language features.
 - Backup, point-in-time recovery, or describing a checkpoint as either.
 - Unbounded caches, unbounded queues, or asynchronous durability as the
   production default.
@@ -293,6 +345,6 @@ changes the product direction:
 
 This roadmap may be refined as evidence changes, but it cannot supersede an
 accepted ADR. A proposal that changes the product boundary, durability level,
-commit ordering, persistent format contract, SQL scope, or transport migration
-policy requires an ADR and corresponding protocol, SQL, architecture, and test
-updates.
+commit ordering, persistent format contract, Runa Flow or Runa Query IR
+semantics, or transport migration policy requires an ADR and corresponding
+protocol, language, architecture, and test updates.
