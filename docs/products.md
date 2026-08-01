@@ -18,7 +18,7 @@ capabilities. Compatibility is verified by the `RunaDB Client version x RunaDB S
 contract tests; it does not depend on matching version numbers or a shared codebase.
 
 This repository co-locates RunaDB Server and RunaDB Client under `src/` and
-`clint/` respectively. They communicate through RunaDB Wire Protocol v2; the
+`clint/` respectively. They communicate through RunaDB Wire Protocol v3; the
 removed PostgreSQL adapter and SQL endpoint are not supported compatibility
 surfaces.
 

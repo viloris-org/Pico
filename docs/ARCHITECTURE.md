@@ -165,7 +165,7 @@ On WAL sync failure, record-encoding failure, or constraint conflict, `commit` d
 
 Observation Evidence is a second immutable persistent format: catalog and LSM
 records hold the logical metadata and a versioned payload reference, while the
-payload bytes live in versioned immutable payload files (ADR-0019). Protocol v2
+payload bytes live in versioned immutable payload files (ADR-0019). Protocol v3
 stages one bounded attachment per Connection in bounded memory; the stage is not
 durable or resumable. Before the single-writer commit point, the Server
 validates the declared length and digest, writes and synchronizes the complete
@@ -220,7 +220,7 @@ If the single writer becomes unacceptable under measured workloads, first use co
 - [VFS](architecture/vfs.md): data-directory fencing, instance lock, positioned I/O, and atomic publication.
 - [Pager and Static Page Cache](architecture/pager-and-static-cache.md): fixed-size page pinning, eviction, and compile-time cache hard limits.
 - [Runa Flow](runa-flow.md): source grammar, canonical Runa Query IR, validation, and implemented execution slice.
-- [Wire Protocol v2](wire-protocol.md): framing, handshake, result framing, and bounded Observation Evidence attachment frames.
+- [Wire Protocol v3](wire-protocol.md): framing, handshake, result framing, and bounded Observation Evidence attachment frames.
 - [Runtime, Connections, and Concurrency Control](architecture/runtime-and-concurrency.md): connection lifecycle, cancellation, bounded scheduling, commit ordering, and snapshot publication.
 - [I/O Scheduling Contract](architecture/io-scheduling.md): defines completion/callback separation, critical-I/O capacity reservation, connection fairness, backpressure, and failure handling; platform backends may vary, but commit and durability semantics may not.
 - [WAL and Crash Recovery](architecture/wal-and-recovery.md): RunaDB WAL frame format, record types, recovery process, CRC invariants, and fault model.

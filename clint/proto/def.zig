@@ -1,8 +1,8 @@
 //! RunaDB Wire Protocol — shared message type definitions.
 //! Used by both RunaDB Server (src/net/runadb.zig) and RunaDB Client (clint/).
-//! Version: v2.0 (development contract; incompatible with the retired SQL endpoint).
+//! Version: v3.0 (development contract; incompatible with the retired SQL endpoint).
 
-pub const PROTOCOL_VERSION_MAJOR: u16 = 2;
+pub const PROTOCOL_VERSION_MAJOR: u16 = 3;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
 pub const IR_FORMAT_VERSION: u16 = 4;
 

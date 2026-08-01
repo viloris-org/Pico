@@ -9,7 +9,7 @@ const proto = clint.proto;
 const server_port: u16 = 64334;
 const data_dir = "zig-cache/runa-client-protocol-integration";
 
-test "RunaDB Client v2 protocol lifecycle, evidence, and request errors" {
+test "RunaDB Client v3 protocol lifecycle, evidence, and request errors" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const server_path = std.mem.span(std.c.getenv("RUNA_TEST_SERVER") orelse return error.ServerPathMissing);
@@ -316,7 +316,7 @@ fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io:
     try writer.interface.flush();
     try expectServerError(allocator, &reader.interface, "RF1002");
 
-    // SQL text has no compatibility or translation path in the v2 endpoint.
+    // SQL text has no compatibility or translation path in the v3 endpoint.
     const sql_text = "SELECT 1";
     var sql_payload: [4 + sql_text.len]u8 = undefined;
     std.mem.writeInt(u32, sql_payload[0..4], sql_text.len, .big);

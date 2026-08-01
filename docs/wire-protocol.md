@@ -1,4 +1,4 @@
-# RunaDB Wire Protocol v2.0
+# RunaDB Wire Protocol v3.0
 
 Status: Implemented development contract. This native TCP protocol is the
 incompatible successor to the removed SQL-text v0.1 endpoint. It does not
@@ -7,9 +7,12 @@ promise compatibility with the PostgreSQL Frontend/Backend Protocol.
 ## Compatibility
 
 The protocol version is a `(major, minor)` pair. The checked-out Server and
-Client implement `2.0`. A `HELLO` with a major other than `2` receives
+Client implement `3.0`. A `HELLO` with a major other than `3` receives
 `HELLO_ERROR` with `unsupported protocol version`, then the Connection closes.
-Minor-version compatibility has not yet been defined.
+Minor-version compatibility has not yet been defined. The major bump from `2`
+to `3` is the negotiated surface for the cancellation credential that `HELLO_OK`
+now appends: a `v2` peer is rejected at the version check before that framing is
+parsed, so it never sees an ambiguous trailing-payload error.
 
 ## Framing
 
@@ -113,7 +116,7 @@ length-prefixed text representation. `COMMAND_COMPLETE` contains a big-endian
 | `EV1003` | Observation Evidence validation or commit failure |
 | `EV1004` | Evidence payload not found or unreadable |
 
-These errors and the relation binding are development-only. Protocol v2
+These errors and the relation binding are development-only. Protocol v3
 implements durable Observation Evidence writes, metadata reads, and payload
 reads; other World Continuum mutations remain unsupported.
 In particular, an IR payload with an empty projection or a relation or field

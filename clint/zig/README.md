@@ -8,7 +8,7 @@ claim is intentionally narrow:
 
 | Client package | RunaDB Wire Protocol | RunaDB Server |
 | --- | --- | --- |
-| Checked-out RunaDB Zig SDK | `2.0` | `RunaDB 0.0.1` in this checked-out revision |
+| Checked-out RunaDB Zig SDK | `3.0` | `RunaDB 0.0.1` in this checked-out revision |
 
 Other server versions are unverified until they have a compatibility regression.
 Run `zig build test` to build the independently deployable `runadb` binary and

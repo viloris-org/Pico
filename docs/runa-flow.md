@@ -1,6 +1,6 @@
 # Runa Flow
 
-Status: Partially implemented development contract. RunaDB Wire Protocol v2.0
+Status: Partially implemented development contract. RunaDB Wire Protocol v3.0
 accepts the read-only relation slice below as Runa Flow source or Runa Query IR.
 Canonical IR also implements `observe` and `read_evidence_payload` for immutable
 Observation Evidence. SQL text is not an accepted protocol request. All other
@@ -11,7 +11,8 @@ operation families remain target design.
 Runa Flow is RunaDB's future formal data language. It presents requests as a
 linear pipeline and binds them against a semantic model before any physical
 planning occurs. It replaced RunaDB SQL in RunaDB Wire Protocol v1; protocol v2
-adds the first World Continuum persistence slice.
+added the first World Continuum persistence slice, and protocol v3 is the current
+development contract.
 
 ## Pipeline Shape
 
@@ -145,7 +146,7 @@ explicit approval policy; defining that policy is separate work.
 ## Compatibility
 
 No SQL compatibility layer is part of Runa Flow. The retired SQL parser,
-executor, and protocol endpoints are not built. The v2 protocol and IR format
+executor, and protocol endpoints are not built. The v3 protocol and IR format
 remain development contracts until the formal grammar, semantic model, and
 compatibility policy are published.
 

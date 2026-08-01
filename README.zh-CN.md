@@ -4,7 +4,7 @@ RunaDB Server 是使用 Zig 实现的单实例网络数据服务，也是 RunaDB
 OLTP 基础。RunaDB Client 作为独立产品提供 CLI、驱动和开发工具；两者只通过
 版本化的 RunaDB Wire Protocol 通信。
 
-Runa Flow 是当前原生请求语言。Wire Protocol v2.0 开发版本接受
+Runa Flow 是当前原生请求语言。Wire Protocol v3.0 开发版本接受
 `from <relation> | where <predicate> | emit { <field> }` 形式的 Runa Flow
 source，或格式版本 `4` 的规范 Runa Query IR。它也支持不可变 Observation
 Evidence 的写入、元数据查询和有界 payload 回读。SQL 文本、PostgreSQL 协议和
@@ -71,7 +71,7 @@ from users
 ## 文档
 
 - [Runa Flow 与 Runa Query IR](docs/runa-flow.md)
-- [RunaDB Wire Protocol v2.0](docs/wire-protocol.md)
+- [RunaDB Wire Protocol v3.0](docs/wire-protocol.md)
 - [架构](docs/ARCHITECTURE.md)
 - [ADR](docs/adr/)
 - [领域术语](CONTEXT.md)
