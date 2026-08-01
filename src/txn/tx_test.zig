@@ -416,3 +416,199 @@ test "a torn wal tail after a transaction commit keeps only the confirmed prefix
     }
     Io.Dir.cwd().deleteTree(io, dir) catch {};
 }
+
+// ── Read Committed read path (roadmap Phase 3) ──
+//
+// The transaction-aware reads merge the private write set (read-your-writes)
+// over committed state. They are the engine boundary that makes explicit
+// transactions read their own staged writes while every other reader sees only
+// published commits.
+
+test "read-your-writes: a transaction reads its own staged writes" {
+    const dir = "zig-cache/runadb-txn-read-your-writes";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{col("name", .text)});
+
+    var alice: value.Value = .{ .text = try gpa.dupe(u8, "alice") };
+    defer alice.deinit(gpa);
+    var carol: value.Value = .{ .text = try gpa.dupe(u8, "carol") };
+    defer carol.deinit(gpa);
+    try eng.insert("t", &.{ .{ .int = 1 }, alice });
+    try eng.insert("t", &.{ .{ .int = 3 }, carol });
+
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    var bob: value.Value = .{ .text = try gpa.dupe(u8, "bob") };
+    defer bob.deinit(gpa);
+    var alice2: value.Value = .{ .text = try gpa.dupe(u8, "alice-updated") };
+    defer alice2.deinit(gpa);
+    try eng.stageInsert(&tx, "t", &.{ .{ .int = 2 }, bob });
+    try eng.stageUpdate(&tx, "t", .{ .int = 1 }, &.{ .{ .int = 1 }, alice2 });
+    try eng.stageDelete(&tx, "t", .{ .int = 3 });
+
+    // Point reads see the transaction's own staged writes.
+    var updated = try eng.selectByPkTx(&tx, "t", .{ .int = 1 });
+    defer updated.deinit();
+    try std.testing.expectEqual(@as(usize, 1), updated.rows.len);
+    try std.testing.expectEqualStrings("alice-updated", updated.rows[0].values[1].text);
+
+    var inserted = try eng.selectByPkTx(&tx, "t", .{ .int = 2 });
+    defer inserted.deinit();
+    try std.testing.expectEqual(@as(usize, 1), inserted.rows.len);
+    try std.testing.expectEqualStrings("bob", inserted.rows[0].values[1].text);
+
+    var deleted = try eng.selectByPkTx(&tx, "t", .{ .int = 3 });
+    defer deleted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), deleted.rows.len);
+
+    // The merged scan contains exactly the transaction's view: committed rows
+    // in read order, staged delete removed, staged insert appended.
+    var all = try eng.selectAllTx(&tx, "t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 2), all.rows.len);
+    try std.testing.expectEqualStrings("alice-updated", all.rows[0].values[1].text);
+    try std.testing.expectEqualStrings("bob", all.rows[1].values[1].text);
+
+    // Committing publishes exactly that state.
+    try eng.commitTransaction(&tx);
+    var committed = try eng.selectAll("t");
+    defer committed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), committed.rows.len);
+    try std.testing.expectEqualStrings("alice-updated", committed.rows[0].values[1].text);
+    try std.testing.expectEqualStrings("bob", committed.rows[1].values[1].text);
+}
+
+test "an uncommitted write set is invisible to other readers and transactions" {
+    const dir = "zig-cache/runadb-txn-invisible";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{col("name", .text)});
+    var alice: value.Value = .{ .text = try gpa.dupe(u8, "alice") };
+    defer alice.deinit(gpa);
+    try eng.insert("t", &.{ .{ .int = 1 }, alice });
+
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    var secret: value.Value = .{ .text = try gpa.dupe(u8, "secret") };
+    defer secret.deinit(gpa);
+    try eng.stageInsert(&tx, "t", &.{ .{ .int = 2 }, secret });
+    try eng.stageUpdate(&tx, "t", .{ .int = 1 }, &.{ .{ .int = 1 }, secret });
+
+    // A plain read (another connection) sees only committed rows.
+    var plain = try eng.selectAll("t");
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plain.rows.len);
+    try std.testing.expectEqualStrings("alice", plain.rows[0].values[1].text);
+
+    // Another transaction's Read Committed scan sees only committed rows.
+    var other = eng.beginTransaction();
+    defer other.deinit();
+    var other_view = try eng.selectAllTx(&other, "t");
+    defer other_view.deinit();
+    try std.testing.expectEqual(@as(usize, 1), other_view.rows.len);
+    try std.testing.expectEqualStrings("alice", other_view.rows[0].values[1].text);
+
+    var other_pk = try eng.selectByPkTx(&other, "t", .{ .int = 2 });
+    defer other_pk.deinit();
+    try std.testing.expectEqual(@as(usize, 0), other_pk.rows.len);
+}
+
+test "Read Committed re-reads the latest committed state between statements" {
+    const dir = "zig-cache/runadb-txn-read-committed";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{col("v", .int)});
+    try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 10 } });
+
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+
+    var first = try eng.selectByPkTx(&tx, "t", .{ .int = 1 });
+    defer first.deinit();
+    try std.testing.expectEqual(@as(i64, 10), first.rows[0].values[1].int);
+
+    // A separate autocommit connection commits between the two statements.
+    try eng.update("t", .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 20 } });
+
+    // Read Committed: the second statement observes that commit.
+    var second = try eng.selectByPkTx(&tx, "t", .{ .int = 1 });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(i64, 20), second.rows[0].values[1].int);
+
+    // The transaction still keeps its own staged writes on top of fresh state.
+    try eng.stageInsert(&tx, "t", &.{ .{ .int = 2 }, .{ .int = 200 } });
+    var merged = try eng.selectAllTx(&tx, "t");
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(usize, 2), merged.rows.len);
+    try std.testing.expectEqual(@as(i64, 20), merged.rows[0].values[1].int);
+    try std.testing.expectEqual(@as(i64, 200), merged.rows[1].values[1].int);
+}
+
+test "a staged insert followed by update emits the latest write-set values" {
+    const dir = "zig-cache/runadb-txn-insert-then-update";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{col("name", .text)});
+
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    var first: value.Value = .{ .text = try gpa.dupe(u8, "first") };
+    defer first.deinit(gpa);
+    var second: value.Value = .{ .text = try gpa.dupe(u8, "second") };
+    defer second.deinit(gpa);
+    try eng.stageInsert(&tx, "t", &.{ .{ .int = 2 }, first });
+    try eng.stageUpdate(&tx, "t", .{ .int = 2 }, &.{ .{ .int = 2 }, second });
+
+    var point = try eng.selectByPkTx(&tx, "t", .{ .int = 2 });
+    defer point.deinit();
+    try std.testing.expectEqual(@as(usize, 1), point.rows.len);
+    try std.testing.expectEqualStrings("second", point.rows[0].values[1].text);
+
+    var all = try eng.selectAllTx(&tx, "t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+    try std.testing.expectEqualStrings("second", all.rows[0].values[1].text);
+}
+
+test "a staged update followed by delete hides the row from the transaction" {
+    const dir = "zig-cache/runadb-txn-update-then-delete";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{col("v", .int)});
+    try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 10 } });
+
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    try eng.stageUpdate(&tx, "t", .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 99 } });
+    try eng.stageDelete(&tx, "t", .{ .int = 1 });
+
+    var point = try eng.selectByPkTx(&tx, "t", .{ .int = 1 });
+    defer point.deinit();
+    try std.testing.expectEqual(@as(usize, 0), point.rows.len);
+
+    var all = try eng.selectAllTx(&tx, "t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 0), all.rows.len);
+
+    // Committing publishes the deletion.
+    try eng.commitTransaction(&tx);
+    var committed = try eng.selectAll("t");
+    defer committed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), committed.rows.len);
+}

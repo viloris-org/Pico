@@ -9,6 +9,7 @@ const engine_mod = @import("../storage/engine.zig");
 const table_mod = @import("../storage/table.zig");
 const value = @import("../storage/value.zig");
 const evidence = @import("../storage/evidence.zig");
+const txn_mod = @import("../txn/transaction.zig");
 
 pub const ExecError = ast.ParseError || ir.IrError || error{
     SemanticNameNotFound,
@@ -78,13 +79,73 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
     var emitted: usize = 0;
     for (indices) |row_index| {
         if (emitted >= max_rows) break;
-        const output = try gpa.alloc(?[]const u8, projection.len);
-        errdefer gpa.free(output);
-        for (projection, 0..) |column, output_index| output[output_index] = try valueToText(gpa, &owned_text, table.rows.items[row_index].values[column]);
-        try cells.append(gpa, output);
+        try emitRow(gpa, &owned_text, &cells, projection, table.rows.items[row_index].values);
         emitted += 1;
     }
     return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
+}
+
+/// Execute a read-only Request through an explicit transaction with Read
+/// Committed visibility: a relation `emit` sees committed state merged with the
+/// transaction's private write set (read-your-writes). Each Request re-reads
+/// the latest committed state, so two `emit` calls in one explicit transaction
+/// may observe commits made by other transactions between them. The evidence
+/// view has no private write set in this slice and is read from committed
+/// observations directly.
+pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, tx: *txn_mod.Transaction) ExecError!Result {
+    if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
+    if (request.operation != .emit) return error.InvalidOperation;
+    if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
+    const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
+    const projection = try bindProjection(gpa, table, request.fields);
+    defer gpa.free(projection);
+
+    const columns = try gpa.alloc([]const u8, projection.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |index, output_index| columns[output_index] = table.columns[index].name;
+
+    var owned_text: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (owned_text.items) |text| gpa.free(text);
+        owned_text.deinit(gpa);
+    }
+    var cells: std.ArrayList([]?[]const u8) = .empty;
+    errdefer {
+        for (cells.items) |row| gpa.free(row);
+        cells.deinit(gpa);
+    }
+
+    var bound = try bindTableWhere(gpa, table, request.where);
+    defer bound.deinit();
+
+    // The table was resolved above; a defensive TableNotFound maps to the same
+    // semantic error as an unresolved relation name.
+    var merged = eng.selectAllTx(tx, request.relation) catch |err| return switch (err) {
+        error.TableNotFound => error.SemanticNameNotFound,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+    defer merged.deinit();
+
+    const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
+    var emitted: usize = 0;
+    for (merged.rows) |row| {
+        if (emitted >= max_rows) break;
+        if (!table_mod.valuesMatch(row.values, bound.preds)) continue;
+        try emitRow(gpa, &owned_text, &cells, projection, row.values);
+        emitted += 1;
+    }
+    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
+}
+
+/// Project one row's values into an output cell row and append it to `cells`.
+/// Text rendering is owned through `owned_text`; the caller frees both.
+fn emitRow(gpa: Allocator, owned_text: *std.ArrayList([]u8), cells: *std.ArrayList([]?[]const u8), projection: []const usize, row_values: []const value.Value) !void {
+    const output = try gpa.alloc(?[]const u8, projection.len);
+    errdefer gpa.free(output);
+    for (projection, 0..) |column, output_index| {
+        output[output_index] = try valueToText(gpa, owned_text, row_values[column]);
+    }
+    try cells.append(gpa, output);
 }
 
 const EvidenceField = struct {
@@ -313,7 +374,17 @@ fn literalToValue(column_type: value.TypeTag, literal: *const ast.Literal) !valu
 fn valueToText(gpa: Allocator, owned: *std.ArrayList([]u8), item: value.Value) !?[]const u8 {
     switch (item) {
         .null => return null,
-        .text => |text| return text,
+        // Text is copied into `owned` so a rendered row never aliases the
+        // source row: the relation emit path may read through a transient
+        // transaction write set whose rows are freed when the read completes.
+        .text => |text| {
+            const owned_text = try gpa.dupe(u8, text);
+            owned.append(gpa, owned_text) catch |err| {
+                gpa.free(owned_text);
+                return err;
+            };
+            return owned_text;
+        },
         .bool => |boolean| return if (boolean) "true" else "false",
         .int => |integer| {
             const text = try std.fmt.allocPrint(gpa, "{d}", .{integer});
@@ -537,6 +608,79 @@ test "where filters observation evidence by typed fields" {
     defer by_length_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), by_length_result.cells.len);
     try std.testing.expectEqualStrings("camera_2", by_length_result.cells[0][0].?);
+}
+
+test "emit through a transaction reads its own staged writes" {
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-exec-tx";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(std.testing.allocator, io, dir, false);
+    defer eng.deinit();
+    var columns = [_]value.Column{
+        .{ .name = try std.testing.allocator.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+        .{ .name = try std.testing.allocator.dupe(u8, "name"), .type_tag = .text },
+    };
+    defer for (&columns) |*column| column.deinit(std.testing.allocator);
+    try eng.createTable("customer", &columns);
+    var ada: value.Value = .{ .text = try std.testing.allocator.dupe(u8, "Ada") };
+    defer ada.deinit(std.testing.allocator);
+    try eng.insert("customer", &.{ .{ .int = 1 }, ada });
+
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    var grace: value.Value = .{ .text = try std.testing.allocator.dupe(u8, "Grace") };
+    defer grace.deinit(std.testing.allocator);
+    try eng.stageInsert(&tx, "customer", &.{ .{ .int = 2 }, grace });
+
+    // Without the transaction, only committed rows are visible.
+    var plain_request = try compile(std.testing.allocator, "from customer\n| emit { id, name }");
+    defer plain_request.deinit(std.testing.allocator);
+    var plain = try execute(std.testing.allocator, &eng, &plain_request);
+    defer plain.deinit();
+    try std.testing.expectEqual(@as(usize, 1), plain.cells.len);
+
+    // Through the transaction, the staged row is visible too.
+    var tx_request = try compile(std.testing.allocator, "from customer\n| emit { id, name }");
+    defer tx_request.deinit(std.testing.allocator);
+    var result = try executeTx(std.testing.allocator, &eng, &tx_request, &tx);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.cells.len);
+    try std.testing.expectEqualStrings("2", result.cells[1][0].?);
+    try std.testing.expectEqualStrings("Grace", result.cells[1][1].?);
+}
+
+test "emit through a transaction applies where over merged rows" {
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-exec-tx-where";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(std.testing.allocator, io, dir, false);
+    defer eng.deinit();
+    var columns = [_]value.Column{
+        .{ .name = try std.testing.allocator.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+        .{ .name = try std.testing.allocator.dupe(u8, "region"), .type_tag = .text },
+    };
+    defer for (&columns) |*column| column.deinit(std.testing.allocator);
+    try eng.createTable("customer", &columns);
+    var north: value.Value = .{ .text = try std.testing.allocator.dupe(u8, "north") };
+    defer north.deinit(std.testing.allocator);
+    var south: value.Value = .{ .text = try std.testing.allocator.dupe(u8, "south") };
+    defer south.deinit(std.testing.allocator);
+    try eng.insert("customer", &.{ .{ .int = 1 }, north });
+
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    try eng.stageInsert(&tx, "customer", &.{ .{ .int = 2 }, south });
+
+    // A predicate is evaluated against the merged row set: the staged row is
+    // filtered like any committed row.
+    var request = try compile(std.testing.allocator, "from customer\n| where region = 'south'\n| emit { id }");
+    defer request.deinit(std.testing.allocator);
+    var result = try executeTx(std.testing.allocator, &eng, &request, &tx);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.cells.len);
+    try std.testing.expectEqualStrings("2", result.cells[0][0].?);
 }
 
 test "where binding rejects unknown columns and type mismatches" {

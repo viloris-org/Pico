@@ -103,6 +103,21 @@ pub const Transaction = struct {
         return self.state == .commit_wait;
     }
 
+    /// The effective staged operation for `(table, pk)`: the last write-set
+    /// entry in staging order, or null when the transaction has not touched the
+    /// row. The Read Committed read path uses this to merge the private write
+    /// set: an insert or update supplies the row values, and a delete hides the
+    /// row, even before the transaction commits.
+    pub fn lastStaged(self: *const Transaction, table: []const u8, pk: value.Value) ?*const WriteOp {
+        var index = self.write_set.items.len;
+        while (index > 0) {
+            index -= 1;
+            const op = &self.write_set.items[index];
+            if (std.mem.eql(u8, op.table, table) and op.pk.eql(pk)) return op;
+        }
+        return null;
+    }
+
     /// Rollback discards the private write set and returns the transaction to
     /// idle. It performs no WAL or storage operation: nothing was ever made
     /// visible to other connections.
@@ -129,13 +144,15 @@ pub const Transaction = struct {
 
     /// Stage an update. `observed_version` is the row version this transaction
     /// saw while building the write set; the coordinator rejects the commit if
-    /// the published row has since changed.
+    /// the published row has since changed. Pass `null` when the target row is
+    /// owned by this transaction's own earlier write set: the coordinator then
+    /// validates against the private shadow instead of the published row.
     pub fn stageUpdate(
         self: *Transaction,
         table_name: []const u8,
         pk: value.Value,
         values: []const value.Value,
-        observed_version: u64,
+        observed_version: ?u64,
     ) TxnError!void {
         try self.expectWritable();
         try self.reserve(estimatedRowBytes(values));
@@ -146,7 +163,7 @@ pub const Transaction = struct {
         self.next_op_id += 1;
     }
 
-    pub fn stageDelete(self: *Transaction, table_name: []const u8, pk: value.Value, observed_version: u64) TxnError!void {
+    pub fn stageDelete(self: *Transaction, table_name: []const u8, pk: value.Value, observed_version: ?u64) TxnError!void {
         try self.expectWritable();
         try self.reserve(@sizeOf(value.Value) + table_name.len);
         var op = try self.buildOp(table_name, .delete, pk, &.{}, observed_version);

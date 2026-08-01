@@ -161,9 +161,13 @@ Representation Chart support.
 **Status:** Core coordinator and write-set semantics implemented as a development
 slice. The `txn` ownership area, single-writer commit coordinator, group commit,
 observed-version write-write conflict detection, bounded admission, and the
-durable commit watermark are implemented and deterministically tested. The
-remaining items below are the Read Committed runtime wiring, connection-level
-cancellation delivery, and production support verification.
+durable commit watermark are implemented and deterministically tested. The Read
+Committed read path — transaction-aware scans and point reads that merge the
+private write set (read-your-writes) over committed state, plus the initial
+isolation-level definition in `docs/architecture/concurrency-control.md` — is
+implemented and deterministically tested at the engine level; it is not yet
+exposed through the wire protocol. The remaining items below are the
+connection-level cancellation delivery and production support verification.
 
 **Goal:** Replace compatibility transaction labels with verified transaction
 semantics while retaining one commit order.

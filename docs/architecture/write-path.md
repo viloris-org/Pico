@@ -1,6 +1,6 @@
 # Write Path and WriteBatch
 
-> **Key files:** `src/txn/transaction.zig` (transaction ownership area), `src/commit/coordinator.zig` (single-writer commit coordinator), and `src/storage/engine.zig` (storage facade that wires them together). Public mutation execution through Runa Flow / Runa Query IR is not yet implemented; the transaction API is exercised by deterministic engine tests.
+> **Key files:** `src/txn/transaction.zig` (transaction ownership area), `src/commit/coordinator.zig` (single-writer commit coordinator), and `src/storage/engine.zig` (storage facade that wires them together). Public mutation execution through Runa Flow / Runa Query IR is not yet implemented; the transaction API and the Read Committed read path are exercised by deterministic engine tests.
 
 ## Overview
 
@@ -197,6 +197,31 @@ const WriteOp = struct {
 
 - Conversion releases staged-value ownership (shallow copy -> moved to the WAL encoder).
 - `Coordinator.Request` accepts `[]TxnOp` plus a parallel `[]?u64` observed-version array.
+
+### Read Committed Read Path
+
+Reads through an explicit transaction use Read Committed visibility (see
+[concurrency control](concurrency-control.md)): the engine merges the private
+write set over committed state instead of reading the live tables alone.
+
+- `Engine.selectAllTx(tx, table)` returns committed rows with the transaction's
+  own staged rows substituted in place: the effective (last staged) insert or
+  update for a touched primary key supplies the row values, a staged delete
+  hides the row, and private inserts that do not exist in committed state
+  append new rows. Committed rows the transaction has not touched are cloned
+  unchanged, so the result never aliases the write set or a live table.
+- `Engine.selectByPkTx(tx, table, pk)` is the point-read form: a staged
+  insert/update returns the write-set values, a staged delete returns no row,
+  and otherwise the committed row is returned.
+- `flow.executeTx` runs relation `emit` over the merged row set, applying the
+  same projection, `where`, and `limit` pipeline as a committed read. Text cell
+  values are copied so a result survives the merged read being released.
+
+Because the tables hold one committed version per row and the single writer
+publishes only after WAL durability, a statement read observes the latest
+committed state at its start; Read Committed does not retain row history, so
+two statements in one transaction may observe intervening commits. Version
+retention for reads over older snapshots arrives with LSM storage (Phase 5).
 
 ## Single Writer and Group Commit
 

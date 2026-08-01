@@ -539,13 +539,16 @@ pub const Engine = struct {
     }
 
     /// Stage an update into `tx`. Captures the observed row version so the
-    /// coordinator can reject a lost update.
+    /// coordinator can reject a lost update. When the target is already owned
+    /// by this transaction's write set (a prior insert or update), no external
+    /// version exists yet: `null` makes the coordinator validate against the
+    /// private shadow, so update-after-insert and update-after-update succeed.
     pub fn stageUpdate(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (self.findStagedOp(tx, table_name, pk)) |staged| {
             if (staged.op == .delete) return error.PrimaryKeyNotFound;
             try table.validateTypes(values);
-            try tx.stageUpdate(table_name, pk, values, 0);
+            try tx.stageUpdate(table_name, pk, values, null);
             return;
         }
         const observed = table.rowVersion(pk) orelse return error.PrimaryKeyNotFound;
@@ -553,12 +556,15 @@ pub const Engine = struct {
         try tx.stageUpdate(table_name, pk, values, observed);
     }
 
-    /// Stage a delete into `tx`. Captures the observed row version.
+    /// Stage a delete into `tx`. Captures the observed row version. A target
+    /// owned by this transaction's write set is staged with `null` so the
+    /// coordinator validates it against the private shadow rather than the
+    /// published row version.
     pub fn stageDelete(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, pk: value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (self.findStagedOp(tx, table_name, pk)) |staged| {
             if (staged.op == .delete) return error.PrimaryKeyNotFound;
-            try tx.stageDelete(table_name, pk, 0);
+            try tx.stageDelete(table_name, pk, null);
             return;
         }
         const observed = table.rowVersion(pk) orelse return error.PrimaryKeyNotFound;
@@ -725,6 +731,89 @@ pub const Engine = struct {
         };
     }
 
+    /// Read Committed scan through `tx`'s private write set: committed rows the
+    /// transaction has not touched are cloned unchanged, rows it staged as
+    /// update or insert appear with the write-set values, and rows it staged as
+    /// delete are invisible. Other connections' uncommitted writes never enter
+    /// this result: the live tables hold only published commits, and the private
+    /// write set is merged only for the owning transaction. This is the engine
+    /// boundary that makes explicit-transaction reads read-your-writes while
+    /// every other reader sees only committed state.
+    pub fn selectAllTx(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8) !SelectResult {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        const gpa = self.gpa;
+
+        var merged: std.ArrayList(Row) = .empty;
+        errdefer {
+            for (merged.items) |*row| row.deinit(gpa);
+            merged.deinit(gpa);
+        }
+
+        const pk_index = table.pk_index;
+        for (table.rows.items) |row| {
+            const staged = if (pk_index) |pki| tx.lastStaged(table_name, row.values[pki]) else null;
+            if (staged) |op| switch (op.op) {
+                .delete => continue,
+                .insert, .update => {
+                    try merged.ensureUnusedCapacity(gpa, 1);
+                    merged.appendAssumeCapacity(try rowFromValues(gpa, op.values));
+                    continue;
+                },
+            };
+            try merged.ensureUnusedCapacity(gpa, 1);
+            merged.appendAssumeCapacity(try row.clone(gpa));
+        }
+
+        // Private rows that do not exist in committed state append new rows.
+        // Only the last write-set entry for a key is effective: an earlier
+        // insert is superseded by its own later update/delete.
+        if (pk_index) |_| {
+            for (tx.write_set.items) |*op| {
+                if (op.op == .delete or !std.mem.eql(u8, op.table, table_name)) continue;
+                const effective = tx.lastStaged(table_name, op.pk) orelse continue;
+                if (effective != op) continue;
+                if (table.pkContains(op.pk)) continue;
+                try merged.ensureUnusedCapacity(gpa, 1);
+                merged.appendAssumeCapacity(try rowFromValues(gpa, op.values));
+            }
+        } else {
+            // Heap table (no single-column primary key): staged updates and
+            // deletes cannot be addressed, so committed rows are unchanged and
+            // every staged insert appends a new row.
+            for (tx.write_set.items) |op| {
+                if (op.op == .insert and std.mem.eql(u8, op.table, table_name)) {
+                    try merged.ensureUnusedCapacity(gpa, 1);
+                    merged.appendAssumeCapacity(try rowFromValues(gpa, op.values));
+                }
+            }
+        }
+
+        const rows = try merged.toOwnedSlice(gpa);
+        return .{ .columns = table.columns, .rows = rows, .owned_rows = rows, .gpa = gpa };
+    }
+
+    /// Read Committed point read through `tx`: a staged insert or update for
+    /// `pk` returns the write-set values, a staged delete returns no row, and
+    /// otherwise the committed row is returned. Tables without a single-column
+    /// primary key fall back to the committed point read because their write
+    /// set cannot address rows by key.
+    pub fn selectByPkTx(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, pk: value.Value) !SelectResult {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (table.pk_index == null) return self.selectByPk(table_name, pk);
+        if (tx.lastStaged(table_name, pk)) |op| {
+            switch (op.op) {
+                .delete => return emptyResult(self.gpa, table.columns),
+                .insert, .update => {
+                    const one = try self.gpa.alloc(Row, 1);
+                    errdefer self.gpa.free(one);
+                    one[0] = try rowFromValues(self.gpa, op.values);
+                    return .{ .columns = table.columns, .rows = one, .owned_rows = one, .gpa = self.gpa };
+                },
+            }
+        }
+        return self.selectByPk(table_name, pk);
+    }
+
     /// Collect row indices matching all predicates (AND). Caller owns the slice.
     pub fn matchIndices(self: *Engine, table: *Table, preds: []const Pred) ![]usize {
         return table.matchIndices(self.gpa, preds);
@@ -768,6 +857,25 @@ fn existingColumnValue(gpa: Allocator, default_expr: value.DefaultExpr) !value.V
         .none, .now => .null,
         .literal => |v| try v.clone(gpa),
     };
+}
+
+/// Build an owned `Row` by cloning `values`. Used by the transaction-aware read
+/// path so a result never aliases the private write set or a live table row.
+fn rowFromValues(gpa: Allocator, values: []const value.Value) !Row {
+    const owned = try gpa.alloc(value.Value, values.len);
+    errdefer gpa.free(owned);
+    var cloned: usize = 0;
+    errdefer {
+        var index: usize = 0;
+        while (index < cloned) : (index += 1) owned[index].deinit(gpa);
+    }
+    while (cloned < values.len) : (cloned += 1) owned[cloned] = try values[cloned].clone(gpa);
+    return .{ .values = owned };
+}
+
+fn emptyResult(gpa: Allocator, columns: []const value.Column) !Engine.SelectResult {
+    const empty = try gpa.alloc(Row, 0);
+    return .{ .columns = columns, .rows = empty, .owned_rows = empty, .gpa = gpa };
 }
 
 fn findShadowRow(shadow: []const commit_mod.ShadowEntry, table: []const u8, pk: value.Value) ?*const commit_mod.ShadowEntry {
