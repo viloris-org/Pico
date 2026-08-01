@@ -61,10 +61,47 @@ test "RunaDB Client v3 protocol lifecycle, evidence, and request errors" {
     try expectGoodbyeConfirmationAndClose(gpa, io);
 }
 
-/// Cancellation requests are fire-and-forget: unknown, mismatched, closed, or
-/// expired credentials finish as protocol no-ops, and a malformed payload is a
-/// request error that leaves the Connection usable.
+/// Cancellation requests are fire-and-forget: an unknown, mismatched, closed,
+/// or expired credential finishes as a protocol no-op and the sending
+/// Connection stays usable. A malformed payload is a protocol error: the
+/// Server replies with `CN1001` and closes the Connection.
 fn expectCancellationNoOps(gpa: std.mem.Allocator, io: Io) !void {
+    {
+        // An unknown credential is a no-op: the Server never replies, and the
+        // next Request still executes on the same Connection.
+        const stream = try connectRaw(io);
+        defer stream.close(io);
+
+        var read_buf: [1024]u8 = undefined;
+        var write_buf: [1024]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var writer = stream.writer(io, &write_buf);
+        try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+        try expectHelloOk(gpa, &reader.interface);
+
+        const bogus_credential = [_]u8{0xAB} ** proto.CANCEL_CREDENTIAL_LENGTH;
+        try clint.codec.writeMessage(&writer.interface, .cancel_request, &bogus_credential);
+        try writer.interface.flush();
+        const source = "from customer\n| emit { id }";
+        var source_payload: [4 + source.len]u8 = undefined;
+        std.mem.writeInt(u32, source_payload[0..4], source.len, .big);
+        @memcpy(source_payload[4..], source);
+        try clint.codec.writeMessage(&writer.interface, .flow_source, &source_payload);
+        try writer.interface.flush();
+        try expectServerError(gpa, &reader.interface, "RF1002");
+    }
+
+    // A malformed cancel payload is a protocol error: `CN1001` is sent, then
+    // the Server closes the Connection. Each case needs a fresh connection
+    // because the close is terminal.
+    try expectMalformedCancelCloses(gpa, io, &.{0x01});
+    const long_payload = [_]u8{0} ** (proto.CANCEL_CREDENTIAL_LENGTH + 1);
+    try expectMalformedCancelCloses(gpa, io, &long_payload);
+}
+
+/// Send a malformed cancel_request on a fresh Connection: expect a `CN1001`
+/// error reply followed by the Server closing the Connection.
+fn expectMalformedCancelCloses(gpa: std.mem.Allocator, io: Io, payload: []const u8) !void {
     const stream = try connectRaw(io);
     defer stream.close(io);
 
@@ -75,31 +112,15 @@ fn expectCancellationNoOps(gpa: std.mem.Allocator, io: Io) !void {
     try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
     try expectHelloOk(gpa, &reader.interface);
 
-    // An unknown credential is a no-op: the Server never replies, and the next
-    // Request still executes on the same Connection.
-    const bogus_credential = [_]u8{0xAB} ** proto.CANCEL_CREDENTIAL_LENGTH;
-    try clint.codec.writeMessage(&writer.interface, .cancel_request, &bogus_credential);
-    try writer.interface.flush();
-    const source = "from customer\n| emit { id }";
-    var source_payload: [4 + source.len]u8 = undefined;
-    std.mem.writeInt(u32, source_payload[0..4], source.len, .big);
-    @memcpy(source_payload[4..], source);
-    try clint.codec.writeMessage(&writer.interface, .flow_source, &source_payload);
-    try writer.interface.flush();
-    try expectServerError(gpa, &reader.interface, "RF1002");
-
-    // A truncated credential is a malformed cancel payload: a request error,
-    // not a silent no-op.
-    const short_payload = [_]u8{0x01};
-    try clint.codec.writeMessage(&writer.interface, .cancel_request, &short_payload);
+    try clint.codec.writeMessage(&writer.interface, .cancel_request, payload);
     try writer.interface.flush();
     try expectServerError(gpa, &reader.interface, "CN1001");
 
-    // An oversized credential is likewise malformed.
-    const long_payload = [_]u8{0} ** (proto.CANCEL_CREDENTIAL_LENGTH + 1);
-    try clint.codec.writeMessage(&writer.interface, .cancel_request, &long_payload);
-    try writer.interface.flush();
-    try expectServerError(gpa, &reader.interface, "CN1001");
+    // The Server closes the Connection after the protocol error, so the next
+    // read reports the close rather than a usable stream.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    try std.testing.expectError(error.EndOfStream, clint.codec.readMessage(arena.allocator(), &reader.interface));
 }
 
 /// The official client receives its own cancellation credential in HELLO_OK.

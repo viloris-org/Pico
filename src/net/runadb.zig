@@ -316,14 +316,16 @@ pub fn handleConnection(
                 attachment = null;
             },
             .cancel_request => {
-                // Fire-and-forget: no response frame is defined. Missing,
-                // mismatched, closed, or expired credentials finish as a
-                // no-op; only the observability counters change. A malformed
-                // payload is a request error that leaves the Connection usable.
+                // Fire-and-forget: no response frame is defined for a
+                // well-formed request. Missing, mismatched, closed, or expired
+                // credentials finish as a no-op; only the observability
+                // counters change. A malformed payload is a protocol error:
+                // the Server replies CN1001 and closes the Connection, so the
+                // error can never be misattributed to a later pipelined frame.
                 if (payload.len != proto.CANCEL_CREDENTIAL_LENGTH) {
                     try sendError(w, 2, "CN1001", "malformed cancel request payload");
                     try w.flush();
-                    continue;
+                    return;
                 }
                 var credential_bytes: [proto.CANCEL_CREDENTIAL_LENGTH]u8 = undefined;
                 @memcpy(&credential_bytes, payload);

@@ -41,8 +41,10 @@ pub const Type = enum(u8) {
 
     /// Client -> Server: requests cooperative cancellation of the statement
     /// currently executing on the Connection named by the credential.
-    /// Fire-and-forget: the Server never replies. Unknown, mismatched, closed,
-    /// or expired credentials finish as a no-op.
+    /// Fire-and-forget: the Server never replies to a well-formed request.
+    /// Unknown, mismatched, closed, or expired credentials finish as a no-op.
+    /// A malformed payload is a protocol error: the Server replies with CN1001
+    /// and closes the Connection.
     cancel_request = 0x30,
 
     /// Either side: clean close.
