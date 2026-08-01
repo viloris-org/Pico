@@ -102,13 +102,21 @@ pub fn handleConnection(
             else => return err,
         };
 
-        // Each frame after the handshake is a statement boundary: a fresh
-        // generation clears any stale cancellation mark, so a cancel delivered
-        // while idle never aborts a later statement.
-        conn.beginStatement();
-
         switch (msg_type) {
             .flow_source => {
+                // Statement start: a fresh generation clears any stale mark so
+                // a cancel delivered while idle never aborts this statement.
+                // The cooperative check and the executing flag are the Phase 6
+                // seam; in the sequential listener a cancel is delivered only
+                // between statements, so these never fire here.
+                conn.beginStatement();
+                conn.setExecuting(true);
+                defer conn.setExecuting(false);
+                conn.checkCancelled() catch |err| {
+                    try sendError(w, 2, "RF1002", @errorName(err));
+                    try w.flush();
+                    continue;
+                };
                 var pos: usize = 0;
                 const source = readStringFromPayload(payload, &pos) catch {
                     try sendError(w, 2, "RF1000", "invalid Runa Flow source payload");
@@ -141,6 +149,15 @@ pub fn handleConnection(
                 try w.flush();
             },
             .flow_ir => {
+                // Statement start (see .flow_source for the Phase 6 seam note).
+                conn.beginStatement();
+                conn.setExecuting(true);
+                defer conn.setExecuting(false);
+                conn.checkCancelled() catch |err| {
+                    try sendError(w, 2, "RF1002", @errorName(err));
+                    try w.flush();
+                    continue;
+                };
                 if (payload.len < 2) {
                     try sendError(w, 2, "RF1003", "invalid Runa Query IR payload");
                     try w.flush();

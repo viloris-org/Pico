@@ -35,10 +35,17 @@ pub const State = struct {
     /// Cancellation credential delivered to the client in HELLO_OK.
     credential: Credential = .{0} ** CREDENTIAL_LENGTH,
     /// Incremented on every statement start; a cancellation mark applies only
-    /// to the generation it was set under.
-    generation: u64 = 0,
-    /// Cooperative cancellation mark for the current generation.
-    cancelled: bool = false,
+    /// to the generation it was set under. Atomic so the connection thread and
+    /// the registry's cancellation routing never race on it (Phase 6 runtime).
+    generation: std.atomic.Value(u64) = .init(0),
+    /// Cooperative cancellation mark for the current generation. Atomic for the
+    /// same reason: `beginStatement` (connection thread) clears it while
+    /// `markCancelled` (registry routing) sets it.
+    cancelled: std.atomic.Value(bool) = .init(false),
+    /// Whether a statement is currently executing and so may observe a mark.
+    /// Atomic so `cancelByCredential` can distinguish a real hit from an idle
+    /// between-statement no-op.
+    executing: std.atomic.Value(bool) = .init(false),
 
     pub fn init(id: u64, credential: Credential) State {
         return .{ .id = id, .credential = credential };
@@ -47,25 +54,31 @@ pub const State = struct {
     /// Transition `ready -> executing`: start a new statement, clearing any
     /// stale mark from a previous statement. A mark set while idle is a no-op.
     pub fn beginStatement(self: *State) void {
-        self.generation += 1;
-        self.cancelled = false;
+        _ = self.generation.fetchAdd(1, .acq_rel);
+        self.cancelled.store(false, .release);
+    }
+
+    /// Mark the Connection as executing (or not). A statement holds the mark
+    /// true for the duration of its execution region.
+    pub fn setExecuting(self: *State, executing: bool) void {
+        self.executing.store(executing, .release);
     }
 
     /// Cooperative cancellation check between bounded work units.
     pub fn checkCancelled(self: *const State) !void {
-        if (self.cancelled) return error.Canceled;
+        if (self.cancelled.load(.acquire)) return error.Canceled;
     }
 
     /// Deliver a cancellation mark for the statement currently executing.
     /// Applies to the current generation only.
     pub fn markCancelled(self: *State) void {
-        self.cancelled = true;
+        self.cancelled.store(true, .release);
     }
 
     /// A mark applies only to the statement that was running when it arrived;
     /// a credential that no longer names a live Connection is a protocol no-op.
     pub fn isLive(self: *const State) bool {
-        return self.generation > 0;
+        return self.generation.load(.monotonic) > 0;
     }
 };
 
@@ -78,9 +91,9 @@ test "a cancellation mark aborts only the current statement" {
     try std.testing.expectError(error.Canceled, state.checkCancelled());
 
     // The next statement clears the mark and advances the generation.
-    const before = state.generation;
+    const before = state.generation.load(.monotonic);
     state.beginStatement();
-    try std.testing.expectEqual(before + 1, state.generation);
+    try std.testing.expectEqual(before + 1, state.generation.load(.monotonic));
     try state.checkCancelled();
 }
 
