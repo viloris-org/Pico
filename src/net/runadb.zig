@@ -61,12 +61,8 @@ pub fn handleConnection(
     const w = &writer.interface;
 
     var conn = connection_mod.State.init(0, credential);
-    registry.register(&conn) catch |err| {
-        try sendHelloError(w, "instance connection table full");
-        try w.flush();
-        return err;
-    };
-    defer registry.unregister(&conn);
+    var registered = false;
+    defer if (registered) registry.unregister(&conn);
 
     // ── Handshake: read HELLO ──
     {
@@ -82,6 +78,23 @@ pub fn handleConnection(
             return error.VersionMismatch;
         }
         _ = minor;
+
+        // Register only after the version check: a peer that never completes
+        // the handshake, or is rejected on version, must not hold a slot in
+        // the bounded connection table. The credential is delivered in
+        // HELLO_OK immediately after, so no cancel can arrive before this
+        // registration. Admission errors are reported distinctly: capacity
+        // exhaustion is not an allocation failure.
+        registry.register(&conn) catch |err| {
+            try sendHelloError(w, switch (err) {
+                error.RegistryFull => "instance connection table full",
+                error.OutOfMemory => "instance out of memory",
+                else => "connection rejected",
+            });
+            try w.flush();
+            return err;
+        };
+        registered = true;
 
         try sendHelloOk(w, conn.credential);
         try w.flush();
