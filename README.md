@@ -34,21 +34,27 @@ RunaDB Server is under active development. The current implementation provides:
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
 - WAL checkpoint (compaction): bounded WAL size and bounded recovery time
+- A single-writer commit coordinator: transaction write sets with commit/rollback,
+  group commit, observed-version write-write conflict detection, bounded commit
+  admission, and a durable MVCC commit watermark recovered on restart
 
 The storage format and execution architecture are still evolving. Persistent
-LSM tables, secondary indexes, MVCC isolation, group commit, and the extended
-query protocol are planned parts of the architecture, not all current product
-capabilities. Runa Flow, Runa Query IR, and the semantic model are the next
-public-contract work; relation, document, and graph capabilities become support
-claims only when their complete semantics and evidence are published. Multi-model
-and multimodal data, AI-assisted execution, distributed deployments, HTAP,
-streaming, historical queries, post-quantum cryptography, and autonomous
+LSM tables, secondary indexes, MVCC snapshot reads over retained versions, and
+the extended query protocol are planned parts of the architecture, not all
+current product capabilities. The transaction coordinator and commit ordering
+exist as an engine-level development slice; they are not yet exposed through the
+wire protocol or MCP. Runa Flow, Runa Query IR, and the semantic model are the
+next public-contract work; relation, document, and graph capabilities become
+support claims only when their complete semantics and evidence are published.
+Multi-model and multimodal data, AI-assisted execution, distributed deployments,
+HTAP, streaming, historical queries, post-quantum cryptography, and autonomous
 operations remain long-horizon target designs. See
 [ADR-0016](docs/adr/0016-long-horizon-unified-database.md) and
 [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
 Mutations, transactions, document and graph operations, semantic-model
-persistence, authorization, and World Continuum bindings are not implemented.
+persistence, authorization, and World Continuum bindings are not implemented
+as public capabilities.
 
 ## Build
 

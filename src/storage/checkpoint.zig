@@ -35,7 +35,11 @@ pub const Stats = struct {
 /// duration of this call. The rewritten WAL becomes the only record of
 /// committed state, so a torn read of a table here would durably lose a commit
 /// rather than merely return a bad row.
-pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table, observations: []const evidence_mod.Record) !Stats {
+///
+/// `commit_seq` is the published commit watermark at rewrite time. It is
+/// emitted as a `set_commit_seq` record after the reconstruction records so
+/// recovery restores the MVCC watermark after per-commit history is collapsed.
+pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table, observations: []const evidence_mod.Record, commit_seq: u64) !Stats {
     var rewrite = try wal.beginRewrite();
 
     var rows: usize = 0;
@@ -61,6 +65,7 @@ pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table, observatio
             try rewrite.emitSetSerial(.{ .table = table.name, .next_serial = table.next_serial });
         }
         for (observations) |record| try rewrite.emitObserve(record.metadata());
+        try rewrite.emitSetCommitSeq(commit_seq);
     }
 
     const before = rewrite.replaced_bytes;
@@ -93,6 +98,7 @@ const RecordLog = struct {
             .create_table => |ct| try std.fmt.allocPrint(self.gpa, "create_table {s}/{d}", .{ ct.name, ct.columns.len }),
             .insert => |ins| try std.fmt.allocPrint(self.gpa, "insert {s}", .{ins.table}),
             .set_serial => |ss| try std.fmt.allocPrint(self.gpa, "set_serial {s}={d}", .{ ss.table, ss.next_serial }),
+            .set_commit_seq => |seq| try std.fmt.allocPrint(self.gpa, "set_commit_seq {d}", .{seq}),
             else => try std.fmt.allocPrint(self.gpa, "other", .{}),
         };
         errdefer self.gpa.free(text);
@@ -130,7 +136,7 @@ test "checkpoint emits current schema and rows, with set_serial after the insert
         try table.delete(gpa, .{ .int = 7 });
         try std.testing.expectEqual(@as(i64, 8), table.next_serial);
 
-        stats = try run(&wal, &.{&table}, &.{});
+        stats = try run(&wal, &.{&table}, &.{}, 42);
     }
 
     try std.testing.expectEqual(@as(usize, 1), stats.tables);
@@ -143,11 +149,14 @@ test "checkpoint emits current schema and rows, with set_serial after the insert
         defer log.deinit();
         try wal_mod.replayWal(&wal, &log, RecordLog.apply);
 
-        try std.testing.expectEqual(@as(usize, 3), log.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 4), log.entries.items.len);
         try std.testing.expectEqualStrings("create_table t/2", log.entries.items[0]);
         try std.testing.expectEqualStrings("insert t", log.entries.items[1]);
-        // set_serial last, and carrying the live counter rather than max(pk)+1.
+        // set_serial before the watermark: replaying inserts raises the counter
+        // to max(pk)+1, so set_serial corrects it, then set_commit_seq restores
+        // the MVCC watermark over the collapsed history.
         try std.testing.expectEqualStrings("set_serial t=8", log.entries.items[2]);
+        try std.testing.expectEqualStrings("set_commit_seq 42", log.entries.items[3]);
     }
 }
 
@@ -161,7 +170,7 @@ test "checkpoint of an empty instance still yields a replayable wal" {
     {
         var wal = try wal_mod.Wal.open(gpa, io, dir_name, false);
         defer wal.deinit();
-        const stats = try run(&wal, &.{}, &.{});
+        const stats = try run(&wal, &.{}, &.{}, 7);
         try std.testing.expectEqual(@as(usize, 0), stats.tables);
         try std.testing.expectEqual(@as(usize, 0), stats.rows);
     }
@@ -172,7 +181,9 @@ test "checkpoint of an empty instance still yields a replayable wal" {
         var log: RecordLog = .{ .gpa = gpa };
         defer log.deinit();
         try wal_mod.replayWal(&wal, &log, RecordLog.apply);
-        try std.testing.expectEqual(@as(usize, 0), log.entries.items.len);
+        // Only the watermark record survives an empty rewrite.
+        try std.testing.expectEqual(@as(usize, 1), log.entries.items.len);
+        try std.testing.expectEqualStrings("set_commit_seq 7", log.entries.items[0]);
         // A fresh append onto the rewritten file must still land correctly.
         try wal.appendInsert(.{ .table = "t", .values = &.{.{ .int = 1 }} });
     }

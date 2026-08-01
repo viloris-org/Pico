@@ -34,6 +34,7 @@ capabilities exist but are not collectively a release claim:
 | Runa Flow | Read-only relation projection from source or canonical Runa Query IR | [Runa Flow](docs/runa-flow.md) |
 | Persistence | WAL-backed table changes, CRC32 validation, and recovery of a valid committed prefix | [WAL and crash recovery](docs/architecture/wal-and-recovery.md) |
 | Native client path | RunaDB Wire Protocol v2 over sequential TCP and a RunaDB Zig client integration suite | [RunaDB Wire Protocol v2](docs/wire-protocol.md) |
+| Transaction semantics | Single-writer commit coordinator, `txn` write sets with commit/rollback, group commit, observed-version write-write conflict detection, and a recovered commit watermark | [Write Path and WriteBatch](docs/architecture/write-path.md), [Concurrency Control](docs/architecture/concurrency-control.md) |
 | Target architecture | LSM storage, MVCC, single-writer commits, group commit, VFS, Pager, execution programs, and asynchronous runtime boundaries are designed but not all implemented | [Architecture](docs/ARCHITECTURE.md) |
 | Public development contract | Runa Flow, Runa Query IR, semantic model revision `0`, and RunaDB Wire Protocol v2 | [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md) |
 | Accepted later work | Interactive RunaDB Client, Ed25519 authentication and permissions, and QUIC transport | [ADRs](docs/adr/) |
@@ -132,6 +133,13 @@ document, vector, temporal, or multimodal capability is implied by the slices.
 
 ### Phase 3: Transaction Semantics and Commit Coordination
 
+**Status:** Core coordinator and write-set semantics implemented as a development
+slice. The `txn` ownership area, single-writer commit coordinator, group commit,
+observed-version write-write conflict detection, bounded admission, and the
+durable commit watermark are implemented and deterministically tested. The
+remaining items below are the Read Committed runtime wiring, connection-level
+cancellation delivery, and production support verification.
+
 **Goal:** Replace compatibility transaction labels with verified transaction
 semantics while retaining one commit order.
 
@@ -140,8 +148,8 @@ semantics while retaining one commit order.
 - Add a dedicated single-writer commit coordinator that assigns commit order,
   validates write conflicts, writes WAL records, and publishes confirmed
   changes in that order.
-- Implement group commit without weakening the default durability level.
-  Group membership, cancellation, I/O failure, and response ordering must have
+- Implement group commit without weakening the default durability level. Group
+  membership, cancellation, I/O failure, and response ordering must have
   defined outcomes.
 - Define and test the initial isolation level and its visibility rules. Reads
   must use snapshots; write-write contention must either wait within bounded
@@ -149,10 +157,10 @@ semantics while retaining one commit order.
 - Add cancellation and resource-bound behavior so a blocked or disconnected
   connection cannot leak write-set or commit-queue state.
 
-**Exit criteria:** Deterministic tests cover autocommit, multi-statement
-commit, rollback, failed transactions, visibility, conflicts, cancellation,
-and bounded contention. Failure injection at every WAL and publication boundary
-shows that restart exposes only the confirmed commit prefix.
+**Exit criteria:** Deterministic tests cover autocommit, multi-statement commit,
+rollback, failed transactions, visibility, conflicts, cancellation, and bounded
+contention. Failure injection at every WAL and publication boundary shows that
+restart exposes only the confirmed commit prefix.
 
 ### Phase 4: Durable Storage Foundation
 

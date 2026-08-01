@@ -10,6 +10,13 @@ pub const checkpoint = @import("storage/checkpoint.zig");
 pub const evidence = @import("storage/evidence.zig");
 pub const vector = @import("vector.zig");
 pub const engine = @import("storage/engine.zig");
+pub const txn = struct {
+    pub const transaction = @import("txn/transaction.zig");
+    pub const tx_test = @import("txn/tx_test.zig");
+};
+pub const commit = struct {
+    pub const coordinator = @import("commit/coordinator.zig");
+};
 pub const flow = struct {
     pub const ast = @import("flow/ast.zig");
     pub const ir = @import("flow/ir.zig");
@@ -29,6 +36,9 @@ test {
     _ = evidence;
     _ = vector;
     _ = engine;
+    _ = txn.transaction;
+    _ = txn.tx_test;
+    _ = commit.coordinator;
     _ = flow.ast;
     _ = flow.ir;
     _ = flow.exec;

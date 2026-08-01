@@ -34,7 +34,7 @@ Offset  Size  Field
 ```
 
 - `RUNADB_WAL` identifies a RunaDB WAL file quickly.
-- `format_version` is currently **2**. Version 1 files (no `set_serial` record) are still replayed by this build; a build older than this one rejects version-2 files with `UnsupportedWalFormat`. The checkpoint path upgrades version-1 files in place when it rewrites the WAL.
+- `format_version` is currently **5**. Version 5 records carry a `commit_seq` on `txn_batch` frames and add the `set_commit_seq` record. Version 1–4 files (no `set_serial` for v1, no `commit_seq` for pre-v5 `txn_batch`) are still replayed by this build; a build older than this one rejects newer files with `UnsupportedWalFormat`. The checkpoint path upgrades older files in place when it rewrites the WAL.
 - Open validates magic + version; mismatch returns `error.UnsupportedWalFormat` and preserves the file as evidence.
 
 ### Frame Layout
@@ -67,8 +67,9 @@ Offset  Size  Field      Description
 | `drop_column` | 6 | Drop a column (table name + column name) |
 | `set_default` | 7 | Set a DEFAULT expression (table name + column name + expression) |
 | `set_not_null` | 8 | Set NOT NULL (table name + column name + enable/disable) |
-| `txn_batch` | 9 | Transaction batch commit: an atomic frame containing nested operations |
+| `txn_batch` | 9 | Transaction batch commit: an atomic frame containing a `commit_seq` (format v5+) and nested operations |
 | `set_serial` | 10 | Checkpoint-only: restore SERIAL counter (table name + i64). Format version 2+. |
+| `set_commit_seq` | 12 | Checkpoint-only: restore the published commit watermark (i64). Format version 5+. |
 
 ### Record Encoding Details
 
@@ -127,19 +128,23 @@ str(table_name)
 Value(pk)
 ```
 
-**`txn_batch` payload encoding:**
+**`txn_batch` payload encoding (format v5):**
 
 ```
 type_byte: u8 = 9
+u64(commit_seq)
 u16(n_ops)
 repeated(n_ops):
   u32(op_payload_len)
   op_payload: [type_byte + encoded_op_data]
 ```
 
-Nested operations in a `txn_batch` frame may use the `insert`, `update`, and `delete`
-encodings without the outer frame header. The entire batch shares one CRC: a frame is either
-complete and valid or the entire batch is discarded.
+`commit_seq` is the MVCC commit sequence assigned by the single-writer coordinator;
+recovery rebuilds the published watermark from it. Nested operations in a `txn_batch` frame may
+use the `insert`, `update`, and `delete` encodings without the outer frame header. The entire
+batch shares one CRC: a frame is either complete and valid or the entire batch is discarded. A
+group of independent transactions may share one durability round via `appendTxnBatchGroup`
+without merging their identity or commit order.
 
 ## WAL Lifecycle
 
@@ -224,6 +229,7 @@ An explicit transaction's write set is stored in a `txn_batch` frame:
 - `replayWal` reads the frame; `applyRecord()` identifies `txn_batch`; `forEachTxnBatchOp()` iterates its nested operations.
 - The entire batch is applied only when the frame is complete and its CRC is valid; a corrupt or truncated frame is discarded in full.
 - This preserves transaction atomicity: recovery cannot expose a partially committed transaction.
+- The frame's `commit_seq` advances the published watermark; a checkpoint persists the watermark with `set_commit_seq` so recovery restores it after history is collapsed.
 
 ### Failure Model
 

@@ -1,6 +1,6 @@
 # Write Path and WriteBatch
 
-> **Key files:** `src/storage/engine.zig` (transitional single-writer facade) and `src/storage/wal.zig` (`txn_batch` records). Public mutation execution is not currently implemented.
+> **Key files:** `src/txn/transaction.zig` (transaction ownership area), `src/commit/coordinator.zig` (single-writer commit coordinator), and `src/storage/engine.zig` (storage facade that wires them together). Public mutation execution through Runa Flow / Runa Query IR is not yet implemented; the transaction API is exercised by deterministic engine tests.
 
 ## Overview
 
@@ -67,7 +67,7 @@ Explicit transactions (`BEGIN` / `COMMIT` / `ROLLBACK`) use two write phases.
 
 **Staging while the transaction is active:**
 
-1. Each DML operation is staged in the `Session` private write set (`ArrayList(WriteOp)`).
+1. Each DML operation is staged in the `Transaction` private write set (`ArrayList(WriteOp)`).
 2. Staging validates visibility against the **base table**, including PK and unique constraints against committed rows.
 3. Staging performs incremental validation against the write set, so earlier operations in the same transaction affect later conflict checks.
 4. The staged write set is invisible to other connections (a private MVCC write set).
@@ -75,13 +75,14 @@ Explicit transactions (`BEGIN` / `COMMIT` / `ROLLBACK`) use two write phases.
 **Commit:**
 
 ```
-Client -> COMMIT -> Session.commit()
-                   -> Session.validateAgainstWriteSet() (final validation)
-                   -> toWalOp() (write set to TxnOp array)
-                   -> Engine.commitTxnOps(ops)
-                   -> Wal.appendTxnBatch(ops) (one atomic frame)
+Client -> COMMIT -> Engine.commitTransaction(tx)
+                   -> tx.toWalOps() (write set to TxnOp array)
+                   -> Coordinator.submit(request) (bounded admission)
+                   -> Coordinator.drain() (single durability round for the batch)
+                   -> Wal.appendTxnBatchGroup() (one atomic frame per txn, shared fsync)
+                   -> validate + assign commit_seq in FIFO order
                    -> apply each op with Table.{insert|update|delete}()
-                   -> clear write set
+                   -> advance published watermark
                    -> return COMMIT success
 ```
 
@@ -90,6 +91,7 @@ sequenceDiagram
     participant C as client
     participant S as Session
     participant E as Engine
+    participant K as Coordinator
     participant W as WAL
     participant T as Table
     Note over C,S: BEGIN
@@ -101,21 +103,21 @@ sequenceDiagram
     S-->>C: INSERT 1
     Note over C,S: COMMIT
     C->>S: COMMIT
-    S->>S: final validation
-    S->>E: commitTxnOps(ops)
-    E->>W: appendTxnBatch(ops)
-    W-->>E: write confirmed
-    E->>T: apply operations in order
-    T-->>E: ok
-    E-->>S: ok
-    S->>S: clear write set
-    S-->>C: COMMIT
+    S->>E: commitTransaction(tx)
+    E->>K: submit(request)
+    K->>W: appendTxnBatchGroup(batch)
+    W-->>K: write confirmed
+    K->>T: apply operations in order
+    T-->>K: ok
+    K->>K: advance published watermark
+    K-->>E: ok
+    E-->>C: COMMIT
 ```
 
 **Rollback:**
 
 ```
-ROLLBACK -> Session.rollback()
+ROLLBACK -> Transaction.rollback()
          -> clear write set (clear ArrayList)
          -> return ROLLBACK
 ```
@@ -126,11 +128,12 @@ Rollback performs no WAL or engine operation; it discards the private in-memory 
 
 ### `txn_batch` in RunaDB
 
-RunaDB represents one explicit transaction as one atomic **`txn_batch` WAL record**:
+RunaDB represents one explicit transaction as one atomic **`txn_batch` WAL record**. Since WAL format v5 the record also carries the commit sequence assigned by the single writer:
 
 ```
 WAL frame:
   [len: u32][crc32: u32][type_byte: txn_batch(9)]
+  [commit_seq: u64]
   [n_ops: u16]
   [op_1_len: u32][op_1_payload]
   [op_2_len: u32][op_2_payload]
@@ -141,12 +144,13 @@ WAL frame:
 - One frame-level CRC covers the complete payload.
 - Recovery either applies every operation in a complete, valid frame or discards the complete damaged/truncated frame.
 - This provides transaction **atomicity** and **durability** once the commit is confirmed.
+- The `commit_seq` lets recovery rebuild the published MVCC watermark from the durable commit prefix.
 
 ### `txn_batch` Contract
 
 | Field or property | RunaDB contract |
 |------|----------------|
-| Commit order | No explicit sequence in Phase 0; operations are serialized by `Engine`. The target single writer allocates `commit_seq` at publication. |
+| Commit order | `commit_seq` is a monotonic 64-bit sequence allocated only by the single-writer commit coordinator at publication. Recovery rebuilds the published watermark from these records; a checkpoint persists it with `set_commit_seq`. |
 | Operation count | `n_ops` is a 2-byte count. |
 | Object identity | Every operation identifies its table by name; RunaDB has no storage namespace field in the record. |
 | Integrity | One frame-level CRC32 protects the complete payload; keys are not protected independently. |
@@ -154,7 +158,7 @@ WAL frame:
 
 ### WriteBatch Atomicity Boundary
 
-- **Autocommit statement**: one WAL frame equals one operation (DML or DDL), implicitly atomic.
+- **Autocommit statement**: one transaction with a one-op write set; one `txn_batch` frame, implicitly atomic.
 - **Explicit transaction**: one `txn_batch` WAL frame equals the complete write set.
 - **DDL is currently forbidden in transactions**: DDL is not staged in an explicit transaction, avoiding complex metadata/row ordering dependencies during recovery.
 
@@ -162,71 +166,77 @@ WAL frame:
 
 ### Write-Set Staging
 
-The Session private write-set type is:
+The transaction private write-set type is (see `src/txn/transaction.zig`):
 
 ```zig
-const WriteOp = union(enum) {
-    insert: struct { table: []const u8, values: []value.Value },
-    update: struct { table: []const u8, pk: value.Value, values: []value.Value },
-    delete: struct { table: []const u8, pk: value.Value },
+const WriteOp = struct {
+    table: []u8,
+    pk: value.Value,
+    values: []value.Value,
+    op: TxnOp.Tag,
+    observed_version: ?u64,  // for update/delete targets
+    bytes: u64,
 };
 ```
 
 - Each `WriteOp` is a complete staged record with copied values.
-- During staging, `visibleRow()` queries both the base table and prior write-set operations to maintain incremental consistency.
-- Staging is allowed only when Session state is `active`.
+- During staging, the engine queries both the base table and prior write-set operations to maintain incremental consistency (read-your-writes).
+- Staging is allowed only when the transaction state is `active`.
 
 ### Final Validation
 
-`Session.commit()` performs final validation before creating the WAL record:
+`Engine.commitTransaction(tx)` performs the final validation at the coordinator before the WAL record is published:
 
-1. Recheck constraints for every write-set operation (PK/unique conflicts).
-2. Validate the read set (rows read by SELECT); if another commit changed one, report a serialization failure (target feature; read-set tracking is not implemented yet).
+1. The coordinator rechecks constraints for every write-set operation against the published tables plus the round shadow (PK/unique conflicts, including other requests accepted earlier in the same drain).
+2. Update/delete targets are revalidated against their observed row versions; a changed version fails with `WriteWriteConflict`.
+3. Read-set tracking for serializable validation is a target feature; it is not implemented yet.
 
 ### Conversion to WAL Operations
 
-`Session.toWalOp()` converts `ArrayList(WriteOp)` to `[]TxnOp`:
+`Transaction.toWalOps()` converts `ArrayList(WriteOp)` to `[]TxnOp`:
 
 - Conversion releases staged-value ownership (shallow copy -> moved to the WAL encoder).
-- `Engine.commitTxnOps()` accepts `[]TxnOp`.
+- `Coordinator.Request` accepts `[]TxnOp` plus a parallel `[]?u64` observed-version array.
 
-## Single Writer and Group Commit (Target)
+## Single Writer and Group Commit
 
-### Current Path
+`Engine` routes every DML write through the commit coordinator in `src/commit/coordinator.zig`. A
+drain collects all queued requests into one batch, validates them in FIFO order (including
+observed-version write-write conflicts), assigns one `commit_seq` per accepted request, appends
+all their `txn_batch` frames as one group (`wal.appendTxnBatchGroup`), then applies them in
+commit order, advancing the published watermark after each. The WAL layer shares the durability
+round across the whole batch, so concurrent small transactions amortize `fdatasync` without
+merging their identity or reordering them.
 
-`Engine` is currently the single-writer facade. Each `commitTxnOps` call directly appends one
-frame with `wal.appendTxnBatch(ops)` (and may sync), then serially applies each `applyTxnOp(op)`.
-The WAL layer already shares durability rounds among concurrent appenders (`syncThrough`), so
-multi-threaded writers can amortize `fdatasync` without an engine commit queue. A single
-serialized client still pays one durability round per autocommit frame; engine-level batching
-is the next step for multi-connection OLTP.
-
-### Target: Group-Commit Queue
+### Implemented: Group-Commit Drain
 
 ```mermaid
 flowchart LR
     A["txn 1 commit request"] --> Q["commit queue\n(bounded FIFO)"]
     B["txn 2 commit request"] --> Q
     C["txn N commit request"] --> Q
-    Q --> BATCH["form batch"]
-    BATCH --> WAL["batched WAL write + one fsync"]
-    WAL --> APPLY["serial apply to LSM"]
+    Q --> VAL["validate in FIFO order\n(observed versions, unique, pk)"]
+    VAL --> BATCH["assign commit_seq per request"]
+    BATCH --> WAL["grouped WAL write + one fsync"]
+    WAL --> APPLY["serial apply to tables in commit order"]
+    APPLY --> WATER["advance published watermark"]
 ```
 
 **Batch rules:**
 
-1. Periodically or at a count threshold, collect queued commit requests into one batch.
-2. Combine the batch's write sets into one WAL batch (one or more frames sharing one `fsync`).
-3. Assign monotonically increasing commit sequences to each write set in the batch.
-4. After WAL confirmation, apply each write set to LSM in sequence order.
-5. Return success to clients before LSM confirmation; at the default durability level WAL sync already provides persistence.
+1. A drain collects the queued commit requests into one batch.
+2. Each request keeps its own `commit_seq` and its own `txn_batch` frame; the frames share one `fsync` (`appendTxnBatchGroup`).
+3. Commit sequences are assigned monotonically in FIFO order; a failed request never consumes a visible sequence.
+4. After WAL confirmation, each write set is applied to the tables in sequence order.
+5. The published watermark advances after each accepted request, so readers never observe a later commit before an earlier one.
 
 **Benefits:** under high contention, `fsync` calls drop from once per transaction to once per batch,
 and small transactions share batch-write overhead.
 
-**Current status:** not implemented. Each `Engine.commitTxnOps` call performs one WAL write.
-The `commit` module will add the queue and batching (see the evolution order in
-`ARCHITECTURE.md`).
+**Current status:** implemented for the engine transaction path and deterministically tested
+(including the bounded queue and a group drain that shares one durability round). The `commit`
+module owns the queue and sequence counters; `storage/engine` wires them to tables and WAL through
+comptime hooks, keeping the coordinator independent of the engine module.
 
 ### Commit Request Contract (Target)
 
@@ -296,15 +306,16 @@ application is a pure data-structure operation, so failure is currently expected
 
 ## Current Implementation vs Target
 
-| Feature | Current (Phase 0) | Target |
+| Feature | Current | Target |
 |------|----------------|------|
-| Single-writer path | `Engine` processes directly in sequence | Bounded commit queue + batching |
-| Group Commit | WAL-layer shared durability among concurrent appenders | Engine commit queue + batched writes + shared `fsync` |
-| WriteBatch | Internal single-operation frames / `txn_batch` | Write-set planning integrated with validated Runa Query IR execution |
-| Commit sequence | None (implicit engine order) | Monotonic `commit_seq` (MVCC foundation) |
-| Two-phase write | Session staging + `Engine.commitTxnOps` | Read-set tracking + serializable validation |
-| Write stall | None | Bounded admission and explicit retryable overload; LSM/compaction pressure feeds back before resource exhaustion |
-| Write amplification metrics | None | Write amplification, queue/admission, conflict, commit-latency, and batch-size metrics |
+| Single-writer path | Commit coordinator with a bounded queue and FIFO drain | Same, wired to the connection runtime |
+| Group Commit | `appendTxnBatchGroup` shares one durability round across a drain batch | Engine commit queue + batched writes + shared `fsync` (implemented) |
+| WriteBatch | `txn_batch` frames carrying `commit_seq` | Write-set planning integrated with validated Runa Query IR execution |
+| Commit sequence | Monotonic `commit_seq` allocated by the coordinator, rebuilt from WAL on recovery | Same (MVCC foundation) |
+| Two-phase write | `txn` write-set staging + coordinator commit | Read-set tracking + serializable validation |
+| Conflict detection | Observed-version write-write conflicts, PK and unique revalidation in the round | Range-history strict-OCC |
+| Write stall | Bounded admission and `CommitQueueFull` rejection | Explicit retryable overload; LSM/compaction pressure feeds back before resource exhaustion |
+| Write amplification metrics | Coordinator commit/conflict/rejection counters | Write amplification, queue/admission, conflict, commit-latency, and batch-size metrics |
 
 ## RunaDB Decisions
 

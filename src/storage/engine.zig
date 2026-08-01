@@ -7,6 +7,8 @@ const table_mod = @import("table.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const evidence_mod = @import("evidence.zig");
 const vector_mod = @import("../vector.zig");
+const commit_mod = @import("../commit/coordinator.zig");
+const txn_mod = @import("../txn/transaction.zig");
 
 pub const EngineError = table_mod.Error;
 pub const Row = table_mod.Row;
@@ -14,6 +16,44 @@ pub const Table = table_mod.Table;
 pub const Pred = table_mod.Pred;
 pub const ColumnSpec = table_mod.ColumnSpec;
 pub const VectorSearchError = error{VectorColumnRequired} || vector_mod.Error || Allocator.Error;
+
+const Coordinator = commit_mod.Coordinator(*Engine, .{
+    .walAppend = engineWalAppend,
+    .rowVersion = engineRowVersion,
+    .pkExists = enginePkExists,
+    .pkOf = enginePkOf,
+    .applyOp = engineApplyOp,
+    .validateOp = engineValidateOp,
+});
+
+fn engineWalAppend(eng: *Engine) *wal_mod.Wal {
+    return &eng.wal;
+}
+
+fn engineRowVersion(eng: *Engine, table_name: []const u8, pk: value.Value) ?u64 {
+    const table = eng.tables.getPtr(table_name) orelse return null;
+    return table.rowVersion(pk);
+}
+
+fn enginePkExists(eng: *Engine, table_name: []const u8, pk: value.Value) bool {
+    const table = eng.tables.getPtr(table_name) orelse return false;
+    return table.pkContains(pk);
+}
+
+fn enginePkOf(eng: *Engine, table_name: []const u8, values: []const value.Value) ?value.Value {
+    const table = eng.tables.getPtr(table_name) orelse return null;
+    const pki = table.pk_index orelse return null;
+    if (pki >= values.len) return null;
+    return values[pki];
+}
+
+fn engineApplyOp(eng: *Engine, op: *const wal_mod.TxnOp) anyerror!void {
+    return eng.applyTxnOp(op);
+}
+
+fn engineValidateOp(eng: *Engine, op: *const wal_mod.TxnOp, shadow: []const commit_mod.ShadowEntry) commit_mod.CoordError!void {
+    return eng.validateCoordinatedOp(op, shadow);
+}
 
 pub const EvidenceStats = struct {
     committed_count: u64 = 0,
@@ -34,8 +74,21 @@ pub const Engine = struct {
     observations: std.ArrayList(evidence_mod.Record),
     next_evidence_id: u64 = 1,
     evidence_stats: EvidenceStats = .{},
-    /// Serializes the mutating sequence (validate → WAL append → apply) against
-    /// itself and against a checkpoint.
+    /// Highest commit sequence whose changes are visible to readers. Advanced by
+    /// the commit coordinator only after WAL durability and in-memory
+    /// publication succeed. Rebuilt from `txn_batch`/`set_commit_seq` records
+    /// during recovery. Row versions become visible through this watermark.
+    published_commit_seq: u64 = 0,
+    /// Single-writer commit coordinator: assigns commit order, writes WAL
+    /// records, validates conflicts, and publishes confirmed changes. All DML
+    /// mutation enters through this boundary.
+    coordinator: Coordinator,
+    /// Serializes DDL, observe, and checkpoint (the non-coordinator writers)
+    /// against each other. DML mutation is ordered by the commit coordinator's
+    /// own mutex; in the current single-threaded server these never overlap.
+    /// A future multi-threaded runtime must route DDL and catalog changes
+    /// through the same single-writer queue as DML (see
+    /// `docs/architecture/concurrency-control.md`).
     ///
     /// A checkpoint discards WAL frames on the strength of the table state it
     /// captured, so it must never observe a writer between its WAL append and
@@ -61,10 +114,14 @@ pub const Engine = struct {
             .payloads = payloads,
             .tables = std.StringHashMap(Table).init(gpa),
             .observations = .empty,
+            .coordinator = Coordinator.init(gpa, io),
         };
         transferred = true;
         errdefer eng.deinit();
         try eng.recover();
+        // Recovery rebuilds the published watermark from the WAL; the
+        // coordinator's sequence counters must start from the recovered state.
+        eng.coordinator.restoreWatermark(eng.published_commit_seq);
         return eng;
     }
 
@@ -77,6 +134,7 @@ pub const Engine = struct {
         for (self.observations.items) |*record| record.deinit(self.gpa);
         self.observations.deinit(self.gpa);
         self.payloads.deinit();
+        self.coordinator.deinit();
         self.wal.deinit();
         self.* = undefined;
     }
@@ -94,7 +152,13 @@ pub const Engine = struct {
     fn applyRecord(self: *Engine, view: wal_mod.RecordView) !void {
         switch (view) {
             .txn_batch => |batch| {
-                try wal_mod.forEachTxnBatchOp(self.gpa, batch.body, self, applyRecord);
+                if (batch.commit_seq != 0 and batch.commit_seq > self.published_commit_seq) {
+                    self.published_commit_seq = batch.commit_seq;
+                }
+                try wal_mod.forEachTxnBatchOp(self.gpa, batch.body, self.wal.file_version, self, applyRecord);
+            },
+            .set_commit_seq => |seq| {
+                if (seq > self.published_commit_seq) self.published_commit_seq = seq;
             },
             else => try self.applyOne(view),
         }
@@ -102,7 +166,7 @@ pub const Engine = struct {
 
     fn applyOne(self: *Engine, view: wal_mod.RecordView) !void {
         switch (view) {
-            .txn_batch => return error.InvalidWal,
+            .txn_batch, .set_commit_seq => return error.InvalidWal,
             .create_table => |ct| {
                 try self.registerTable(ct.name, ct.columns);
             },
@@ -184,33 +248,97 @@ pub const Engine = struct {
         }
     }
 
-    /// Publish an explicit-transaction write set: one WAL frame, then apply all ops.
-    /// Ops were validated incrementally while staging against base + earlier write-set
-    /// entries; apply order must match staging order so later ops see earlier ones.
-    pub fn commitTxnOps(self: *Engine, ops: []const wal_mod.TxnOp) !void {
-        if (ops.len == 0) return;
-        try self.writer_mutex.lock(self.io);
-        defer self.writer_mutex.unlock(self.io);
-
-        try self.wal.appendTxnBatch(ops);
-        for (ops) |op| {
-            try self.applyTxnOp(op);
-        }
+    /// Snapshot watermark for a new transaction.
+    pub fn snapshotSeq(self: *Engine) u64 {
+        return self.coordinator.snapshot();
     }
 
-    fn applyTxnOp(self: *Engine, op: wal_mod.TxnOp) !void {
-        switch (op) {
+    /// Published commit watermark.
+    pub fn publishedSeq(self: *Engine) u64 {
+        return self.coordinator.publishedSeq();
+    }
+
+    fn applyTxnOp(self: *Engine, op: *const wal_mod.TxnOp) anyerror!void {
+        switch (op.*) {
             .insert => |ins| {
                 const table = self.tables.getPtr(ins.table) orelse return error.TableNotFound;
                 try table.insert(self.gpa, ins.values);
             },
             .update => |upd| {
                 const table = self.tables.getPtr(upd.table) orelse return error.TableNotFound;
-                try table.update(self.gpa, upd.pk, upd.values);
+                if (table.pk_index != null) {
+                    try table.update(self.gpa, upd.pk, upd.values);
+                } else {
+                    const idx: usize = switch (upd.pk) {
+                        .int => |i| @intCast(i),
+                        else => return error.PrimaryKeyNotFound,
+                    };
+                    try table.updateAt(self.gpa, idx, upd.values);
+                }
             },
             .delete => |del| {
                 const table = self.tables.getPtr(del.table) orelse return error.TableNotFound;
-                try table.delete(self.gpa, del.pk);
+                if (table.pk_index != null) {
+                    try table.delete(self.gpa, del.pk);
+                } else {
+                    const idx: usize = switch (del.pk) {
+                        .int => |i| @intCast(i),
+                        else => return error.PrimaryKeyNotFound,
+                    };
+                    try table.deleteAt(self.gpa, idx);
+                }
+            },
+        }
+    }
+
+    /// Coordinator-side validation of one op against published tables plus the
+    /// round shadow (earlier accepted requests). Unique-column and primary-key
+    /// checks must account for a transaction's own earlier inserts, which the
+    /// shadow exposes.
+    fn validateCoordinatedOp(self: *Engine, op: *const wal_mod.TxnOp, shadow: []const commit_mod.ShadowEntry) commit_mod.CoordError!void {
+        switch (op.*) {
+            .insert => |ins| {
+                const table = self.tables.getPtr(ins.table) orelse return error.PrimaryKeyNotFound;
+                table.validateInsert(ins.values) catch |err| return mapCoordError(err);
+                // Reject a primary key that another request in the same round
+                // already inserted. The engine resolves the pk from the values
+                // using the table schema.
+                if (table.pk_index) |pki| {
+                    const pk = ins.values[pki];
+                    if (findShadowRow(shadow, ins.table, pk) != null) return error.DuplicatePrimaryKey;
+                }
+            },
+            .update => |upd| {
+                const table = self.tables.getPtr(upd.table) orelse return error.PrimaryKeyNotFound;
+                // If the target was inserted earlier in this same write set, it
+                // is not yet live; validate against the shadow row instead.
+                if (findShadowRow(shadow, upd.table, upd.pk) != null) {
+                    table.validateTypes(upd.values) catch |err| return mapCoordError(err);
+                    return;
+                }
+                if (table.pk_index != null) {
+                    table.validateUpdate(upd.pk, upd.values) catch |err| return mapCoordError(err);
+                } else {
+                    const idx: usize = switch (upd.pk) {
+                        .int => |i| @intCast(i),
+                        else => return error.PrimaryKeyNotFound,
+                    };
+                    if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
+                    table.validateUpdateAt(idx, upd.values) catch |err| return mapCoordError(err);
+                }
+            },
+            .delete => |del| {
+                const table = self.tables.getPtr(del.table) orelse return error.PrimaryKeyNotFound;
+                if (findShadowRow(shadow, del.table, del.pk) != null) return;
+                if (table.pk_index != null) {
+                    if (!table.pkContains(del.pk)) return error.PrimaryKeyNotFound;
+                } else {
+                    const idx: usize = switch (del.pk) {
+                        .int => |i| @intCast(i),
+                        else => return error.PrimaryKeyNotFound,
+                    };
+                    if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
+                }
             },
         }
     }
@@ -353,65 +481,152 @@ pub const Engine = struct {
         try table.setNotNull(name, enabled);
     }
 
+    /// Autocommit insert: one statement, one commit, routed through the
+    /// single-writer coordinator.
     pub fn insert(self: *Engine, table_name: []const u8, values: []const value.Value) !void {
-        try self.writer_mutex.lock(self.io);
-        defer self.writer_mutex.unlock(self.io);
+        var tx = txn_mod.Transaction.begin(self.gpa, self.coordinator.snapshot());
+        defer tx.deinit();
+        try self.stageInsert(&tx, table_name, values);
+        try self.commitTransaction(&tx);
+    }
+
+    /// Autocommit update by primary key.
+    pub fn update(self: *Engine, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
+        var tx = txn_mod.Transaction.begin(self.gpa, self.coordinator.snapshot());
+        defer tx.deinit();
+        try self.stageUpdate(&tx, table_name, pk, values);
+        try self.commitTransaction(&tx);
+    }
+
+    /// Autocommit delete by primary key.
+    pub fn delete(self: *Engine, table_name: []const u8, pk: value.Value) !void {
+        var tx = txn_mod.Transaction.begin(self.gpa, self.coordinator.snapshot());
+        defer tx.deinit();
+        try self.stageDelete(&tx, table_name, pk);
+        try self.commitTransaction(&tx);
+    }
+
+    // ── Explicit transaction API ──
+
+    /// Begin an explicit transaction at the current published watermark.
+    pub fn beginTransaction(self: *Engine) txn_mod.Transaction {
+        return txn_mod.Transaction.begin(self.gpa, self.coordinator.snapshot());
+    }
+
+    /// Stage an insert into `tx`, validating against the live table and the
+    /// transaction's own earlier writes (read-your-writes).
+    pub fn stageInsert(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, values: []const value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         try table.validateInsert(values);
-        try self.wal.appendInsert(.{ .table = table_name, .values = values });
-        try table.insert(self.gpa, values);
+        // A transaction must not insert the same primary key twice. The live
+        // table does not yet contain this row, so check the private write set.
+        const pk: value.Value = if (table.pk_index) |pki| values[pki] else .null;
+        if (pk != .null) {
+            if (self.findStagedOp(tx, table_name, pk)) |staged| {
+                if (staged.op == .insert) return error.DuplicatePrimaryKey;
+            }
+        }
+        try tx.stageInsert(table_name, pk, values);
     }
 
-    pub fn update(self: *Engine, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
-        try self.writer_mutex.lock(self.io);
-        defer self.writer_mutex.unlock(self.io);
+    /// Find a staged write-set entry for `(table_name, pk)`.
+    fn findStagedOp(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, pk: value.Value) ?*txn_mod.WriteOp {
+        _ = self;
+        for (tx.write_set.items) |*op| {
+            if (std.mem.eql(u8, op.table, table_name) and op.pk.eql(pk)) return op;
+        }
+        return null;
+    }
+
+    /// Stage an update into `tx`. Captures the observed row version so the
+    /// coordinator can reject a lost update.
+    pub fn stageUpdate(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, pk: value.Value, values: []const value.Value) !void {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (self.findStagedOp(tx, table_name, pk)) |staged| {
+            if (staged.op == .delete) return error.PrimaryKeyNotFound;
+            try table.validateTypes(values);
+            try tx.stageUpdate(table_name, pk, values, 0);
+            return;
+        }
+        const observed = table.rowVersion(pk) orelse return error.PrimaryKeyNotFound;
         try table.validateUpdate(pk, values);
-        try self.wal.appendUpdate(.{ .table = table_name, .pk = pk, .values = values });
-        try table.update(self.gpa, pk, values);
+        try tx.stageUpdate(table_name, pk, values, observed);
     }
 
-    /// Update by current row index; WAL records full row with PK when present, else uses int index as pseudo-pk for replay.
+    /// Stage a delete into `tx`. Captures the observed row version.
+    pub fn stageDelete(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, pk: value.Value) !void {
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        if (self.findStagedOp(tx, table_name, pk)) |staged| {
+            if (staged.op == .delete) return error.PrimaryKeyNotFound;
+            try tx.stageDelete(table_name, pk, 0);
+            return;
+        }
+        const observed = table.rowVersion(pk) orelse return error.PrimaryKeyNotFound;
+        try tx.stageDelete(table_name, pk, observed);
+    }
+
+    /// Commit a staged transaction through the coordinator.
+    pub fn commitTransaction(self: *Engine, tx: *txn_mod.Transaction) !void {
+        if (!tx.isActive()) return error.InvalidState;
+        const observed = try self.gpa.alloc(?u64, tx.write_set.items.len);
+        for (tx.write_set.items, 0..) |op, i| observed[i] = op.observed_version;
+        const ops = tx.toWalOps() catch {
+            self.gpa.free(observed);
+            return error.OutOfMemory;
+        };
+
+        var request = commit_mod.Request{
+            .gpa = self.gpa,
+            .ops = ops,
+            .observed = observed,
+            .read_seq = tx.snapshot_seq,
+        };
+        var transferred = false;
+        defer if (!transferred) request.deinit();
+
+        try self.coordinator.submit(self, &request);
+        try self.coordinator.drain(self);
+        transferred = true;
+        const result = request.result;
+        request.deinit();
+        if (result) |err| return err;
+    }
+
+    /// Rollback discards the transaction's private write set.
+    pub fn rollbackTransaction(self: *Engine, tx: *txn_mod.Transaction) !void {
+        _ = self;
+        try tx.rollback();
+    }
+
+    /// Update by current row index; resolves to a primary key when present and
+    /// routes through the commit coordinator so the watermark advances. Tables
+    /// without a single-column primary key use a legacy index-addressed WAL
+    /// path (unused by the current public API).
     pub fn updateAt(self: *Engine, table_name: []const u8, idx: usize, values: []const value.Value) !void {
-        try self.writer_mutex.lock(self.io);
-        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
         if (table.pk_index) |pki| {
             const pk = table.rows.items[idx].values[pki];
-            try table.validateUpdate(pk, values);
-            try self.wal.appendUpdate(.{ .table = table_name, .pk = pk, .values = values });
-            try table.update(self.gpa, pk, values);
-        } else {
-            try table.validateUpdateAt(idx, values);
-            try self.wal.appendUpdate(.{ .table = table_name, .pk = .{ .int = @intCast(idx) }, .values = values });
-            try table.updateAt(self.gpa, idx, values);
+            return self.update(table_name, pk, values);
         }
-    }
-
-    pub fn delete(self: *Engine, table_name: []const u8, pk: value.Value) !void {
         try self.writer_mutex.lock(self.io);
         defer self.writer_mutex.unlock(self.io);
-        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        if (!table.pkContains(pk)) return error.PrimaryKeyNotFound;
-
-        try self.wal.appendDelete(.{ .table = table_name, .pk = pk });
-        try table.delete(self.gpa, pk);
+        try table.validateUpdateAt(idx, values);
+        try self.wal.appendUpdate(.{ .table = table_name, .pk = .{ .int = @intCast(idx) }, .values = values });
+        try table.updateAt(self.gpa, idx, values);
     }
 
     pub fn deleteAt(self: *Engine, table_name: []const u8, idx: usize) !void {
-        try self.writer_mutex.lock(self.io);
-        defer self.writer_mutex.unlock(self.io);
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
         if (table.pk_index) |pki| {
             const pk = table.rows.items[idx].values[pki];
-            try self.wal.appendDelete(.{ .table = table_name, .pk = pk });
-            try table.delete(self.gpa, pk);
-        } else {
-            try self.wal.appendDelete(.{ .table = table_name, .pk = .{ .int = @intCast(idx) } });
-            try table.deleteAt(self.gpa, idx);
+            return self.delete(table_name, pk);
         }
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        try self.wal.appendDelete(.{ .table = table_name, .pk = .{ .int = @intCast(idx) } });
+        try table.deleteAt(self.gpa, idx);
     }
 
     /// Publish immutable Observation Evidence through payload-file then WAL
@@ -544,7 +759,7 @@ pub const Engine = struct {
         var it = self.tables.iterator();
         while (it.next()) |entry| refs.appendAssumeCapacity(entry.value_ptr);
 
-        return checkpoint_mod.run(&self.wal, refs.items, self.observations.items);
+        return checkpoint_mod.run(&self.wal, refs.items, self.observations.items, self.publishedSeq());
     }
 };
 
@@ -552,6 +767,26 @@ fn existingColumnValue(gpa: Allocator, default_expr: value.DefaultExpr) !value.V
     return switch (default_expr) {
         .none, .now => .null,
         .literal => |v| try v.clone(gpa),
+    };
+}
+
+fn findShadowRow(shadow: []const commit_mod.ShadowEntry, table: []const u8, pk: value.Value) ?*const commit_mod.ShadowEntry {
+    for (shadow) |*entry| {
+        if (std.mem.eql(u8, entry.table, table) and entry.pk.eql(pk)) return entry;
+    }
+    return null;
+}
+
+fn mapCoordError(err: table_mod.Error) commit_mod.CoordError {
+    return switch (err) {
+        error.DuplicatePrimaryKey => error.DuplicatePrimaryKey,
+        error.UniqueViolation => error.UniqueViolation,
+        error.PrimaryKeyNotFound => error.PrimaryKeyNotFound,
+        error.TableNotFound => error.PrimaryKeyNotFound,
+        error.NotNullViolation => error.DuplicatePrimaryKey,
+        error.TypeMismatch => error.DuplicatePrimaryKey,
+        error.ColumnCountMismatch => error.DuplicatePrimaryKey,
+        else => error.InvalidRequest,
     };
 }
 

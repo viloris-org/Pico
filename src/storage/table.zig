@@ -23,6 +23,11 @@ pub const Error = error{
 
 pub const Row = struct {
     values: []value.Value,
+    /// Monotonic per-table version stamp, bumped on every mutation. Used by the
+    /// commit coordinator to detect write-write conflicts: an update/delete
+    /// records the version it observed, and commit fails if that version no
+    /// longer matches the published row.
+    version: u64 = 0,
 
     pub fn deinit(self: *Row, gpa: Allocator) void {
         for (self.values) |*v| v.deinit(gpa);
@@ -69,6 +74,10 @@ pub const Table = struct {
     rows: std.ArrayList(Row),
     /// Next value for SERIAL/BIGSERIAL columns.
     next_serial: i64,
+    /// Monotonic version stamp assigned to the next row version. Every
+    /// mutation consumes one value so a changed row is always observable as a
+    /// different version to the commit coordinator.
+    next_version: u64 = 1,
 
     pub fn deinit(self: *Table, gpa: Allocator) void {
         gpa.free(self.name);
@@ -150,6 +159,13 @@ pub const Table = struct {
         };
     }
 
+    /// Current version stamp of the live row for `pk`, or null when absent.
+    /// Used by the commit coordinator for write-write conflict validation.
+    pub fn rowVersion(self: *const Table, pk: value.Value) ?u64 {
+        const idx = self.pkLookup(pk) orelse return null;
+        return self.rows.items[idx].version;
+    }
+
     pub fn pkContains(self: *const Table, pk: value.Value) bool {
         return self.pkLookup(pk) != null;
     }
@@ -215,6 +231,13 @@ pub const Table = struct {
         try self.checkUnique(values, null);
     }
 
+    /// Validate column count and type tags without primary-key or unique
+    /// checks. Used by the commit coordinator when a target row was inserted by
+    /// the same write set and is not yet visible to the live table.
+    pub fn validateTypes(self: *const Table, values: []const value.Value) Error!void {
+        try self.checkTypes(values);
+    }
+
     pub fn validateUpdate(self: *const Table, pk: value.Value, values: []const value.Value) Error!void {
         try self.checkTypes(values);
         const pk_index = self.pk_index orelse return error.MissingPrimaryKey;
@@ -250,7 +273,8 @@ pub const Table = struct {
         }
 
         const idx = self.rows.items.len;
-        try self.rows.append(gpa, .{ .values = owned_vals });
+        try self.rows.append(gpa, .{ .values = owned_vals, .version = self.next_version });
+        self.next_version += 1;
         errdefer {
             var row = self.rows.pop().?;
             row.deinit(gpa);
@@ -289,7 +313,8 @@ pub const Table = struct {
 
         var old = self.rows.items[idx];
         old.deinit(gpa);
-        self.rows.items[idx] = .{ .values = owned_vals };
+        self.rows.items[idx] = .{ .values = owned_vals, .version = self.next_version };
+        self.next_version += 1;
         try self.pkPut(self.rows.items[idx].values[pki], idx);
     }
 
@@ -319,7 +344,8 @@ pub const Table = struct {
 
         var old = self.rows.items[idx];
         old.deinit(gpa);
-        self.rows.items[idx] = .{ .values = owned_vals };
+        self.rows.items[idx] = .{ .values = owned_vals, .version = self.next_version };
+        self.next_version += 1;
         if (self.pk_index) |pki| {
             try self.pkPut(self.rows.items[idx].values[pki], idx);
         }

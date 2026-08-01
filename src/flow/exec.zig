@@ -42,6 +42,11 @@ pub fn compile(gpa: Allocator, source: []const u8) !ir.Request {
 pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
     if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
     if (request.operation != .emit) return error.InvalidOperation;
+    // Read Committed: a Request observes the committed state at the current
+    // published watermark. The in-memory tables hold one committed version per
+    // row, so the live state is the latest committed state; version retention
+    // for reads over older snapshots arrives with LSM storage (Phase 5).
+    _ = eng.publishedSeq();
     if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
     // Revision 0 is an explicit development binding of relation names to the
     // existing table catalog. It is read-only and is not persisted as a model.

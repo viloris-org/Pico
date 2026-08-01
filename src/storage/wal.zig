@@ -26,6 +26,11 @@ pub const RecordType = enum(u8) {
     /// Immutable Observation Evidence metadata. Payload bytes live in the
     /// versioned payload store and are validated before this record is applied.
     observe = 11,
+    /// Authoritative published commit watermark. Only the checkpoint path emits
+    /// this: replaying reconstruction records alone would reset the watermark to
+    /// zero, which would make every pre-checkpoint row look created at seq 0 and
+    /// break MVCC ordering after restart. Requires WAL format version 5.
+    set_commit_seq = 12,
 };
 
 /// One DML op inside an explicit-transaction commit batch.
@@ -33,6 +38,12 @@ pub const TxnOp = union(enum) {
     insert: InsertRecord,
     update: UpdateRecord,
     delete: DeleteRecord,
+
+    pub const Tag = enum {
+        insert,
+        update,
+        delete,
+    };
 };
 
 /// WAL files are self-identifying so a changed frame layout never reinterprets old bytes.
@@ -44,7 +55,11 @@ pub const TxnOp = union(enum) {
 /// different complete frame; only an incomplete tail may be truncated.
 const file_magic = "RUNADB_WAL";
 /// Version written into every new or rewritten WAL file.
-const format_version: u32 = 4;
+///
+/// Version 5: `txn_batch` records carry a leading `commit_seq: u64`, and the
+/// checkpoint path emits `set_commit_seq` to restore the published watermark.
+/// Recovery rebuilds the MVCC watermark from these records.
+const format_version: u32 = 5;
 /// Oldest version this build still replays. Version 1 files contain no
 /// `set_serial` record, so reading them needs no compatibility shim; only a
 /// checkpoint rewrite upgrades a file in place. An older build meeting a
@@ -96,6 +111,9 @@ pub const Wal = struct {
     file: vfs_mod.File,
     /// Next write offset (end of file).
     offset: u64,
+    /// Format version read from the file header, so record parsing can be
+    /// version-aware during replay (e.g. v5 `txn_batch` carries `commit_seq`).
+    file_version: u32,
     sync_on_append: bool,
     /// Serializes positional writes and allocation of WAL offsets.
     append_mutex: Io.Mutex = .init,
@@ -142,6 +160,7 @@ pub const Wal = struct {
         var file = try vfs.openFile("wal", .{ .create = true });
         errdefer file.close();
 
+        var file_version: u32 = format_version;
         var len = try file.size();
         if (len == 0) {
             var header: [file_header_len]u8 = undefined;
@@ -150,7 +169,9 @@ pub const Wal = struct {
             if (sync_on_append) try file.syncData();
             len = file_header_len;
         } else {
-            try validateFileHeader(&file, len);
+            const version = try validateFileHeader(&file, len);
+            if (version > format_version) return error.UnsupportedWalFormat;
+            file_version = version;
         }
         return .{
             .gpa = gpa,
@@ -158,6 +179,7 @@ pub const Wal = struct {
             .vfs = vfs,
             .file = file,
             .offset = len,
+            .file_version = file_version,
             .sync_on_append = sync_on_append,
             .durable_offset = len,
             .requested_durable_offset = len,
@@ -263,13 +285,16 @@ pub const Wal = struct {
     }
 
     /// Persist a whole explicit-transaction write set as one checksummed frame.
-    pub fn appendTxnBatch(self: *Wal, ops: []const TxnOp) !void {
+    /// `commit_seq` is the MVCC commit sequence assigned by the single writer;
+    /// recovery uses it to rebuild the published watermark.
+    pub fn appendTxnBatch(self: *Wal, commit_seq: u64, ops: []const TxnOp) !void {
         if (ops.len == 0) return error.InvalidWal;
         if (ops.len > std.math.maxInt(u16)) return error.InvalidWal;
 
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.gpa);
         try list.append(self.gpa, @intFromEnum(RecordType.txn_batch));
+        try writeU64(&list, self.gpa, commit_seq);
         try writeU16(&list, self.gpa, @intCast(ops.len));
 
         for (ops) |op| {
@@ -281,6 +306,80 @@ pub const Wal = struct {
             try list.appendSlice(self.gpa, sub.items);
         }
         try self.appendPayload(list.items);
+    }
+
+    /// Persist the published commit watermark so recovery can restore it after
+    /// a checkpoint has collapsed per-commit history into reconstruction
+    /// records. Only the checkpoint path emits this record.
+    pub fn appendSetCommitSeq(self: *Wal, commit_seq: u64) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try list.append(self.gpa, @intFromEnum(RecordType.set_commit_seq));
+        try writeU64(&list, self.gpa, commit_seq);
+        try self.appendPayload(list.items);
+    }
+
+    /// A batch of independent transaction commits prepared for one durability
+    /// round. Each batch entry is its own `txn_batch` frame with its own
+    /// `commit_seq`; group commit shares the WAL write and sync across them.
+    pub const TxnBatchGroup = struct {
+        commit_seq: u64,
+        ops: []const TxnOp,
+    };
+
+    /// Append several `txn_batch` frames under one append-mutex hold and sync
+    /// once through the end offset, so a group of commits pays a single
+    /// durability round without merging their identity or commit order.
+    pub fn appendTxnBatchGroup(self: *Wal, batches: []const TxnBatchGroup) !void {
+        if (batches.len == 0) return error.InvalidWal;
+        if (self.unusable) return error.WalUnusable;
+
+        const end_offset = blk: {
+            try self.append_mutex.lock(self.io);
+            defer self.append_mutex.unlock(self.io);
+
+            var end = self.offset;
+            for (batches) |batch| {
+                if (batch.ops.len == 0 or batch.ops.len > std.math.maxInt(u16)) return error.InvalidWal;
+                var list: std.ArrayList(u8) = .empty;
+                defer list.deinit(self.gpa);
+                try list.append(self.gpa, @intFromEnum(RecordType.txn_batch));
+                try writeU64(&list, self.gpa, batch.commit_seq);
+                try writeU16(&list, self.gpa, @intCast(batch.ops.len));
+                for (batch.ops) |op| {
+                    var sub: std.ArrayList(u8) = .empty;
+                    defer sub.deinit(self.gpa);
+                    try encodeTxnOp(&sub, self.gpa, op);
+                    if (sub.items.len > std.math.maxInt(u32)) return error.InvalidWal;
+                    try writeU32(&list, self.gpa, @intCast(sub.items.len));
+                    try list.appendSlice(self.gpa, sub.items);
+                }
+                try self.writeFrameNoSync(list.items, end);
+                end += frame_header_len + list.items.len;
+            }
+            self.offset = end;
+            break :blk end;
+        };
+        if (self.sync_on_append) {
+            try self.syncThrough(end_offset);
+        }
+    }
+
+    /// Write one fully checksummed frame at `offset` without advancing the
+    /// durable boundary. The caller owns ordering and the eventual sync.
+    fn writeFrameNoSync(self: *Wal, payload: []const u8, offset: u64) !void {
+        if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
+        const frame_len = frame_header_len + payload.len;
+        var stack_frame: [small_frame_cap]u8 = undefined;
+        const use_stack = frame_len <= small_frame_cap;
+        const frame = if (use_stack) stack_frame[0..frame_len] else try self.gpa.alloc(u8, frame_len);
+        defer if (!use_stack) self.gpa.free(frame);
+
+        const payload_len: u32 = @intCast(payload.len);
+        bytes.writeU32LE(frame[0..4], payload_len);
+        bytes.writeU32LE(frame[4..8], frameChecksum(payload_len, payload));
+        @memcpy(frame[frame_header_len..], payload);
+        try self.file.writeAtAll(frame, offset);
     }
 
     /// Encode with a stack-backed list when the record fits; fall back to the
@@ -453,6 +552,16 @@ pub const Wal = struct {
             try self.emitPayload(list.items);
         }
 
+        /// Emit the published commit watermark last, so recovery restores it
+        /// after the reconstruction records collapse per-commit history.
+        pub fn emitSetCommitSeq(self: *Rewrite, commit_seq: u64) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try list.append(self.wal.gpa, @intFromEnum(RecordType.set_commit_seq));
+            try writeU64(&list, self.wal.gpa, commit_seq);
+            try self.emitPayload(list.items);
+        }
+
         fn emitPayload(self: *Rewrite, payload: []const u8) !void {
             if (payload.len == 0 or payload.len > frame_payload_len_max) return error.InvalidWal;
 
@@ -531,6 +640,7 @@ pub const Wal = struct {
         self.file.close();
         self.file = reopened;
         self.offset = new_end;
+        self.file_version = format_version;
         self.durable_offset = new_end;
         self.requested_durable_offset = new_end;
         // The staged file was synced before publication, so the new file is
@@ -594,7 +704,7 @@ fn frameChecksum(payload_len: u32, payload: []const u8) u32 {
     return c.final();
 }
 
-fn validateFileHeader(file: *vfs_mod.File, len: u64) !void {
+fn validateFileHeader(file: *vfs_mod.File, len: u64) !u32 {
     if (len < file_header_len) return error.InvalidWal;
 
     var header: [file_header_len]u8 = undefined;
@@ -605,6 +715,7 @@ fn validateFileHeader(file: *vfs_mod.File, len: u64) !void {
     if (version < format_version_min or version > format_version) {
         return error.UnsupportedWalFormat;
     }
+    return version;
 }
 
 pub const RecordView = union(RecordType) {
@@ -629,11 +740,16 @@ pub const RecordView = union(RecordType) {
     drop_column: struct { table: []const u8, column: []const u8 },
     set_default: struct { table: []const u8, column: []const u8, default_expr: value.DefaultExpr },
     set_not_null: struct { table: []const u8, column: []const u8, enabled: bool },
-    /// Body is `n_ops:u16` then repeated `op_len:u32` + single-op payload (incl. type byte).
-    /// Borrowed from the frame buffer for the duration of `apply` only.
-    txn_batch: struct { body: []const u8 },
+    /// Body is `commit_seq:u64` then `n_ops:u16` then repeated `op_len:u32` +
+    /// single-op payload (incl. type byte). Borrowed from the frame buffer for
+    /// the duration of `apply` only.
+    txn_batch: struct {
+        commit_seq: u64,
+        body: []const u8,
+    },
     set_serial: struct { table: []const u8, next_serial: i64 },
     observe: evidence.Metadata,
+    set_commit_seq: u64,
 
     pub const ParsedColumn = struct {
         name: []const u8,
@@ -646,14 +762,19 @@ pub const RecordView = union(RecordType) {
     };
 
     pub fn parseAlloc(gpa: Allocator, payload: []const u8) !struct { view: RecordView, owned: Owned } {
+        return parseAllocVersioned(gpa, payload, format_version);
+    }
+
+    /// Parse one record body. `file_version` gates format changes: the v5
+    /// `txn_batch` body begins with `commit_seq`, older bodies do not.
+    pub fn parseAllocVersioned(gpa: Allocator, payload: []const u8, file_version: u32) !struct { view: RecordView, owned: Owned } {
         var owned: Owned = .{ .gpa = gpa, .columns = .empty, .values = .empty, .pk = .null };
         errdefer owned.deinit();
 
         if (payload.len < 1) return error.InvalidWal;
         const tag = std.enums.fromInt(RecordType, payload[0]) orelse return error.InvalidWal;
         var i: usize = 1;
-        switch (tag) {
-            .create_table => {
+        switch (tag) {            .create_table => {
                 const name = try readStr(payload, &i);
                 const ncol = try readU16(payload, &i);
                 try owned.columns.ensureTotalCapacity(gpa, ncol);
@@ -810,6 +931,10 @@ pub const RecordView = union(RecordType) {
             .txn_batch => {
                 // Validate shape eagerly; engine expands nested ops during apply.
                 var j: usize = i;
+                var commit_seq: u64 = 0;
+                if (file_version >= 5) {
+                    commit_seq = try readU64(payload, &j);
+                }
                 const n_ops = try readU16(payload, &j);
                 if (n_ops == 0) return error.InvalidWal;
                 var k: u16 = 0;
@@ -822,11 +947,16 @@ pub const RecordView = union(RecordType) {
                     if (sub.len < 1) return error.InvalidWal;
                     const sub_tag = std.enums.fromInt(RecordType, sub[0]) orelse return error.InvalidWal;
                     if (sub_tag == .txn_batch) return error.InvalidWal;
-                    var sub_parsed = try parseAlloc(gpa, sub);
+                    var sub_parsed = try parseAllocVersioned(gpa, sub, file_version);
                     sub_parsed.owned.deinit();
                 }
                 if (j != payload.len) return error.InvalidWal;
-                return .{ .view = .{ .txn_batch = .{ .body = payload[i..] } }, .owned = owned };
+                return .{ .view = .{ .txn_batch = .{ .commit_seq = commit_seq, .body = payload[i..] } }, .owned = owned };
+            },
+            .set_commit_seq => {
+                if (payload.len - i != 8) return error.InvalidWal;
+                const commit_seq = readU64(payload, &i) catch return error.InvalidWal;
+                return .{ .view = .{ .set_commit_seq = commit_seq }, .owned = owned };
             },
         }
     }
@@ -856,7 +986,7 @@ pub const RecordView = union(RecordType) {
 /// - A complete frame with a bad checksum, zero/oversized length, or undecodable
 ///   payload fails recovery; the file is left untouched for forensics.
 pub fn replayWal(self: *Wal, ctx: anytype, comptime apply: fn (@TypeOf(ctx), RecordView) anyerror!void) !void {
-    try validateFileHeader(&self.file, self.offset);
+    _ = try validateFileHeader(&self.file, self.offset);
     var off: u64 = file_header_len;
     var truncated = false;
     while (off < self.offset) {
@@ -890,7 +1020,7 @@ pub fn replayWal(self: *Wal, ctx: anytype, comptime apply: fn (@TypeOf(ctx), Rec
         if (payload_read_len < payload_len) return error.InvalidWal;
         if (frameChecksum(payload_len, buf) != payload_crc) return error.CorruptWal;
 
-        var parsed = try RecordView.parseAlloc(self.gpa, buf);
+        var parsed = try RecordView.parseAllocVersioned(self.gpa, buf, self.file_version);
         defer parsed.owned.deinit();
         try apply(ctx, parsed.view);
         off += frame_len;
@@ -961,14 +1091,19 @@ fn readU64(payload: []const u8, i: *usize) !u64 {
     return value_read;
 }
 
-/// Iterate nested ops inside a `txn_batch` body. `body` excludes the type byte.
+/// Iterate nested ops inside a `txn_batch` body. `body` excludes the type byte;
+/// for format v5 it is `commit_seq:u64` then `n_ops:u16` then repeated ops.
 pub fn forEachTxnBatchOp(
     gpa: Allocator,
     body: []const u8,
+    file_version: u32,
     ctx: anytype,
     comptime apply: fn (@TypeOf(ctx), RecordView) anyerror!void,
 ) !void {
     var i: usize = 0;
+    if (file_version >= 5) {
+        _ = try readU64(body, &i);
+    }
     const n_ops = try readU16(body, &i);
     var k: u16 = 0;
     while (k < n_ops) : (k += 1) {
@@ -976,7 +1111,7 @@ pub fn forEachTxnBatchOp(
         if (op_len == 0 or i + op_len > body.len) return error.InvalidWal;
         const sub = body[i .. i + op_len];
         i += op_len;
-        var parsed = try RecordView.parseAlloc(gpa, sub);
+        var parsed = try RecordView.parseAllocVersioned(gpa, sub, file_version);
         defer parsed.owned.deinit();
         try apply(ctx, parsed.view);
     }
@@ -1528,4 +1663,112 @@ test "wal rejects unknown magic and format version" {
         try wal.file.writeAtAll(&ver, file_magic.len);
     }
     try std.testing.expectError(error.UnsupportedWalFormat, Wal.open(gpa, io, dir_name, false));
+}
+
+// A v5 `txn_batch` carries its commit_seq so recovery can rebuild the watermark.
+test "wal replays a v5 txn_batch with its commit seq" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-v5-batch");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        const ops = [_]TxnOp{.{
+            .insert = .{ .table = "users", .values = &.{.{ .int = 1 }} },
+        }};
+        try wal.appendTxnBatch(7, &ops);
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: BatchSink = .{};
+        try replayWal(&wal, &sink, BatchSink.apply);
+        try std.testing.expectEqual(@as(u64, 7), sink.last_commit_seq);
+        try std.testing.expectEqual(@as(u32, 1), sink.inserts);
+    }
+}
+
+test "wal replays a set_commit_seq record" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-set-commit-seq");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendSetCommitSeq(99);
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: BatchSink = .{};
+        try replayWal(&wal, &sink, BatchSink.apply);
+        try std.testing.expectEqual(@as(u64, 99), sink.watermark);
+    }
+}
+
+test "wal appends a group of txn_batch frames as one durable round" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-group-batch");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, true);
+        defer wal.deinit();
+        const ops = [_]TxnOp{.{
+            .insert = .{ .table = "users", .values = &.{.{ .int = 1 }} },
+        }};
+        const batches = [_]Wal.TxnBatchGroup{
+            .{ .commit_seq = 1, .ops = &ops },
+            .{ .commit_seq = 2, .ops = &ops },
+        };
+        try wal.appendTxnBatchGroup(&batches);
+        // Two commits share one durability round.
+        try std.testing.expectEqual(@as(u64, 1), wal.sync_rounds);
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: BatchSink = .{};
+        try replayWal(&wal, &sink, BatchSink.apply);
+        try std.testing.expectEqual(@as(u32, 2), sink.inserts);
+    }
+}
+
+const BatchSink = struct {
+    inserts: u32 = 0,
+    last_commit_seq: u64 = 0,
+    watermark: u64 = 0,
+
+    fn apply(self: *BatchSink, view: RecordView) !void {
+        switch (view) {
+            .txn_batch => |batch| {
+                self.last_commit_seq = batch.commit_seq;
+                try forEachTxnBatchOp(std.testing.allocator, batch.body, format_version, self, subApply);
+            },
+            .set_commit_seq => |seq| self.watermark = seq,
+            .insert => |ins| {
+                _ = ins;
+                self.inserts += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+fn subApply(self: *BatchSink, view: RecordView) !void {
+    switch (view) {
+        .insert => |ins| {
+            _ = ins;
+            self.inserts += 1;
+        },
+        else => return error.InvalidWal,
+    }
 }

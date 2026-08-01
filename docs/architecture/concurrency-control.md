@@ -4,7 +4,7 @@
 
 This document refines ADR-0005's "single-writer commit ordering + MVCC reads" and defines the semantic boundaries RunaDB must satisfy when implementing transactions, versioned storage, and background reclamation. It describes the target architecture; it does not claim that Phase 0 already provides these capabilities.
 
-The current public Flow/IR slice is read-only and has no transaction-control operations. Internal table mutation methods write to the WAL, but they are not public transaction support. Until the implementation reaches the phase described here, transaction syntax or isolation must not be advertised.
+The current public Flow/IR slice is read-only and has no transaction-control operations. The transaction ownership area (`txn`), the single-writer commit coordinator (`commit`), group commit, observed-version write-write conflict detection, bounded admission, and the durable commit watermark are implemented as a development slice and deterministically tested at the engine level; the wire protocol does not yet expose them. Internal table mutation methods write through the coordinator, but they are not public transaction support. Until the implementation reaches the phase described here, transaction syntax or isolation must not be advertised.
 
 This document constrains concurrency within a single RunaDB **instance**. It does not define cross-instance coordination, replication, distributed transactions, user-visible lock operations, savepoints, or PostgreSQL isolation compatibility. A future Flow/IR shape does not become supported merely because the Wire Protocol can carry it.
 

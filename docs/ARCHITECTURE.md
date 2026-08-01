@@ -87,16 +87,22 @@ flowchart TB
 
 ### Current Implementation Mapping (Phase 0: In-Memory Tables + WAL)
 
-The target `catalog` / `commit` / `lsm` modules do not yet exist independently. These files currently carry transitional responsibilities, avoiding further accumulation of constraints, row storage, and durability orchestration in one file:
+The target `catalog` / `lsm` modules do not yet exist independently. The `txn` and `commit`
+ownership areas from the roadmap's Phase 3 have arrived as separate modules; these files carry
+the remaining transitional responsibilities, avoiding further accumulation of constraints, row
+storage, and durability orchestration in one file:
 
 | Module | Target mapping | Sole responsibility | May depend on |
 | --- | --- | --- | --- |
-| `storage/table` | `catalog` column definitions + `lsm` in-memory-table subset | Rows, primary-key index, constraint validation, and predicate matching for one table | `storage/value`, `util` |
-| `storage/engine` | `commit` single-writer facade | Table registration, validate -> WAL append -> apply to `table`, and startup recovery | `storage/table`, `storage/wal`, `util` |
+| `storage/table` | `catalog` column definitions + `lsm` in-memory-table subset | Rows, primary-key index, row version stamps, constraint validation, and predicate matching for one table | `storage/value`, `util` |
+| `storage/engine` | `commit` publication wiring | Table registration, startup recovery, and wiring the commit coordinator to tables and WAL | `storage/table`, `storage/wal`, `txn`, `commit`, `util` |
+| `txn` | `txn` ownership area | Transaction state machine, private write sets, snapshots, commit/rollback, and write-set bounds | `storage/wal`, `storage/value`, `util` |
+| `commit` | `commit` single-writer coordinator | Commit-sequence allocation, published watermark, group commit, conflict validation, and bounded admission | `storage/wal`, `txn`, `util` |
 
 - `flow` / `net` depend only on the public `storage/engine` facade.
-- `storage/table` knows nothing about WAL; durability ordering and recovery replay belong only to `engine`.
-- When independent `catalog` / `lsm` / `commit` modules arrive, move registration and persistent ordered sets out of `engine`/`table` rather than returning the logic to one file.
+- `storage/table` knows nothing about WAL; durability ordering and recovery replay belong only to `engine` + `commit`.
+- `commit` is generic over the storage context (comptime hooks), so it never imports the engine module; `storage/engine` wires it.
+- When independent `catalog` / `lsm` modules arrive, move registration and persistent ordered sets out of `engine`/`table` rather than returning the logic to one file.
 
 `net` must not import `storage`; `flow` must not read or write WAL or LSM files; `storage` must not know Runa Flow source, Runa Query IR, or protocol frames. `commit` is the sole writer allowed to change catalog, WAL, and LSM-visible state. Background compaction may prepare new files in parallel, but it makes them visible to new readers only through the `commit`/manifest publication path. `storage/pager` `flush`/`sync` is not a user commit; the user-table main path must not devolve into page overwrites without WAL protection.
 
@@ -168,9 +174,9 @@ Executable module boundaries, data-write ownership, and initial quality gates ar
 
 ## Evolution Order and Failure Signals
 
-1. Fix the current WAL's version, tail-truncation, and complete-record-corruption semantics and establish crash regressions.
+1. Fix the current WAL's version, tail-truncation, and complete-record-corruption semantics and establish crash regressions. *(Implemented.)*
 2. Add persistent catalog metadata, checkpoint positions, and the minimal in-memory/immutable-table LSM path; recovery remains based only on checkpoint + WAL.
-3. Extract commit ordering into a bounded single-writer queue, adding group commit, write-set conflicts, and Read Committed snapshots.
+3. Extract commit ordering into a bounded single-writer queue, adding group commit, write-set conflicts, and Read Committed snapshots. *(Transaction ownership area, commit coordinator, group commit, and observed-version conflict detection are implemented as an engine-level development slice; snapshot reads over retained versions and connection-level wiring remain.)*
 4. Add secondary indexes, atomic manifest publication, compaction, and reclamation, then extend reads from in-memory tables to LSM lookup.
 5. Expand Runa Flow, Runa Query IR, and the RunaDB Wire Protocol only at stages where each semantic is verified.
 
@@ -185,5 +191,6 @@ If the single writer becomes unacceptable under measured workloads, first use co
 - [Runtime, Connections, and Concurrency Control](architecture/runtime-and-concurrency.md): connection lifecycle, cancellation, bounded scheduling, commit ordering, and snapshot publication.
 - [I/O Scheduling Contract](architecture/io-scheduling.md): defines completion/callback separation, critical-I/O capacity reservation, connection fairness, backpressure, and failure handling; platform backends may vary, but commit and durability semantics may not.
 - [WAL and Crash Recovery](architecture/wal-and-recovery.md): RunaDB WAL frame format, record types, recovery process, CRC invariants, and fault model.
-- [Write Path and WriteBatch](architecture/write-path.md): autocommit and explicit-transaction write APIs, the `txn_batch` atomic model, two-phase staging and commit, group-commit target, durability levels, and sync strategy.
+- [Write Path and WriteBatch](architecture/write-path.md): autocommit and explicit-transaction write APIs, the `txn_batch` atomic model, two-phase staging and commit, group-commit, durability levels, and sync strategy.
 - [LSM Storage Engine Design](architecture/lsm-storage.md): ordered storage, SST format, compaction, manifest publication, snapshot reclamation, and space management.
+- [Transaction ownership and commit coordinator](architecture/write-path.md): the `txn` write-set lifecycle and the single-writer `commit` coordinator with commit-sequence allocation, group commit, conflict validation, and bounded admission.
