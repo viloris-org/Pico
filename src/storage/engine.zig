@@ -55,12 +55,56 @@ fn engineValidateOp(eng: *Engine, op: *const wal_mod.TxnOp, shadow: []const comm
     return eng.validateCoordinatedOp(op, shadow);
 }
 
+/// Operator-configurable resource bounds for Observation Evidence (ADR-0019).
+/// A rejected limit creates no visible evidence and no WAL record.
+pub const EvidenceLimits = struct {
+    /// Maximum attachments staged concurrently across all connections. A
+    /// connection stages at most one attachment; this bounds the instance-wide
+    /// total, not the per-Connection rule already enforced by the protocol.
+    max_concurrent_staging: usize = 8,
+    /// Maximum expected bytes staged concurrently across all connections.
+    max_staged_bytes: u64 = 64 * 1024 * 1024,
+    /// Maximum retained committed payload bytes across all evidence.
+    max_retained_bytes: u64 = 512 * 1024 * 1024,
+};
+
+/// Why evidence was rejected. Metrics break rejections down by this reason.
+pub const RejectReason = enum(u8) {
+    payload_too_large,
+    invalid_metadata,
+    retained_quota,
+    corrupt_payload,
+    storage_failure,
+};
+
+/// Evidence operator metrics (ADR-0019 "Reads And Observability"). Counters
+/// never expose payload bytes, origin secrets, or authorization tokens.
 pub const EvidenceStats = struct {
+    // Staged-upload accounting: uploads begun instance-wide, and how many
+    // staging reservations were aborted or rejected by a quota.
+    staged_uploads: u64 = 0,
+    staged_upload_bytes: u64 = 0,
+    aborted_uploads: u64 = 0,
+    staging_rejections: u64 = 0,
+    // Accepted (committed) evidence by modality; `committed_count` is the total.
+    accepted_by_modality: [modalityCount]u64 = [_]u64{0} ** modalityCount,
+    // Rejected evidence by reason; `rejected_evidence` is the total.
+    rejected_evidence: u64 = 0,
+    rejected_by_reason: [rejectReasonCount]u64 = [_]u64{0} ** rejectReasonCount,
+    // Payload write and synchronization latency (total nanoseconds + count).
+    payload_write_ns: u64 = 0,
+    payload_write_count: u64 = 0,
+    // Committed payloads and recovery orphan reclamation.
     committed_count: u64 = 0,
     committed_bytes: u64 = 0,
     recovery_orphans_found: u64 = 0,
     recovery_orphan_bytes: u64 = 0,
+    // Missing, corrupt, or unsupported payload file failures at read time.
+    payload_failures: u64 = 0,
 };
+
+const modalityCount = std.enums.values(evidence_mod.Modality).len;
+const rejectReasonCount = std.enums.values(RejectReason).len;
 
 /// Single-writer storage engine: in-memory tables + WAL.
 /// Phase 0 has no SSTables yet. Table storage lives in `table.zig`;
@@ -74,6 +118,13 @@ pub const Engine = struct {
     observations: std.ArrayList(evidence_mod.Record),
     next_evidence_id: u64 = 1,
     evidence_stats: EvidenceStats = .{},
+    /// Operator resource bounds for evidence staging and retention.
+    evidence_limits: EvidenceLimits = .{},
+    /// Instance-wide attachments currently in the begin..finish/abort staging
+    /// window. Guarded by `writer_mutex` in a multi-threaded runtime; the
+    /// current single-threaded server never overlaps these with a writer.
+    staging_active: usize = 0,
+    staging_active_bytes: u64 = 0,
     /// Highest commit sequence whose changes are visible to readers. Advanced by
     /// the commit coordinator only after WAL durability and in-memory
     /// publication succeed. Rebuilt from `txn_batch`/`set_commit_seq` records
@@ -635,12 +686,62 @@ pub const Engine = struct {
         try table.deleteAt(self.gpa, idx);
     }
 
+    /// Reserve one instance-wide staging slot and expected-byte budget for a
+    /// bounded attachment. The connection holds the reservation until
+    /// `finishStage` or `abortStage`. A rejected reservation creates no visible
+    /// evidence and no WAL record.
+    pub fn beginStage(self: *Engine, expected_length: u64) error{StagingQuotaExceeded}!void {
+        if (self.staging_active >= self.evidence_limits.max_concurrent_staging) {
+            self.evidence_stats.staging_rejections += 1;
+            return error.StagingQuotaExceeded;
+        }
+        const total = std.math.add(u64, self.staging_active_bytes, expected_length) catch {
+            self.evidence_stats.staging_rejections += 1;
+            return error.StagingQuotaExceeded;
+        };
+        if (total > self.evidence_limits.max_staged_bytes) {
+            self.evidence_stats.staging_rejections += 1;
+            return error.StagingQuotaExceeded;
+        }
+        self.staging_active += 1;
+        self.staging_active_bytes = total;
+        self.evidence_stats.staged_uploads += 1;
+        self.evidence_stats.staged_upload_bytes +|= expected_length;
+    }
+
+    /// Release a staging reservation after the upload completed. The attached
+    /// evidence is committed later by `observe`.
+    pub fn finishStage(self: *Engine, expected_length: u64) void {
+        self.releaseStage(expected_length);
+    }
+
+    /// Release a staging reservation after the upload was aborted or dropped.
+    pub fn abortStage(self: *Engine, expected_length: u64) void {
+        self.releaseStage(expected_length);
+        self.evidence_stats.aborted_uploads += 1;
+    }
+
+    fn releaseStage(self: *Engine, expected_length: u64) void {
+        std.debug.assert(self.staging_active > 0);
+        std.debug.assert(self.staging_active_bytes >= expected_length);
+        self.staging_active -= 1;
+        self.staging_active_bytes -= expected_length;
+    }
+
     /// Publish immutable Observation Evidence through payload-file then WAL
-    /// ordering. A failed WAL append leaves a reclaimable orphan file.
+    /// ordering. A failed WAL append leaves a reclaimable orphan file. Enforces
+    /// the retained-byte quota and records acceptance/rejection metrics.
     pub fn observe(self: *Engine, object_id: []const u8, modality: evidence_mod.Modality, media_type: []const u8, observed_at: []const u8, origin: []const u8, owner: []const u8, payload: []const u8) !u64 {
         try self.writer_mutex.lock(self.io);
         defer self.writer_mutex.unlock(self.io);
-        if (payload.len > evidence_mod.MAX_PAYLOAD_LENGTH) return error.PayloadTooLarge;
+        if (payload.len > evidence_mod.MAX_PAYLOAD_LENGTH) {
+            recordRejection(self, .payload_too_large);
+            return error.PayloadTooLarge;
+        }
+        if (self.evidence_stats.committed_bytes + payload.len > self.evidence_limits.max_retained_bytes) {
+            recordRejection(self, .retained_quota);
+            return error.RetainedQuotaExceeded;
+        }
         const id = self.next_evidence_id;
         const payload_digest = evidence_mod.digest(payload);
         const metadata: evidence_mod.Metadata = .{
@@ -654,15 +755,32 @@ pub const Engine = struct {
             .payload_length = payload.len,
             .payload_digest = payload_digest,
         };
-        try evidence_mod.validateMetadata(metadata);
+        evidence_mod.validateMetadata(metadata) catch |err| {
+            recordRejection(self, if (err == error.PayloadTooLarge) .payload_too_large else .invalid_metadata);
+            return err;
+        };
         var record = try evidence_mod.Record.clone(self.gpa, metadata);
         errdefer record.deinit(self.gpa);
         try self.observations.ensureUnusedCapacity(self.gpa, 1);
-        const stored_digest = try self.payloads.publish(id, payload);
-        if (!std.mem.eql(u8, &stored_digest, &payload_digest)) return error.CorruptPayload;
-        try self.wal.appendObserve(metadata);
+        const timer_start = Io.Clock.Timestamp.now(self.io, .awake);
+        const stored_digest = self.payloads.publish(id, payload) catch |err| {
+            recordRejection(self, if (err == error.PayloadTooLarge) .payload_too_large else .storage_failure);
+            return err;
+        };
+        const payload_latency = timer_start.untilNow(self.io);
+        self.evidence_stats.payload_write_ns +|= @intCast(payload_latency.raw.nanoseconds);
+        self.evidence_stats.payload_write_count += 1;
+        if (!std.mem.eql(u8, &stored_digest, &payload_digest)) {
+            recordRejection(self, .corrupt_payload);
+            return error.CorruptPayload;
+        }
+        self.wal.appendObserve(metadata) catch |err| {
+            recordRejection(self, .storage_failure);
+            return err;
+        };
         self.observations.appendAssumeCapacity(record);
         self.next_evidence_id = id + 1;
+        self.evidence_stats.accepted_by_modality[modalityIndex(modality)] += 1;
         self.evidence_stats.committed_count += 1;
         self.evidence_stats.committed_bytes += payload.len;
         return id;
@@ -671,7 +789,10 @@ pub const Engine = struct {
     pub fn readEvidencePayload(self: *Engine, evidence_id: u64) ![]u8 {
         for (self.observations.items) |record| {
             if (record.evidence_id == evidence_id) {
-                return self.payloads.read(self.gpa, evidence_id, record.payload_length, record.payload_digest);
+                return self.payloads.read(self.gpa, evidence_id, record.payload_length, record.payload_digest) catch |err| {
+                    self.evidence_stats.payload_failures += 1;
+                    return err;
+                };
             }
         }
         return error.EvidenceNotFound;
@@ -876,6 +997,19 @@ fn rowFromValues(gpa: Allocator, values: []const value.Value) !Row {
 fn emptyResult(gpa: Allocator, columns: []const value.Column) !Engine.SelectResult {
     const empty = try gpa.alloc(Row, 0);
     return .{ .columns = columns, .rows = empty, .owned_rows = empty, .gpa = gpa };
+}
+
+fn recordRejection(self: *Engine, reason: RejectReason) void {
+    self.evidence_stats.rejected_evidence += 1;
+    self.evidence_stats.rejected_by_reason[@intFromEnum(reason)] += 1;
+}
+
+/// Dense 0-based index into `accepted_by_modality` for `modality`.
+fn modalityIndex(modality: evidence_mod.Modality) usize {
+    for (std.enums.values(evidence_mod.Modality), 0..) |modality_value, index| {
+        if (modality_value == modality) return index;
+    }
+    unreachable;
 }
 
 fn findShadowRow(shadow: []const commit_mod.ShadowEntry, table: []const u8, pk: value.Value) ?*const commit_mod.ShadowEntry {
@@ -1296,6 +1430,148 @@ test "recovery rejects a corrupt committed evidence payload" {
         try file.sync(io);
     }
     try std.testing.expectError(error.CorruptPayload, Engine.open(gpa, io, dir_name, true));
+}
+
+// ── Evidence operator contract (roadmap Phase 2, ADR-0019) ──
+// Metrics, instance-wide staging quotas, and staged-upload accounting.
+
+test "instance-wide staging quota bounds concurrent attachments" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-evidence-staging-quota";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    eng.evidence_limits.max_concurrent_staging = 2;
+
+    try eng.beginStage(10);
+    try eng.beginStage(20);
+    try std.testing.expectError(error.StagingQuotaExceeded, eng.beginStage(30));
+    eng.finishStage(10); // a completed upload frees a slot
+    try eng.beginStage(40);
+    eng.abortStage(20); // an aborted upload frees a slot
+    try eng.beginStage(50);
+
+    const stats = eng.evidenceStats();
+    try std.testing.expectEqual(@as(u64, 4), stats.staged_uploads);
+    try std.testing.expectEqual(@as(u64, 1), stats.staging_rejections);
+    try std.testing.expectEqual(@as(u64, 1), stats.aborted_uploads);
+}
+
+test "instance-wide staged byte budget is enforced" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-evidence-staged-bytes";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    eng.evidence_limits.max_staged_bytes = 100;
+
+    try eng.beginStage(60);
+    try std.testing.expectError(error.StagingQuotaExceeded, eng.beginStage(60));
+    eng.abortStage(60);
+    try eng.beginStage(60);
+
+    const stats = eng.evidenceStats();
+    try std.testing.expectEqual(@as(u64, 2), stats.staged_uploads);
+    try std.testing.expectEqual(@as(u64, 1), stats.staging_rejections);
+}
+
+test "retained byte quota rejects evidence without creating it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-evidence-retained-quota";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+    eng.evidence_limits.max_retained_bytes = 100;
+
+    _ = try eng.observe("camera_1", .image, "image/png", "2026-07-31T12:00:00+08:00", "test-camera", "development", "aaaaaaaaaa");
+    try std.testing.expectError(
+        error.RetainedQuotaExceeded,
+        eng.observe("camera_1", .image, "image/png", "2026-07-31T12:00:00+08:00", "test-camera", "development", "b" ** 95),
+    );
+    try std.testing.expectEqual(@as(usize, 1), eng.observationsView().len);
+
+    const stats = eng.evidenceStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.committed_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.rejected_evidence);
+    try std.testing.expectEqual(@as(u64, 1), stats.rejected_by_reason[@intFromEnum(RejectReason.retained_quota)]);
+}
+
+test "evidence metrics account a full upload lifecycle" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-evidence-metrics";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+
+    try eng.beginStage(11);
+    eng.finishStage(11);
+    _ = try eng.observe("camera_1", .image, "image/png", "2026-07-31T12:00:00+08:00", "test-camera", "development", "image bytes");
+
+    const stats = eng.evidenceStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.staged_uploads);
+    try std.testing.expectEqual(@as(u64, 1), stats.committed_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.accepted_by_modality[modalityIndex(.image)]);
+    try std.testing.expect(stats.payload_write_count >= 1);
+}
+
+test "oversized evidence payload rejection is counted" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-evidence-oversize";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try Engine.open(gpa, io, dir_name, false);
+    defer eng.deinit();
+
+    const big = try gpa.alloc(u8, evidence_mod.MAX_PAYLOAD_LENGTH + 1);
+    defer gpa.free(big);
+    try std.testing.expectError(
+        error.PayloadTooLarge,
+        eng.observe("camera_1", .image, "image/png", "2026-07-31T12:00:00+08:00", "test-camera", "development", big),
+    );
+    try std.testing.expectEqual(@as(usize, 0), eng.observationsView().len);
+
+    const stats = eng.evidenceStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.rejected_evidence);
+    try std.testing.expectEqual(@as(u64, 1), stats.rejected_by_reason[@intFromEnum(RejectReason.payload_too_large)]);
+}
+
+test "a corrupt payload read increments the failure counter" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-evidence-read-failure";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var eng = try Engine.open(gpa, io, dir_name, true);
+    defer eng.deinit();
+    const id = try eng.observe("sensor_1", .sensor, "application/octet-stream", "2026-07-31T12:00:00+08:00", "test-sensor", "development", "sensor bytes");
+
+    var root = try Io.Dir.cwd().openDir(io, dir_name, .{});
+    defer root.close(io);
+    var file = try root.openFile(io, "payloads/0000000000000001.rpe", .{ .mode = .read_write });
+    defer file.close(io);
+    var byte: [1]u8 = undefined;
+    _ = try file.readPositionalAll(io, &byte, 20);
+    byte[0] ^= 1;
+    try file.writePositionalAll(io, &byte, 20);
+    try file.sync(io);
+
+    try std.testing.expectError(error.CorruptPayload, eng.readEvidencePayload(id));
+    try std.testing.expectEqual(@as(u64, 1), eng.evidenceStats().payload_failures);
 }
 
 test "vector columns survive checkpoint and restart, and rank deterministically" {

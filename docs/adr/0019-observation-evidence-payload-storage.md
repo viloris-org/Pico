@@ -15,8 +15,11 @@ restart recovery, orphan reclamation, and startup rejection for corrupt
 committed payloads. The Non-Goals remain unsupported.
 
 The engine records committed payload count and bytes plus recovery orphan count
-and bytes. Rejection counters and latency histograms are not yet exposed through
-an operator surface; they remain required before a production support claim.
+and bytes. Instance-wide staging and retained-byte quotas, staged-upload
+accounting, and the ADR-0019 metric counters are implemented at the engine level
+(see [Evidence Operator Contract](../architecture/evidence-operator.md)). Their
+exposure through an operator request surface remains administration-request work
+(roadmap Phase 7) and is required before a production support claim.
 
 ```text
 FORMAT CHANGE

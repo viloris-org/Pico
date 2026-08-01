@@ -27,6 +27,10 @@ const Attachment = struct {
     expected_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8,
     bytes: std.ArrayList(u8) = .empty,
     finished: bool = false,
+    /// True while this connection holds an instance-wide staging reservation
+    /// (begun but not yet finished or aborted). Guards the engine accounting so
+    /// a reservation is released exactly once on every exit path.
+    staging_reserved: bool = false,
 
     fn deinit(self: *Attachment, gpa: Allocator) void {
         self.bytes.deinit(gpa);
@@ -68,7 +72,12 @@ pub fn handleConnection(
     }
 
     var attachment: ?Attachment = null;
-    defer if (attachment) |*item| item.deinit(gpa);
+    defer if (attachment) |*item| {
+        // A connection that drops mid-upload must release its staging
+        // reservation so the instance-wide quota cannot leak.
+        if (item.staging_reserved) eng.abortStage(item.expected_length);
+        item.deinit(gpa);
+    };
 
     // ── Main loop ──
     while (true) {
@@ -202,7 +211,12 @@ pub fn handleConnection(
                 }
                 var expected_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
                 @memcpy(&expected_digest, payload[16..]);
-                attachment = .{ .upload_id = upload_id, .expected_length = expected_length, .expected_digest = expected_digest };
+                eng.beginStage(expected_length) catch {
+                    try sendError(w, 2, "EV1001", "staging quota exceeded");
+                    try w.flush();
+                    continue;
+                };
+                attachment = .{ .upload_id = upload_id, .expected_length = expected_length, .expected_digest = expected_digest, .staging_reserved = true };
             },
             .attachment_chunk => {
                 if (attachment == null or payload.len < 8 or payload.len - 8 > proto.MAX_ATTACHMENT_CHUNK_LENGTH) {
@@ -228,6 +242,7 @@ pub fn handleConnection(
                 const upload_id = std.mem.readInt(u64, payload[0..8], .big);
                 const staged = &attachment.?;
                 if (staged.upload_id != upload_id or staged.bytes.items.len != staged.expected_length or !std.mem.eql(u8, &evidence_mod.digest(staged.bytes.items), &staged.expected_digest)) {
+                    if (staged.staging_reserved) eng.abortStage(staged.expected_length);
                     staged.deinit(gpa);
                     attachment = null;
                     try sendError(w, 2, "EV1001", "attachment length or digest mismatch");
@@ -235,6 +250,8 @@ pub fn handleConnection(
                     continue;
                 }
                 staged.finished = true;
+                eng.finishStage(staged.expected_length);
+                staged.staging_reserved = false;
             },
             .attachment_abort => {
                 if (payload.len != 8 or attachment == null or std.mem.readInt(u64, payload[0..8], .big) != attachment.?.upload_id) {
@@ -242,7 +259,9 @@ pub fn handleConnection(
                     try w.flush();
                     continue;
                 }
-                attachment.?.deinit(gpa);
+                const item = &attachment.?;
+                if (item.staging_reserved) eng.abortStage(item.expected_length);
+                item.deinit(gpa);
                 attachment = null;
             },
             .goodbye => {

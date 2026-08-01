@@ -135,9 +135,11 @@ capability, including immutable evidence ingestion, metadata inspection, bounded
 payload retrieval, checkpoint retention, restart recovery, orphan reclamation,
 and startup rejection of corrupt committed payloads. The opt-in MCP stdio
 adapter (ADR-0021) exposes the same read-only boundary through
-`runadb_flow_emit`. The document and graph slices, the remaining World Continuum
-inspection forms, and the evidence operator contract (metrics, quotas, and
-staged-upload accounting) remain outstanding below.
+`runadb_flow_emit`. The evidence operator contract (metrics, instance-wide
+staging and retained-byte quotas, and staged-upload accounting) is implemented
+at the engine level; exposing it through an operator request surface is Phase 7
+administration work. The document and graph slices and the remaining World
+Continuum inspection forms remain outstanding below.
 
 - Build relation, document, and graph read-only vertical slices through the
   official RunaDB Client, from Runa Flow source through binding and canonical
