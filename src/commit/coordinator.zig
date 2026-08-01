@@ -65,9 +65,16 @@ pub const Request = struct {
     /// Snapshot watermark the transaction started from; used for admission
     /// ordering and observability. Validation itself uses the observed stamps.
     read_seq: u64 = 0,
-    /// Cancellation mark honored only up to the WAL durability boundary. A
-    /// request cancelled before the irreversible commit point is discarded;
-    /// once its complete commit record is durable, cancellation is a no-op.
+    /// Structural byte weight of `ops`, stored by `submit` and reused by
+    /// `cancel` so the queued-byte accounting has a single source of truth.
+    byte_weight: u64 = 0,
+    /// In-round cancellation mark, checked exactly once when a queued request
+    /// is admitted into a drain round, before a commit sequence is assigned.
+    /// Withdrawal removes a still-queued request entirely and marks it done
+    /// with a `Canceled` result; a request already taken into a drain round
+    /// cannot be cancelled in the current synchronous runtime (the writer
+    /// mutex serializes `cancel` against `drain`), and mid-round marks become
+    /// deliverable only with the Phase 6 runtime.
     cancelled: bool = false,
     result: ?CoordError = null,
     done: bool = false,
@@ -143,7 +150,11 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
         queue: std.ArrayList(*Request) = .empty,
         queued_bytes: u64 = 0,
         next_commit_seq: u64 = 1,
-        published_commit_seq: u64 = 0,
+        /// Last published commit sequence. Atomic so readers can take a
+        /// snapshot watermark without contending on the writer mutex (Phase 6
+        /// runtime); the store in pass 4 uses `release` so applied effects are
+        /// visible to an `acquire` reader.
+        published_commit_seq: std.atomic.Value(u64) = .init(0),
         /// Counters for observability.
         commits: u64 = 0,
         conflicts: u64 = 0,
@@ -163,19 +174,19 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
         }
 
         pub fn publishedSeq(self: *const Self) u64 {
-            return self.published_commit_seq;
+            return self.published_commit_seq.load(.acquire);
         }
 
         /// Snapshot watermark for a new transaction: the current published
         /// commit sequence.
         pub fn snapshot(self: *const Self) u64 {
-            return self.published_commit_seq;
+            return self.published_commit_seq.load(.acquire);
         }
 
         /// Adopt the watermark rebuilt during recovery so new commits continue
         /// above the last confirmed one.
         pub fn restoreWatermark(self: *Self, seq: u64) void {
-            self.published_commit_seq = seq;
+            self.published_commit_seq.store(seq, .release);
             self.next_commit_seq = seq + 1;
         }
 
@@ -194,22 +205,26 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                 self.queue_rejections += 1;
                 return error.CommitQueueFull;
             }
+            request.byte_weight = bytes;
             try self.queue.append(self.gpa, request);
             self.queued_bytes += bytes;
         }
 
         /// Cancel a submitted request. Returns true when the request was still
         /// queued and is withdrawn before any commit sequence is assigned: the
-        /// caller owns the state again and must free it. Returns false when the
-        /// request has already been taken into a drain round or finished; the
-        /// request is then marked and drain honors the mark only up to the WAL
-        /// durability boundary. Once a complete commit record is in the WAL,
-        /// cancellation cannot make it uncommitted — the single writer still
-        /// publishes and the caller decides whether the response is delivered.
+        /// request is marked `done` with a `Canceled` result, so it publishes
+        /// nothing and cannot create a visible gap in commit numbers. Ownership
+        /// stays with the original submitter, who observes the `Canceled`
+        /// result and frees the request exactly once; the canceller must not
+        /// touch the request after a successful cancel.
         ///
-        /// A withdrawn request consumes its queue position but no commit
-        /// sequence, so it cannot create a visible gap in published commit
-        /// numbers.
+        /// Returns false when the request is not queued (already committed,
+        /// already taken into a drain round, or never submitted). The request
+        /// is not modified: a post-durability cancel is a no-op, and a request
+        /// that never entered the queue is not silently dropped later. In the
+        /// current synchronous runtime a drain round runs to completion under
+        /// the writer mutex, so only withdrawal is reachable; mid-round marks
+        /// become deliverable with the Phase 6 runtime.
         pub fn cancel(self: *Self, request: *Request) !bool {
             try self.writer_mutex.lock(self.io);
             defer self.writer_mutex.unlock(self.io);
@@ -219,12 +234,13 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                     // queue is drained in order, so a swap-remove would
                     // reorder commit candidates.
                     _ = self.queue.orderedRemove(i);
-                    self.queued_bytes -= requestBytes(request);
+                    self.queued_bytes -= request.byte_weight;
                     self.cancelled += 1;
+                    request.done = true;
+                    request.result = error.Canceled;
                     return true;
                 }
             }
-            request.cancelled = true;
             return false;
         }
 
@@ -262,13 +278,12 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                     self.cancelled += 1;
                     continue;
                 }
-                const valid = self.validateRequest(ctx, req, &shadow) catch |err| {
+                self.validateRequest(ctx, req, &shadow) catch |err| {
                     req.result = err;
                     req.done = true;
                     self.conflicts += 1;
                     continue;
                 };
-                if (!valid) continue;
                 try accepted.append(self.gpa, req);
             }
 
@@ -310,14 +325,14 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                     };
                 }
                 if (req.result == null) {
-                    self.published_commit_seq = seq;
+                    self.published_commit_seq.store(seq, .release);
                     req.done = true;
                     self.commits += 1;
                 }
             }
         }
 
-        fn validateRequest(self: *Self, ctx: Ctx, req: *Request, shadow: *std.ArrayList(ShadowEntry)) CoordError!bool {
+        fn validateRequest(self: *Self, ctx: Ctx, req: *Request, shadow: *std.ArrayList(ShadowEntry)) CoordError!void {
             // Interleave validation and shadow application per op so a request
             // sees its own earlier writes (insert then update the same row).
             for (req.ops, req.observed) |*op, observed| {
@@ -360,7 +375,6 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                 }
                 try self.shadowApply(ctx, shadow, op, observed);
             }
-            return true;
         }
 
         fn shadowApply(self: *Self, ctx: Ctx, shadow: *std.ArrayList(ShadowEntry), op: *const wal_mod.TxnOp, observed: ?u64) !void {

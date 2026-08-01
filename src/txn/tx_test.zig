@@ -335,8 +335,13 @@ test "a cancelled queued commit is withdrawn without a commit-sequence gap" {
 
     // Withdraw the first request before the drain round: it consumes its
     // queue position but no commit sequence, so the surviving request commits
-    // exactly as if the cancelled one had never been submitted.
+    // exactly as if the cancelled one had never been submitted. Withdrawal
+    // marks the request done with a Canceled result so the original submitter
+    // observes a deterministic outcome; ownership stays with the submitter,
+    // which frees it exactly once.
     try std.testing.expect(try eng.coordinator.cancel(&req_a));
+    try std.testing.expect(req_a.done);
+    try std.testing.expectEqual(error.Canceled, req_a.result.?);
     try eng.coordinator.drain(&eng);
 
     try std.testing.expectEqual(@as(u64, 1), eng.coordinator.publishedSeq());
@@ -351,7 +356,7 @@ test "a cancelled queued commit is withdrawn without a commit-sequence gap" {
     try std.testing.expectEqual(@as(i64, 2), all.rows[0].values[0].int);
 }
 
-test "a request cancelled at the drain boundary publishes nothing" {
+test "a request marked at the drain boundary publishes nothing (white-box Phase 6 invariant)" {
     const dir = "zig-cache/runadb-txn-cancel-round";
     var eng = try freshEngine(dir);
     defer {
@@ -375,12 +380,14 @@ test "a request cancelled at the drain boundary publishes nothing" {
     try eng.coordinator.submit(&eng, &req_a);
     try eng.coordinator.submit(&eng, &req_b);
 
-    // Simulate a cancellation mark delivered before the WAL durability
-    // boundary (the writer mutex serializes mid-round marks in the current
-    // synchronous runtime; a concurrent runtime observes the same rule). The
-    // request terminates deterministically: no commit sequence advances the
-    // watermark, no WAL frame or row is published, and later requests in the
-    // round are unaffected.
+    // White-box Phase 6 invariant: the drain-boundary mark is checked exactly
+    // once at admission (pass 1, before any commit sequence is assigned). No
+    // production path sets `cancelled` on a live request today — `cancel()`
+    // withdraws queued requests instead, and the writer mutex serializes
+    // `cancel` against `drain`, so mid-round marks become deliverable only with
+    // the Phase 6 runtime. This test drives the mark directly to pin the
+    // invariant: the request terminates deterministically, publishes nothing,
+    // and later requests in the round are unaffected.
     req_a.cancelled = true;
     try eng.coordinator.drain(&eng);
 
@@ -416,9 +423,10 @@ test "cancelling a committed request is a no-op" {
     try std.testing.expectEqual(@as(?commit_mod.CoordError, null), req.result);
 
     // Once the complete commit record is durable, cancellation cannot make it
-    // uncommitted: the mark is set but the commit stands.
+    // uncommitted: cancel() reports false and leaves the request unmodified, so
+    // a stale flag can never silently drop a later submission.
     try std.testing.expect(!try eng.coordinator.cancel(&req));
-    try std.testing.expect(req.cancelled);
+    try std.testing.expect(!req.cancelled);
     try std.testing.expectEqual(@as(u64, 0), eng.coordinator.cancelled);
 
     var all = try eng.selectAll("t");
