@@ -8,6 +8,8 @@ const flow = @import("../flow/exec.zig");
 const flow_ir = @import("../flow/ir.zig");
 const engine_mod = @import("../storage/engine.zig");
 const evidence_mod = @import("../storage/evidence.zig");
+const connection_mod = @import("connection.zig");
+const registry_mod = @import("registry.zig");
 const proto = @import("clint_proto");
 
 const ConnError = error{
@@ -19,6 +21,7 @@ const ConnError = error{
     EndOfStream,
     ReadFailed,
     WriteFailed,
+    RegistryFull,
 } || Allocator.Error || Io.Cancelable || Io.UnexpectedError;
 
 const Attachment = struct {
@@ -38,12 +41,17 @@ const Attachment = struct {
     }
 };
 
-/// Handle one RunaDB protocol connection until terminate or error.
+/// Handle one RunaDB protocol connection until terminate or error. The
+/// connection registers with the instance registry after accept and revokes
+/// its credential on every exit path, so a disconnected connection can never
+/// leak cancellation state.
 pub fn handleConnection(
     gpa: Allocator,
     io: Io,
     stream: Io.net.Stream,
     eng: *engine_mod.Engine,
+    registry: *registry_mod.Registry,
+    credential: connection_mod.Credential,
 ) ConnError!void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
@@ -51,6 +59,14 @@ pub fn handleConnection(
     var writer = stream.writer(io, &write_buf);
     const r = &reader.interface;
     const w = &writer.interface;
+
+    var conn = connection_mod.State.init(0, credential);
+    registry.register(&conn) catch |err| {
+        try sendHelloError(w, "instance connection table full");
+        try w.flush();
+        return err;
+    };
+    defer registry.unregister(&conn);
 
     // ── Handshake: read HELLO ──
     {
@@ -67,7 +83,7 @@ pub fn handleConnection(
         }
         _ = minor;
 
-        try sendHelloOk(w);
+        try sendHelloOk(w, conn.credential);
         try w.flush();
     }
 
@@ -85,6 +101,11 @@ pub fn handleConnection(
             error.EndOfStream => return,
             else => return err,
         };
+
+        // Each frame after the handshake is a statement boundary: a fresh
+        // generation clears any stale cancellation mark, so a cancel delivered
+        // while idle never aborts a later statement.
+        conn.beginStatement();
 
         switch (msg_type) {
             .flow_source => {
@@ -264,6 +285,20 @@ pub fn handleConnection(
                 item.deinit(gpa);
                 attachment = null;
             },
+            .cancel_request => {
+                // Fire-and-forget: no response frame is defined. Missing,
+                // mismatched, closed, or expired credentials finish as a
+                // no-op; only the observability counters change. A malformed
+                // payload is a request error that leaves the Connection usable.
+                if (payload.len != proto.CANCEL_CREDENTIAL_LENGTH) {
+                    try sendError(w, 2, "CN1001", "malformed cancel request payload");
+                    try w.flush();
+                    continue;
+                }
+                var credential_bytes: [proto.CANCEL_CREDENTIAL_LENGTH]u8 = undefined;
+                @memcpy(&credential_bytes, payload);
+                _ = registry.cancelByCredential(credential_bytes) catch {};
+            },
             .goodbye => {
                 if (!validGoodbyePayload(payload)) return error.Protocol;
                 try sendGoodbye(w, "ok");
@@ -310,10 +345,14 @@ fn sendFrameHeader(w: anytype, msg_type: proto.Type, payload_len: usize) !void {
 
 // ── Message helpers ──
 
-fn sendHelloOk(w: anytype) !void {
+fn sendHelloOk(w: anytype, credential: [proto.CANCEL_CREDENTIAL_LENGTH]u8) !void {
     const s = "RunaDB 0.0.1";
-    try sendFrameHeader(w, .hello_ok, try stringPayloadLen(s));
+    const payload_len = try addPayloadLength(try stringPayloadLen(s), proto.CANCEL_CREDENTIAL_LENGTH);
+    try sendFrameHeader(w, .hello_ok, payload_len);
     try sendString(w, s);
+    // The cancellation credential follows the version string and is unique
+    // within the Connection lifetime.
+    try w.writeAll(&credential);
 }
 
 fn sendHelloError(w: anytype, reason: []const u8) !void {

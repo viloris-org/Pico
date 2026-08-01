@@ -47,6 +47,16 @@ fn col(name: []const u8, tag: value.TypeTag) value.Column {
     return .{ .name = @constCast(name), .type_tag = tag };
 }
 
+/// Build an immutable commit request for a staged transaction, mirroring the
+/// engine's commitTransaction request construction. The caller owns the
+/// request and must deinit it.
+fn buildRequest(tx: *txn_mod.Transaction) !commit_mod.Request {
+    const observed = try gpa.alloc(?u64, tx.write_set.items.len);
+    for (tx.write_set.items, 0..) |op, i| observed[i] = op.observed_version;
+    const ops = try tx.toWalOps();
+    return .{ .gpa = gpa, .ops = ops, .observed = observed, .read_seq = tx.snapshot_seq };
+}
+
 test "autocommit statements each commit and advance the watermark" {
     const dir = "zig-cache/runadb-txn-autocommit";
     {
@@ -297,6 +307,123 @@ test "commit queue is bounded and rejects overflow" {
     var all = try eng.selectAll("t");
     defer all.deinit();
     try std.testing.expectEqual(count, all.rows.len);
+}
+
+test "a cancelled queued commit is withdrawn without a commit-sequence gap" {
+    const dir = "zig-cache/runadb-txn-cancel-withdraw";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{});
+
+    var tx_a = eng.beginTransaction();
+    defer tx_a.deinit();
+    try eng.stageInsert(&tx_a, "t", &.{.{ .int = 1 }});
+    var tx_b = eng.beginTransaction();
+    defer tx_b.deinit();
+    try eng.stageInsert(&tx_b, "t", &.{.{ .int = 2 }});
+
+    var req_a = try buildRequest(&tx_a);
+    defer req_a.deinit();
+    var req_b = try buildRequest(&tx_b);
+    defer req_b.deinit();
+
+    try eng.coordinator.submit(&eng, &req_a);
+    try eng.coordinator.submit(&eng, &req_b);
+
+    // Withdraw the first request before the drain round: it consumes its
+    // queue position but no commit sequence, so the surviving request commits
+    // exactly as if the cancelled one had never been submitted.
+    try std.testing.expect(try eng.coordinator.cancel(&req_a));
+    try eng.coordinator.drain(&eng);
+
+    try std.testing.expectEqual(@as(u64, 1), eng.coordinator.publishedSeq());
+    try std.testing.expectEqual(@as(u64, 1), eng.coordinator.commits);
+    // A withdrawn request never reaches the round, so it is not counted as a
+    // round cancellation; it was already counted at withdrawal time.
+    try std.testing.expectEqual(@as(u64, 1), eng.coordinator.cancelled);
+
+    var all = try eng.selectAll("t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+    try std.testing.expectEqual(@as(i64, 2), all.rows[0].values[0].int);
+}
+
+test "a request cancelled at the drain boundary publishes nothing" {
+    const dir = "zig-cache/runadb-txn-cancel-round";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{});
+
+    var tx_a = eng.beginTransaction();
+    defer tx_a.deinit();
+    try eng.stageInsert(&tx_a, "t", &.{.{ .int = 1 }});
+    var tx_b = eng.beginTransaction();
+    defer tx_b.deinit();
+    try eng.stageInsert(&tx_b, "t", &.{.{ .int = 2 }});
+
+    var req_a = try buildRequest(&tx_a);
+    defer req_a.deinit();
+    var req_b = try buildRequest(&tx_b);
+    defer req_b.deinit();
+
+    try eng.coordinator.submit(&eng, &req_a);
+    try eng.coordinator.submit(&eng, &req_b);
+
+    // Simulate a cancellation mark delivered before the WAL durability
+    // boundary (the writer mutex serializes mid-round marks in the current
+    // synchronous runtime; a concurrent runtime observes the same rule). The
+    // request terminates deterministically: no commit sequence advances the
+    // watermark, no WAL frame or row is published, and later requests in the
+    // round are unaffected.
+    req_a.cancelled = true;
+    try eng.coordinator.drain(&eng);
+
+    try std.testing.expect(req_a.done);
+    try std.testing.expectEqual(error.Canceled, req_a.result.?);
+    try std.testing.expectEqual(@as(u64, 1), eng.coordinator.cancelled);
+    try std.testing.expectEqual(@as(u64, 1), eng.coordinator.publishedSeq());
+
+    var all = try eng.selectAll("t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+    try std.testing.expectEqual(@as(i64, 2), all.rows[0].values[0].int);
+}
+
+test "cancelling a committed request is a no-op" {
+    const dir = "zig-cache/runadb-txn-cancel-after";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{});
+
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    try eng.stageInsert(&tx, "t", &.{.{ .int = 1 }});
+    var req = try buildRequest(&tx);
+    defer req.deinit();
+
+    try eng.coordinator.submit(&eng, &req);
+    try eng.coordinator.drain(&eng);
+    try std.testing.expect(req.done);
+    try std.testing.expectEqual(@as(?commit_mod.CoordError, null), req.result);
+
+    // Once the complete commit record is durable, cancellation cannot make it
+    // uncommitted: the mark is set but the commit stands.
+    try std.testing.expect(!try eng.coordinator.cancel(&req));
+    try std.testing.expect(req.cancelled);
+    try std.testing.expectEqual(@as(u64, 0), eng.coordinator.cancelled);
+
+    var all = try eng.selectAll("t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
 }
 
 test "coordinator group commit shares one durability round" {

@@ -18,6 +18,9 @@ pub const Connection = struct {
     server_version: []const u8,
     next_upload_id: u64 = 1,
     bound_address: usize,
+    /// Unpredictable credential received in HELLO_OK; names this Connection for
+    /// the Server's cancellation routing.
+    cancel_credential: [proto.CANCEL_CREDENTIAL_LENGTH]u8 = .{0} ** proto.CANCEL_CREDENTIAL_LENGTH,
 
     pub fn connect(allocator: Allocator, io: Io, host: []const u8, port: u16) !Connection {
         const addr = try Io.net.IpAddress.parse(host, port);
@@ -59,6 +62,7 @@ pub const Connection = struct {
         switch (msg) {
             .hello_ok => |ok| {
                 self.server_version = try allocator.dupe(u8, ok.server_version);
+                self.cancel_credential = ok.cancel_credential;
                 return self;
             },
             .hello_error => {
@@ -190,6 +194,17 @@ pub const Connection = struct {
         const complete = try codec.readMessage(arena.allocator(), &self.reader.interface);
         if (complete != .command_complete) return error.Protocol;
         return result;
+    }
+
+    /// Request cooperative cancellation of the statement currently executing
+    /// on this Connection. Fire-and-forget: the Server never replies, and an
+    /// unknown or already-revoked credential is a protocol no-op. A cancellation
+    /// mark applies only to the statement in flight; it cannot roll back a
+    /// committed transaction.
+    pub fn cancel(self: *Connection) !void {
+        self.ensureBound();
+        try codec.writeMessage(&self.writer.interface, .cancel_request, &self.cancel_credential);
+        try self.writer.interface.flush();
     }
 
     /// Close the connection gracefully.

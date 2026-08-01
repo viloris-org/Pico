@@ -25,17 +25,46 @@ without changing shared state. A framed Request with an invalid payload returns
 1. Client sends `HELLO` (`0x01`) with two big-endian `u16` values: major then
    minor.
 2. Server returns `HELLO_OK` (`0x02`) or `HELLO_ERROR` (`0x03`), each with a
-   length-prefixed reason or Server version string.
+   length-prefixed reason or Server version string. `HELLO_OK` appends the
+   Connection's 16-byte cancellation credential after the version string; it is
+   unique within the Connection lifetime and must not be logged.
 3. Client sends `FLOW_SOURCE` (`0x10`), one length-prefixed Runa Flow source
    request, or `FLOW_IR` (`0x15`), a big-endian `u16` IR format version plus
    canonical Runa Query IR bytes. The implemented IR format version is `4`.
 4. Server responds with `ROW_DESCRIPTION` (`0x11`), zero or more `ROW_DATA`
    (`0x12`) messages, and `COMMAND_COMPLETE` (`0x13`), or with `SERVER_ERROR`
    (`0x14`). The initial Flow slice's successful completion tag is `EMIT`.
-5. Either peer sends `GOODBYE` (`0xff`) to close the Connection.
+5. At any point after the handshake, a client may send `CANCEL_REQUEST`
+   (`0x30`) with the 16-byte credential of another live Connection to request
+   cooperative cancellation of that Connection's currently executing statement
+   (see [Cancellation](#cancellation)).
+6. Either peer sends `GOODBYE` (`0xff`) to close the Connection.
 
 Requests execute sequentially on a TCP Connection; multiplexing is not part of
 this version.
+
+## Cancellation
+
+`CANCEL_REQUEST` (`0x30`) carries the 16-byte credential delivered in
+`HELLO_OK`. The Server looks the credential up in its bounded connection table
+and marks the named Connection's current statement; the executing statement
+stops at its next cooperative cancellation point with a `CANCELED` outcome.
+Delivery is fire-and-forget: the Server never replies to a `CANCEL_REQUEST`.
+Missing, mismatched, closed, or expired credentials finish as a protocol no-op;
+only the Server's observability counters change. A payload that is not exactly
+16 bytes is a malformed request: the Server returns `SERVER_ERROR` with code
+`CN1001` and leaves the sending Connection available for another Request.
+
+A cancellation mark applies only to the statement running when it arrives and
+is cleared when that Connection starts its next statement. Cancellation is
+cooperative: parsing, scanning, result streaming, commit-queue waits, and
+pre-sync execution observe the mark between bounded work units. Before the
+irreversible commit point, a cancelled transaction discards its private write
+set and any queued commit request; once a complete commit record has reached
+the selected durability level, cancellation cannot make it uncommitted. The
+single writer still publishes, and the response is discarded or delivered
+according to Connection liveness. Cancelling a committed transaction is a
+no-op; a stale mark never aborts a later statement.
 
 ## Observation Evidence Attachments
 
@@ -78,6 +107,7 @@ length-prefixed text representation. `COMMAND_COMPLETE` contains a big-endian
 | `RF1003` | Malformed Runa Query IR payload |
 | `RF1004` | Unsupported Runa Query IR format version |
 | `RF1005` | Unknown message type after handshake |
+| `CN1001` | Malformed `CANCEL_REQUEST` payload |
 | `EV1001` | Attachment state, limit, length, or digest failure |
 | `EV1002` | Invalid modality |
 | `EV1003` | Observation Evidence validation or commit failure |

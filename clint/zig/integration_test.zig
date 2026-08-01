@@ -56,7 +56,69 @@ test "RunaDB Client v2 protocol lifecycle, evidence, and request errors" {
     try expectEvidenceRoundTrip(gpa, io);
     try expectVersionRejection(gpa, io);
     try expectMalformedRequestsKeepConnectionUsable(gpa, io);
+    try expectCancellationNoOps(gpa, io);
+    try expectClientCancelIsNoop(gpa, io);
     try expectGoodbyeConfirmationAndClose(gpa, io);
+}
+
+/// Cancellation requests are fire-and-forget: unknown, mismatched, closed, or
+/// expired credentials finish as protocol no-ops, and a malformed payload is a
+/// request error that leaves the Connection usable.
+fn expectCancellationNoOps(gpa: std.mem.Allocator, io: Io) !void {
+    const stream = try connectRaw(io);
+    defer stream.close(io);
+
+    var read_buf: [1024]u8 = undefined;
+    var write_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &write_buf);
+    try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    try expectHelloOk(gpa, &reader.interface);
+
+    // An unknown credential is a no-op: the Server never replies, and the next
+    // Request still executes on the same Connection.
+    const bogus_credential = [_]u8{0xAB} ** proto.CANCEL_CREDENTIAL_LENGTH;
+    try clint.codec.writeMessage(&writer.interface, .cancel_request, &bogus_credential);
+    try writer.interface.flush();
+    const source = "from customer\n| emit { id }";
+    var source_payload: [4 + source.len]u8 = undefined;
+    std.mem.writeInt(u32, source_payload[0..4], source.len, .big);
+    @memcpy(source_payload[4..], source);
+    try clint.codec.writeMessage(&writer.interface, .flow_source, &source_payload);
+    try writer.interface.flush();
+    try expectServerError(gpa, &reader.interface, "RF1002");
+
+    // A truncated credential is a malformed cancel payload: a request error,
+    // not a silent no-op.
+    const short_payload = [_]u8{0x01};
+    try clint.codec.writeMessage(&writer.interface, .cancel_request, &short_payload);
+    try writer.interface.flush();
+    try expectServerError(gpa, &reader.interface, "CN1001");
+
+    // An oversized credential is likewise malformed.
+    const long_payload = [_]u8{0} ** (proto.CANCEL_CREDENTIAL_LENGTH + 1);
+    try clint.codec.writeMessage(&writer.interface, .cancel_request, &long_payload);
+    try writer.interface.flush();
+    try expectServerError(gpa, &reader.interface, "CN1001");
+}
+
+/// The official client receives its own cancellation credential in HELLO_OK.
+/// Sending it while no statement is running must not abort the next statement:
+/// the mark applies only to the statement in flight.
+fn expectClientCancelIsNoop(gpa: std.mem.Allocator, io: Io) !void {
+    var conn = try connectWhenReady(gpa, io);
+    defer conn.deinit(io);
+
+    try conn.cancel();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var result = try conn.executeFlow(arena.allocator(), "from customer\n| emit { id }");
+    const failure = (try result.next(arena.allocator())).?;
+    switch (failure) {
+        .server_error => |server_error| try std.testing.expectEqualStrings("RF1002", server_error.code),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try result.next(arena.allocator())) == null);
 }
 
 fn expectEvidenceRoundTrip(gpa: std.mem.Allocator, io: Io) !void {

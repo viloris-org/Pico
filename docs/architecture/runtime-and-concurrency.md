@@ -4,9 +4,17 @@
 
 This is the target RunaDB v1 runtime design, not a claim that Phase 0 implements it. The
 current `src/net/server.zig` handles connections in `accept -> handleConnection` order and
-exists only to validate the migration adapter's minimal working loop. Concurrent admission,
-commit queues, and I/O scheduling become implementation guarantees only after the relevant
-modules and regressions land.
+exists only to validate the migration adapter's minimal working loop. The cancellation slice
+is implemented at the ownership boundaries that Phase 6 builds on: `src/commit/coordinator.zig`
+withdraws queued commit requests before a commit sequence is assigned and terminates marked
+requests before the WAL durability boundary; `src/net/connection.zig` owns the per-Connection
+identity, statement generation, and cancellation mark; `src/net/registry.zig` is the bounded
+credential → Connection table used for constant-time cancellation routing; and
+`CANCEL_REQUEST` is a wire-protocol contract with official-client and malformed-input coverage.
+Because the listener is sequential, a `CANCEL_REQUEST` from another Connection is delivered
+only between statements today (a no-op by design); concurrent mid-statement delivery,
+admission, commit queues, and I/O scheduling become implementation guarantees only after the
+Phase 6 runtime and its regressions land.
 
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 

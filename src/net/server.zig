@@ -2,6 +2,8 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const engine_mod = @import("../storage/engine.zig");
+const connection_mod = @import("connection.zig");
+const registry_mod = @import("registry.zig");
 const mcp = @import("mcp.zig");
 const runadb = @import("runadb.zig");
 
@@ -49,13 +51,19 @@ fn runRunaListener(cfg: RunaListenerConfig) !void {
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
+    var registry = registry_mod.Registry.init(gpa, io, .{});
+    defer registry.deinit();
+
     while (true) {
         const stream = server.accept(io) catch |err| {
             std.log.err("runa listener: accept failed: {s}", .{@errorName(err)});
             continue;
         };
         defer stream.close(io);
-        runadb.handleConnection(gpa, io, stream, cfg.eng) catch |err| {
+        // A fresh unpredictable credential per Connection; it is delivered in
+        // HELLO_OK and revoked when the Connection closes.
+        const credential = connection_mod.randomCredential(io);
+        runadb.handleConnection(gpa, io, stream, cfg.eng, &registry, credential) catch |err| {
             std.log.warn("RunaDB connection closed with error: {s}", .{@errorName(err)});
         };
     }

@@ -168,8 +168,17 @@ Committed read path — transaction-aware scans and point reads that merge the
 private write set (read-your-writes) over committed state, plus the initial
 isolation-level definition in `docs/architecture/concurrency-control.md` — is
 implemented and deterministically tested at the engine level; it is not yet
-exposed through the wire protocol. The remaining items below are the
-connection-level cancellation delivery and production support verification.
+exposed through the wire protocol. Connection-level cancellation delivery is
+implemented at its ownership boundaries: the coordinator withdraws queued
+commit requests before a commit sequence is assigned and terminates marked
+requests before the WAL durability boundary; a per-connection cancellation
+state machine and a bounded credential registry own the mark and its routing;
+and `CANCEL_REQUEST` is a wire-protocol contract with deterministic engine,
+unit, and official-client integration coverage. Deterministic tests now cover
+autocommit, multi-statement commit, rollback, failed transactions, visibility,
+conflicts, cancellation, and bounded contention. The remaining items below are
+production support verification and the concurrent mid-statement cancellation
+delivery that the Phase 6 runtime enables.
 
 **Goal:** Replace compatibility transaction labels with verified transaction
 semantics while retaining one commit order.
@@ -186,7 +195,11 @@ semantics while retaining one commit order.
   must use snapshots; write-write contention must either wait within bounded
   rules or fail with a documented conflict error.
 - Add cancellation and resource-bound behavior so a blocked or disconnected
-  connection cannot leak write-set or commit-queue state.
+  connection cannot leak write-set or commit-queue state. Implemented as: the
+  coordinator's queue withdrawal and pre-durability termination, the
+  per-connection generation/mark lifecycle, the bounded credential registry,
+  and the `CANCEL_REQUEST` protocol contract. A connection that drops mid-upload
+  releases its staging reservation and revokes its credential.
 
 **Exit criteria:** Deterministic tests cover autocommit, multi-statement commit,
 rollback, failed transactions, visibility, conflicts, cancellation, and bounded

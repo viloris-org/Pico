@@ -44,6 +44,7 @@ pub const CoordError = error{
     PrimaryKeyNotFound,
     InvalidRequest,
     WalAppendFailed,
+    Canceled,
 } || Allocator.Error || Io.Cancelable;
 
 pub const Config = struct {
@@ -64,6 +65,10 @@ pub const Request = struct {
     /// Snapshot watermark the transaction started from; used for admission
     /// ordering and observability. Validation itself uses the observed stamps.
     read_seq: u64 = 0,
+    /// Cancellation mark honored only up to the WAL durability boundary. A
+    /// request cancelled before the irreversible commit point is discarded;
+    /// once its complete commit record is durable, cancellation is a no-op.
+    cancelled: bool = false,
     result: ?CoordError = null,
     done: bool = false,
 
@@ -143,6 +148,10 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
         commits: u64 = 0,
         conflicts: u64 = 0,
         queue_rejections: u64 = 0,
+        /// Requests whose commit was suppressed by cancellation (withdrawals
+        /// and in-round terminations). A cancel that arrives after the commit
+        /// is already durable is a no-op and is not counted.
+        cancelled: u64 = 0,
 
         pub fn init(gpa: Allocator, io: Io) Self {
             return .{ .gpa = gpa, .io = io };
@@ -189,6 +198,36 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
             self.queued_bytes += bytes;
         }
 
+        /// Cancel a submitted request. Returns true when the request was still
+        /// queued and is withdrawn before any commit sequence is assigned: the
+        /// caller owns the state again and must free it. Returns false when the
+        /// request has already been taken into a drain round or finished; the
+        /// request is then marked and drain honors the mark only up to the WAL
+        /// durability boundary. Once a complete commit record is in the WAL,
+        /// cancellation cannot make it uncommitted — the single writer still
+        /// publishes and the caller decides whether the response is delivered.
+        ///
+        /// A withdrawn request consumes its queue position but no commit
+        /// sequence, so it cannot create a visible gap in published commit
+        /// numbers.
+        pub fn cancel(self: *Self, request: *Request) !bool {
+            try self.writer_mutex.lock(self.io);
+            defer self.writer_mutex.unlock(self.io);
+            for (self.queue.items, 0..) |queued, i| {
+                if (queued == request) {
+                    // Preserve FIFO order for the requests that remain: the
+                    // queue is drained in order, so a swap-remove would
+                    // reorder commit candidates.
+                    _ = self.queue.orderedRemove(i);
+                    self.queued_bytes -= requestBytes(request);
+                    self.cancelled += 1;
+                    return true;
+                }
+            }
+            request.cancelled = true;
+            return false;
+        }
+
         /// Drain the queue as one group-commit round. Returns once every queued
         /// request has a result. Safe to call with an empty queue.
         pub fn drain(self: *Self, ctx: Ctx) !void {
@@ -214,6 +253,15 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
             defer seqs.deinit(self.gpa);
 
             for (batch.items) |req| {
+                if (req.cancelled) {
+                    // Terminate before validation: no commit sequence, WAL
+                    // frame, or publication. Deterministic and leaves no
+                    // visibility hole.
+                    req.result = error.Canceled;
+                    req.done = true;
+                    self.cancelled += 1;
+                    continue;
+                }
                 const valid = self.validateRequest(ctx, req, &shadow) catch |err| {
                     req.result = err;
                     req.done = true;

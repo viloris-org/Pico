@@ -24,6 +24,8 @@ pub const flow = struct {
 };
 pub const server = @import("net/server.zig");
 pub const mcp = @import("net/mcp.zig");
+pub const connection = @import("net/connection.zig");
+pub const registry = @import("net/registry.zig");
 
 test {
     _ = util;
@@ -44,4 +46,6 @@ test {
     _ = flow.exec;
     _ = server;
     _ = mcp;
+    _ = connection;
+    _ = registry;
 }

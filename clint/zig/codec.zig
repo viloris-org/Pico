@@ -19,7 +19,11 @@ pub const ProtocolError = error{
 } || Allocator.Error;
 
 pub const Message = union(enum) {
-    hello_ok: struct { server_version: []const u8 },
+    hello_ok: struct {
+        server_version: []const u8,
+        /// Unpredictable per-Connection cancellation credential.
+        cancel_credential: [proto.CANCEL_CREDENTIAL_LENGTH]u8,
+    },
     hello_error: struct { reason: []const u8 },
     row_description: struct {
         column_count: u16,
@@ -72,7 +76,11 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
     const message = switch (msg_type) {
         .hello_ok => blk: {
             const sv = try readString(arena, payload, &pos);
-            break :blk Message{ .hello_ok = .{ .server_version = sv } };
+            if (payload.len - pos != proto.CANCEL_CREDENTIAL_LENGTH) return error.Protocol;
+            var credential: [proto.CANCEL_CREDENTIAL_LENGTH]u8 = undefined;
+            @memcpy(&credential, payload[pos..]);
+            pos = payload.len;
+            break :blk Message{ .hello_ok = .{ .server_version = sv, .cancel_credential = credential } };
         },
         .hello_error => blk: {
             const reason = try readString(arena, payload, &pos);
