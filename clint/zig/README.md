@@ -27,6 +27,8 @@ normal result row. `Connection.readEvidencePayload` retrieves one payload and
 validates its ID, declared length, chunk bounds, and BLAKE3-256 digest before
 returning bytes to the caller. The payload limit is 8,388,608 bytes.
 
-The protocol has no timeout, cancellation, or retry message in v2.0. The
-implemented Flow source slice is read-only; Observation Evidence mutations are
-not retried automatically.
+Protocol v3.0 defines a fire-and-forget `cancel_request`; in the sequential
+runtime a cancel is delivered only between statements (a no-op by design), and
+a delivered `CANCELED` result arrives with the concurrent runtime. There is no
+timeout or retry message. The implemented Flow source slice is read-only;
+Observation Evidence mutations are not retried automatically.

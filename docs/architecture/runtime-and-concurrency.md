@@ -12,9 +12,11 @@ identity, statement generation, and cancellation mark; `src/net/registry.zig` is
 credential → Connection table used for constant-time cancellation routing; and
 `CANCEL_REQUEST` is a wire-protocol contract with official-client and malformed-input coverage.
 Because the listener is sequential, a `CANCEL_REQUEST` from another Connection is delivered
-only between statements today (a no-op by design); concurrent mid-statement delivery,
-admission, commit queues, and I/O scheduling become implementation guarantees only after the
-Phase 6 runtime and its regressions land.
+only between statements today (a no-op by design); the registry counts those as no-ops, and
+a `hit` requires a statement actually executing. A malformed `CANCEL_REQUEST` is a protocol
+error: the Server replies `CN1001` and closes the Connection. Concurrent mid-statement
+delivery, admission, commit queues, and I/O scheduling become implementation guarantees only
+after the Phase 6 runtime and its regressions land.
 
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 

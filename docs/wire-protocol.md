@@ -50,28 +50,33 @@ this version.
 
 `CANCEL_REQUEST` (`0x30`) carries the 16-byte credential delivered in
 `HELLO_OK`. The Server looks the credential up in its bounded connection table
-and marks the named Connection's current statement; the executing statement
-stops at its next cooperative cancellation point with a `CANCELED` outcome.
-Delivery is fire-and-forget: the Server never replies to a `CANCEL_REQUEST`.
-Missing, mismatched, closed, or expired credentials finish as a protocol no-op;
-only the Server's observability counters change. A payload that is not exactly
-16 bytes is a malformed request: the Server returns `SERVER_ERROR` with code
-`CN1001` and leaves the sending Connection available for another Request.
+and, when the named Connection has a statement executing, marks that statement
+for cooperative cancellation. Delivery is fire-and-forget: the Server never
+replies to a well-formed `CANCEL_REQUEST`. Missing, mismatched, closed, or
+expired credentials finish as a protocol no-op; only the Server's observability
+counters change. A payload that is not exactly 16 bytes is a malformed request:
+the Server returns `SERVER_ERROR` with code `CN1001` and then closes the
+Connection, so the error cannot be misattributed to a later pipelined frame.
 
 A cancellation mark applies only to the statement running when it arrives and
 is cleared when that Connection starts its next statement. Cancellation is
 cooperative: parsing, scanning, result streaming, commit-queue waits, and
-pre-sync execution observe the mark between bounded work units. Before the
-irreversible commit point, a cancelled transaction discards its private write
-set and any queued commit request; once a complete commit record has reached
-the selected durability level, cancellation cannot make it uncommitted. The
-single writer still publishes, and the response is discarded or delivered
-according to Connection liveness. Cancelling a committed transaction is a
-no-op; a stale mark never aborts a later statement.
+pre-sync execution observe the mark between bounded work units. In the current
+sequential listener a `CANCEL_REQUEST` from another Connection is delivered only
+between statements — a no-op by design — so the executing statement does not yet
+observe a `CANCELED` outcome. Concurrent mid-statement delivery, including the
+delivered `CANCELED` outcome, becomes a guarantee with the Phase 6 runtime (see
+`docs/architecture/runtime-and-concurrency.md`). Before the irreversible commit
+point, a cancelled transaction discards its private write set and any queued
+commit request; once a complete commit record has reached the selected
+durability level, cancellation cannot make it uncommitted. The single writer
+still publishes, and the response is discarded or delivered according to
+Connection liveness. Cancelling a committed transaction is a no-op; a stale mark
+never aborts a later statement.
 
 ## Observation Evidence Attachments
 
-Protocol v2 implements bounded payload transfer for a canonical `observe` IR
+Protocol v3 implements bounded payload transfer for a canonical `observe` IR
 request. One Connection may stage one attachment at a time:
 
 1. `ATTACHMENT_BEGIN` (`0x20`) carries a big-endian `u64` upload ID, a
