@@ -46,8 +46,8 @@ The versioned message contract defined by RunaDB and exchanged over a connection
 _Avoid_: API, RPC (unless referring to an internal module boundary), "PostgreSQL-compatible protocol"
 
 **RunaDB Client**:
-An official CLI, driver, or tool in the RunaDB Client product. RunaDB Client releases its language coverage, version policy, and support scope separately and declares its support for RunaDB Server through a compatibility matrix.
-_Avoid_: Driver compatibility, `psql` / libpq / pgx compatibility, dedicated SDK (until a specific tool is defined)
+An official CLI, driver, or tool in the RunaDB Client product. RunaDB Client releases its language coverage, version policy, and support scope separately and declares its support for RunaDB Server through a compatibility matrix. The official Zig SDK (`sdk/zig/`) is a specific RunaDB Client tool defined in ADR-0023.
+_Avoid_: Driver compatibility, `psql` / libpq / pgx compatibility, dedicated SDK (use `sdk/zig/` when a specific SDK tool is meant)
 
 ### Data Model
 

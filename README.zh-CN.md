@@ -2,7 +2,9 @@
 
 RunaDB Server 是使用 Zig 实现的单实例网络数据服务，也是 RunaDB 当前的
 OLTP 基础。RunaDB Client 作为独立产品提供 CLI、驱动和开发工具；两者只通过
-版本化的 RunaDB Wire Protocol 通信。
+版本化的 RunaDB Wire Protocol 通信。官方 Zig SDK 位于
+[`sdk/zig/`](sdk/zig/README.md)（ADR-0023），当前经原生 TCP 通信，QUIC
+（ADR-0015）为目标设计传输，需等服务端支持（roadmap Phase 9）。
 
 Runa Flow 是当前原生请求语言。Wire Protocol v3.0 开发版本接受
 `from <relation> | where <predicate> | emit { <field> }` 形式的 Runa Flow

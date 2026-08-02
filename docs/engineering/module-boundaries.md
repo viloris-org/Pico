@@ -8,16 +8,16 @@ This reference owns the detailed dependency and delivery boundaries used by
 | Area | Owns | May depend on | Must not own or depend on |
 | --- | --- | --- | --- |
 | `clint/proto/` | Versioned shared messages and wire constants | Protocol-only utilities | Client or server internals |
-| `clint/` | Official CLI, drivers, tools, SDKs, Connection state, protocol codec | `clint/proto/` | Data directory, server storage, transaction internals |
-| `clint/zig/` | Zig SDK API, Connection lifecycle, result/error mapping, integration tests | Client modules, `clint/proto/` | `src/`, data directory, server policy |
+| `clint/` | Official CLI, drivers, tools, Connection state, protocol codec | `clint/proto/` | Data directory, server storage, transaction internals |
+| `sdk/zig/` | Official Zig SDK API, Connection lifecycle, transports (TCP, QUIC), result/error mapping, integration tests | `clint/proto/`, zquic (`lib/zquic/`) | `src/`, data directory, server policy |
 | `src/net/` | Connection lifecycle, framing, backpressure, protocol error mapping | `src/flow/`, `src/util/`, `clint/proto/` | WAL, catalog, LSM, VFS, execution storage policy |
 | `src/flow/` | Runa Flow parsing, Runa Query IR validation, binding, and execution | Catalog/storage facade, `src/util/` | Wire framing, storage formats |
 | `src/txn/` | Transaction state, snapshots, private writes, conflict inputs, commit requests | Catalog/storage facade, `src/util/` | Direct protocol handling or commit publication |
 | `src/commit` (target) | Commit sequence, bounded queue, group commit, conflict validation, publication | Transaction, catalog, storage, `src/util/` | Runa Flow parsing or network framing |
 | `src/catalog` (target) | Semantic names, constraints, and physical bindings | Storage, `src/util/` | Runa Flow source, network framing, client state |
 | `src/storage/wal` | WAL encode, append, validate, sync, recovery scan | VFS, `src/util/` | Request source or protocol frames |
-| `src/storage/lsm` (target) | Ordered-set reads/writes, memtables, immutable tables, manifests | VFS, pager, `src/util/` | Runa Flow syntax, commit policy |
-| `src/storage/compaction` (target) | Bounded maintenance and file preparation | LSM, VFS, `src/util/` | Commit ordering or direct publication |
+| `src/storage/lsm` | SSTable format, version-set manifest, flush, compaction, point/range reads, orphan reclamation (`lsm/{codec,sstable,manifest,store}.zig`) | VFS, pager, `src/util/`, `src/storage/table` (memtable half) | Runa Flow syntax, commit policy |
+| `src/storage/compaction` (target) | Bounded maintenance and file preparation, background scheduling with backpressure | LSM, VFS, `src/util/` | Commit ordering or direct publication |
 | `src/storage/vfs` | Data-directory fencing, logical names, handles, positional I/O, atomic publication | `src/util/` | Flow/IR, protocol, transaction policy |
 | `src/storage/pager` | Fixed frames, pinning, dirty writeback, truncation for one file | VFS, `src/util/` | User commit semantics or recovery policy |
 | `src/util/` | Small domain-neutral helpers | Standard library | Flow/IR, wire, transaction, durability, storage policy |

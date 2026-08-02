@@ -14,20 +14,25 @@ identity, statement generation, and cancellation mark; `src/net/registry.zig` is
 credential → Connection table used for constant-time cancellation routing; and
 `CANCEL_REQUEST` is a wire-protocol contract with official-client and malformed-input coverage.
 With the concurrent listener, a `CANCEL_REQUEST` from another Connection is delivered
-mid-statement: the `emit` scan paths (`src/flow/exec.zig`) check the mark between bounded work
-units, so a canceled scan stops at the next row boundary and the Server returns `SERVER_ERROR`
+mid-statement: the streaming execution program (`src/flow/program.zig`) checks the mark between
+bounded work units, so a canceled scan stops at the next row/batch boundary and the Server
+returns `SERVER_ERROR`
 `RF1006` (the delivered `CANCELED` outcome) while keeping the Connection usable. A malformed
 `CANCEL_REQUEST` is a protocol error: the Server replies `CN1001` and closes the Connection.
-Slow-consumer and connection-loss fault regressions verify that a Connection that never reads
-blocks only its own result send (the statement lock is released before sending, so other
+Result production is streamed through the execution program: the `emit` protocol path opens
+the program under the statement lock (binding + snapshot), releases the lock, and produces
+bounded `ROW_DESCRIPTION`/`ROW_DATA` batches with a flush per batch, so a slow consumer blocks
+only its own handler thread and the lock is never held across a send; the materialized
+`flow.exec` entry points drain the same program, keeping golden parity with the validated IR
+paths. Slow-consumer and connection-loss fault regressions verify that a Connection that never
+reads blocks only its own result send (the statement lock is released before sending, so other
 Connections keep making progress) and that closing the slow stream unblocks the handler and
 empties the registry. The bounded work-queue scheduler core is implemented as a development
 slice: `src/runtime/scheduler.zig` owns operation states, fixed per-class capacity, the bounded
 completion queue, and the tick discipline (extract-only completion recording, bounded callback
 processing, then class-priority submission), validated deterministically against a fake platform
-backend. Streaming results with backpressure, socket-I/O reactor work, the I/O scheduler's
-per-Connection backpressure, reserved WAL slots, and the queue-saturation and
-compaction-pressure load regressions remain target work.
+backend. Socket-I/O reactor work, the I/O scheduler's per-Connection backpressure, reserved WAL
+slots, and the queue-saturation and compaction-pressure load regressions remain target work.
 
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 

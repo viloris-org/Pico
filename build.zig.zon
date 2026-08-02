@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "clint",
+        "sdk",
         "lib",
         "CONTEXT.md",
         "docs",

@@ -19,7 +19,10 @@ accepted protocol request.
 
 RunaDB Server and RunaDB Client communicate only through versioned protocol
 definitions and the public error model. See [product boundaries](docs/products.md)
-and [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
+and [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md). The
+official Zig SDK lives at [`sdk/zig/`](sdk/zig/README.md) (ADR-0023); it
+speaks the RunaDB Wire Protocol over native TCP today, with a target-design
+QUIC transport (ADR-0015) that awaits server support (roadmap Phase 9).
 
 ## Status
 

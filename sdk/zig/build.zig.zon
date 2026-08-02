@@ -1,0 +1,17 @@
+.{
+    .name = .runadb_zig_sdk,
+    .version = "0.0.1",
+    .fingerprint = 0x591e7e3049f9fce7, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "lib.zig",
+        "codec.zig",
+        "connection.zig",
+        "transport.zig",
+        "transport",
+        "README.md",
+    },
+}

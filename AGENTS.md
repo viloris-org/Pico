@@ -30,7 +30,7 @@ that defines its semantics, recovery, observability, compatibility, and tests:
    cluster. Distributed work requires a dedicated topology, consistency, and
    failure-model ADR.
 2. **RunaDB Wire Protocol**, **Runa Flow**, and **Runa Query IR** are the public contracts. SQL execution and PostgreSQL protocol compatibility are not supported.
-3. **RunaDB Client and RunaDB Server are separate products sharing one repo**: client code lives under `clint/`, server code under `src/`. They communicate only through `clint/proto/` protocol definitions. No cross-directory non-protocol references.
+3. **RunaDB Client and RunaDB Server are separate products sharing one repo**: CLI and protocol code lives under `clint/`, official language SDKs under `sdk/<lang>/` (ADR-0023), server code under `src/`. They communicate only through `clint/proto/` protocol definitions. No cross-directory non-protocol references.
 4. The implemented Runa Flow slice is read-only. Unsupported operations must
    fail clearly; new models and multimodal values need explicit Flow, IR, and
    Wire Protocol contracts.

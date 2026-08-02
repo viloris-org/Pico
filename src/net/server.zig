@@ -6,13 +6,20 @@ const connection_mod = @import("connection.zig");
 const registry_mod = @import("registry.zig");
 const mcp = @import("mcp.zig");
 const runadb = @import("runadb.zig");
+const quic = @import("quic.zig");
 
 pub const Config = struct {
     host: []const u8 = "127.0.0.1",
     runa_port: u16 = 5434,
+    /// UDP QUIC listener port (ADR-0015 §5); 0 disables the QUIC listener.
+    quic_port: u16 = 5435,
     data_dir: []const u8 = "data",
     sync_wal: bool = true,
     mcp_stdio: bool = false,
+    /// PEM certificate/key overrides; default to the embedded development
+    /// self-signed certificate (src/net/dev-cert.pem, RSA-2048).
+    quic_cert_pem: ?[]const u8 = null,
+    quic_key_pem: ?[]const u8 = null,
 };
 
 pub fn run(gpa: Allocator, io: Io, cfg: Config) !void {
@@ -23,9 +30,27 @@ pub fn run(gpa: Allocator, io: Io, cfg: Config) !void {
         std.log.info("RunaDB MCP stdio adapter listening", .{});
         return mcp.runStdio(gpa, io, &eng);
     }
+    if (cfg.runa_port == 0 and cfg.quic_port == 0) return error.NoListener;
+    std.log.info("Data directory: {s}", .{cfg.data_dir});
+
+    if (cfg.quic_port > 0) {
+        const quic_cfg = quic.Config{
+            .port = cfg.quic_port,
+            .cert_pem = cfg.quic_cert_pem orelse @embedFile("dev-cert.pem"),
+            .key_pem = cfg.quic_key_pem orelse @embedFile("dev-key.pem"),
+        };
+        var quic_registry = registry_mod.Registry.init(gpa, io, .{});
+        const qs = try quic.QuicServer.init(gpa, io, quic_cfg, &eng, &quic_registry, null);
+        std.log.info("RunaDB Wire Protocol v3 QUIC listening on udp 0.0.0.0:{d} (ALPN {s})", .{ cfg.quic_port, quic.ALPN });
+        if (cfg.runa_port == 0) {
+            // QUIC-only mode: the QUIC event loop owns the main thread.
+            return qs.run();
+        }
+        const thread = try std.Thread.spawn(.{}, quicServerThread, .{qs});
+        thread.detach();
+    }
     if (cfg.runa_port == 0) return error.NoListener;
     std.log.info("RunaDB Wire Protocol v3 listening on {s}:{d}", .{ cfg.host, cfg.runa_port });
-    std.log.info("Data directory: {s}", .{cfg.data_dir});
     try runRunaListener(.{
         .gpa = gpa,
         .io = io,
@@ -33,6 +58,12 @@ pub fn run(gpa: Allocator, io: Io, cfg: Config) !void {
         .port = cfg.runa_port,
         .eng = &eng,
     });
+}
+
+fn quicServerThread(qs: *quic.QuicServer) void {
+    qs.run() catch |err| {
+        std.log.err("quic listener: {s}", .{@errorName(err)});
+    };
 }
 
 const RunaListenerConfig = struct {

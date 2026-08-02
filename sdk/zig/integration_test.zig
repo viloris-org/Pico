@@ -1,10 +1,12 @@
 //! RunaDB Client compatibility tests against the independently built server.
-//! This module imports only the public client package and communicates over TCP.
+//! This module imports only the public client package and communicates over
+//! native TCP (the transport implemented in this checkout; ADR-0023 §2.2).
 
 const std = @import("std");
 const Io = std.Io;
-const clint = @import("clint");
-const proto = clint.proto;
+const sdk = @import("sdk_zig");
+const proto = sdk.proto;
+const codec = sdk.codec;
 
 const server_port: u16 = 64334;
 const data_dir = "zig-cache/runa-client-protocol-integration";
@@ -72,26 +74,22 @@ fn expectCancellationNoOps(gpa: std.mem.Allocator, io: Io) !void {
     {
         // An unknown credential is a no-op: the Server never replies, and the
         // next Request still executes on the same Connection.
-        const stream = try connectRaw(io);
-        defer stream.close(io);
-
-        var read_buf: [1024]u8 = undefined;
-        var write_buf: [1024]u8 = undefined;
-        var reader = stream.reader(io, &read_buf);
-        var writer = stream.writer(io, &write_buf);
-        try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
-        try expectHelloOk(gpa, &reader.interface);
+        const raw = try connectRaw(gpa, io);
+        defer raw.deinit();
+        const stream = raw.byteStream();
+        try writeHello(stream, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+        try expectHelloOk(gpa, stream);
 
         const bogus_credential = [_]u8{0xAB} ** proto.CANCEL_CREDENTIAL_LENGTH;
-        try clint.codec.writeMessage(&writer.interface, .cancel_request, &bogus_credential);
-        try writer.interface.flush();
+        try codec.writeMessage(stream, .cancel_request, &bogus_credential);
+        try stream.flush();
         const source = "from customer\n| emit { id }";
         var source_payload: [4 + source.len]u8 = undefined;
         std.mem.writeInt(u32, source_payload[0..4], source.len, .big);
         @memcpy(source_payload[4..], source);
-        try clint.codec.writeMessage(&writer.interface, .flow_source, &source_payload);
-        try writer.interface.flush();
-        try expectServerError(gpa, &reader.interface, "RF1002");
+        try codec.writeMessage(stream, .flow_source, &source_payload);
+        try stream.flush();
+        try expectServerError(gpa, stream, "RF1002");
     }
 
     // A malformed cancel payload is a protocol error: `CN1001` is sent, then
@@ -105,25 +103,21 @@ fn expectCancellationNoOps(gpa: std.mem.Allocator, io: Io) !void {
 /// Send a malformed cancel_request on a fresh Connection: expect a `CN1001`
 /// error reply followed by the Server closing the Connection.
 fn expectMalformedCancelCloses(gpa: std.mem.Allocator, io: Io, payload: []const u8) !void {
-    const stream = try connectRaw(io);
-    defer stream.close(io);
+    const raw = try connectRaw(gpa, io);
+    defer raw.deinit();
+    const stream = raw.byteStream();
+    try writeHello(stream, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    try expectHelloOk(gpa, stream);
 
-    var read_buf: [1024]u8 = undefined;
-    var write_buf: [1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
-    var writer = stream.writer(io, &write_buf);
-    try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
-    try expectHelloOk(gpa, &reader.interface);
-
-    try clint.codec.writeMessage(&writer.interface, .cancel_request, payload);
-    try writer.interface.flush();
-    try expectServerError(gpa, &reader.interface, "CN1001");
+    try codec.writeMessage(stream, .cancel_request, payload);
+    try stream.flush();
+    try expectServerError(gpa, stream, "CN1001");
 
     // The Server closes the Connection after the protocol error, so the next
     // read reports the close rather than a usable stream.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    try std.testing.expectError(error.EndOfStream, clint.codec.readMessage(arena.allocator(), &reader.interface));
+    try std.testing.expectError(error.EndOfStream, codec.readMessage(arena.allocator(), stream));
 }
 
 /// The official client receives its own cancellation credential in HELLO_OK.
@@ -313,10 +307,14 @@ fn expectGraphRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
     try std.testing.expect((try bad.next(arena.allocator())) == null);
 }
 
-fn connectWhenReady(gpa: std.mem.Allocator, io: Io) !clint.Connection {
+fn connectWhenReady(gpa: std.mem.Allocator, io: Io) !sdk.Connection {
     var last_error: ?anyerror = null;
     for (0..100) |_| {
-        if (clint.Connection.connect(gpa, io, "127.0.0.1", server_port)) |conn| {
+        if (sdk.Connection.connect(gpa, io, .{
+            .host = "127.0.0.1",
+            .port = server_port,
+            .kind = .tcp,
+        })) |conn| {
             return conn;
         } else |err| {
             last_error = err;
@@ -326,32 +324,32 @@ fn connectWhenReady(gpa: std.mem.Allocator, io: Io) !clint.Connection {
     return last_error orelse error.ServerDidNotStart;
 }
 
-fn connectRaw(io: Io) !Io.net.Stream {
-    const addr = try Io.net.IpAddress.parse("127.0.0.1", server_port);
-    return addr.connect(io, .{ .mode = .stream });
+/// A raw TCP connection used for protocol-level framing regressions.
+fn connectRaw(gpa: std.mem.Allocator, io: Io) !*sdk.tcp_transport.TcpConn {
+    return sdk.tcp_transport.TcpConn.connect(gpa, io, "127.0.0.1", server_port);
 }
 
-fn writeHello(writer: *Io.Writer, major: u16, minor: u16) !void {
+fn writeHello(stream: codec.Stream, major: u16, minor: u16) !void {
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u16, payload[0..2], major, .big);
     std.mem.writeInt(u16, payload[2..4], minor, .big);
-    try clint.codec.writeMessage(writer, .hello, &payload);
-    try writer.flush();
+    try codec.writeMessage(stream, .hello, &payload);
+    try stream.flush();
 }
 
-fn expectHelloOk(allocator: std.mem.Allocator, reader: *Io.Reader) !void {
+fn expectHelloOk(allocator: std.mem.Allocator, stream: codec.Stream) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const response = try clint.codec.readMessage(arena.allocator(), reader);
+    const response = try codec.readMessage(arena.allocator(), stream);
     try std.testing.expect(response == .hello_ok);
 }
 
 /// Read HELLO_OK and return the Connection's cancellation credential, which
 /// names that Connection for the Server's cancellation routing.
-fn expectHelloOkCredential(allocator: std.mem.Allocator, reader: *Io.Reader) ![proto.CANCEL_CREDENTIAL_LENGTH]u8 {
+fn expectHelloOkCredential(allocator: std.mem.Allocator, stream: codec.Stream) ![proto.CANCEL_CREDENTIAL_LENGTH]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const response = try clint.codec.readMessage(arena.allocator(), reader);
+    const response = try codec.readMessage(arena.allocator(), stream);
     switch (response) {
         .hello_ok => |ok| return ok.cancel_credential,
         else => return error.TestUnexpectedResult,
@@ -360,12 +358,12 @@ fn expectHelloOkCredential(allocator: std.mem.Allocator, reader: *Io.Reader) ![p
 
 fn expectServerError(
     allocator: std.mem.Allocator,
-    reader: *Io.Reader,
+    stream: codec.Stream,
     expected_code: []const u8,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const response = try clint.codec.readMessage(arena.allocator(), reader);
+    const response = try codec.readMessage(arena.allocator(), stream);
     switch (response) {
         .server_error => |server_error| {
             try std.testing.expectEqual(@as(u8, 2), server_error.severity);
@@ -375,20 +373,40 @@ fn expectServerError(
     }
 }
 
+/// Drain a canceled statement's result stream to its terminal outcome
+/// (roadmap Phase 6 streaming): `ROW_DESCRIPTION`/`ROW_DATA` frames may
+/// precede the `SERVER_ERROR` `RF1006`, which must arrive; a
+/// `COMMAND_COMPLETE` (a full success) or any other frame fails the
+/// expectation.
+fn expectCanceledOutcomeAfterRows(allocator: std.mem.Allocator, stream: codec.Stream) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var iterations: usize = 0;
+    while (true) : (iterations += 1) {
+        if (iterations > 100_000) return error.TestTimeout;
+        const msg = try codec.readMessage(arena.allocator(), stream);
+        switch (msg) {
+            .row_description, .row_data => continue,
+            .server_error => |server_error| {
+                try std.testing.expectEqual(@as(u8, 2), server_error.severity);
+                try std.testing.expectEqualStrings("RF1006", server_error.code);
+                return;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 fn expectVersionRejection(allocator: std.mem.Allocator, io: Io) !void {
-    const stream = try connectRaw(io);
-    defer stream.close(io);
+    const raw = try connectRaw(allocator, io);
+    defer raw.deinit();
+    const stream = raw.byteStream();
 
-    var read_buf: [1024]u8 = undefined;
-    var write_buf: [1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
-    var writer = stream.writer(io, &write_buf);
-
-    try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR + 1, proto.PROTOCOL_VERSION_MINOR);
+    try writeHello(stream, proto.PROTOCOL_VERSION_MAJOR + 1, proto.PROTOCOL_VERSION_MINOR);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const response = try clint.codec.readMessage(arena.allocator(), &reader.interface);
+    const response = try codec.readMessage(arena.allocator(), stream);
     switch (response) {
         .hello_error => |hello_error| {
             try std.testing.expectEqualStrings("unsupported protocol version", hello_error.reason);
@@ -396,31 +414,27 @@ fn expectVersionRejection(allocator: std.mem.Allocator, io: Io) !void {
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.EndOfStream, clint.codec.readMessage(arena.allocator(), &reader.interface));
+    try std.testing.expectError(error.EndOfStream, codec.readMessage(arena.allocator(), stream));
 }
 
 fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io: Io) !void {
-    const stream = try connectRaw(io);
-    defer stream.close(io);
-
-    var read_buf: [1024]u8 = undefined;
-    var write_buf: [1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
-    var writer = stream.writer(io, &write_buf);
-    try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
-    try expectHelloOk(allocator, &reader.interface);
+    const raw = try connectRaw(allocator, io);
+    defer raw.deinit();
+    const stream = raw.byteStream();
+    try writeHello(stream, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    try expectHelloOk(allocator, stream);
 
     // The source string declares one byte but provides none.
     const truncated_source = [_]u8{ 0, 0, 0, 1 };
-    try clint.codec.writeMessage(&writer.interface, .flow_source, &truncated_source);
-    try writer.interface.flush();
-    try expectServerError(allocator, &reader.interface, "RF1000");
+    try codec.writeMessage(stream, .flow_source, &truncated_source);
+    try stream.flush();
+    try expectServerError(allocator, stream, "RF1000");
 
     var unsupported_ir_version: [2]u8 = undefined;
     std.mem.writeInt(u16, &unsupported_ir_version, proto.IR_FORMAT_VERSION + 1, .big);
-    try clint.codec.writeMessage(&writer.interface, .flow_ir, &unsupported_ir_version);
-    try writer.interface.flush();
-    try expectServerError(allocator, &reader.interface, "RF1004");
+    try codec.writeMessage(stream, .flow_ir, &unsupported_ir_version);
+    try stream.flush();
+    try expectServerError(allocator, stream, "RF1004");
 
     // The wrapper declares the supported IR format, but the canonical IR has
     // no projection fields. Direct IR input must obey the same static shape
@@ -436,18 +450,18 @@ fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io:
         0, // no limit
         0, // no navigate
     };
-    try clint.codec.writeMessage(&writer.interface, .flow_ir, &empty_projection_ir);
-    try writer.interface.flush();
-    try expectServerError(allocator, &reader.interface, "RF1003");
+    try codec.writeMessage(stream, .flow_ir, &empty_projection_ir);
+    try stream.flush();
+    try expectServerError(allocator, stream, "RF1003");
 
     // A parse rejection also leaves the Connection usable.
     const invalid_source = "from customer\n| emit { }";
     var source_payload: [4 + invalid_source.len]u8 = undefined;
     std.mem.writeInt(u32, source_payload[0..4], invalid_source.len, .big);
     @memcpy(source_payload[4..], invalid_source);
-    try clint.codec.writeMessage(&writer.interface, .flow_source, &source_payload);
-    try writer.interface.flush();
-    try expectServerError(allocator, &reader.interface, "RF1001");
+    try codec.writeMessage(stream, .flow_source, &source_payload);
+    try stream.flush();
+    try expectServerError(allocator, stream, "RF1001");
 
     // A where predicate whose literal type does not match the column fails
     // semantic binding and keeps the Connection usable.
@@ -455,51 +469,47 @@ fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io:
     var mismatch_payload: [4 + type_mismatch_source.len]u8 = undefined;
     std.mem.writeInt(u32, mismatch_payload[0..4], type_mismatch_source.len, .big);
     @memcpy(mismatch_payload[4..], type_mismatch_source);
-    try clint.codec.writeMessage(&writer.interface, .flow_source, &mismatch_payload);
-    try writer.interface.flush();
-    try expectServerError(allocator, &reader.interface, "RF1002");
+    try codec.writeMessage(stream, .flow_source, &mismatch_payload);
+    try stream.flush();
+    try expectServerError(allocator, stream, "RF1002");
 
     // An unknown where column also fails semantic binding.
     const unknown_column_source = "from observation_evidence\n| where missing = 1\n| emit { evidence_id }";
     var unknown_payload: [4 + unknown_column_source.len]u8 = undefined;
     std.mem.writeInt(u32, unknown_payload[0..4], unknown_column_source.len, .big);
     @memcpy(unknown_payload[4..], unknown_column_source);
-    try clint.codec.writeMessage(&writer.interface, .flow_source, &unknown_payload);
-    try writer.interface.flush();
-    try expectServerError(allocator, &reader.interface, "RF1002");
+    try codec.writeMessage(stream, .flow_source, &unknown_payload);
+    try stream.flush();
+    try expectServerError(allocator, stream, "RF1002");
 
     // SQL text has no compatibility or translation path in the v3 endpoint.
     const sql_text = "SELECT 1";
     var sql_payload: [4 + sql_text.len]u8 = undefined;
     std.mem.writeInt(u32, sql_payload[0..4], sql_text.len, .big);
     @memcpy(sql_payload[4..], sql_text);
-    try clint.codec.writeMessage(&writer.interface, .flow_source, &sql_payload);
-    try writer.interface.flush();
-    try expectServerError(allocator, &reader.interface, "RF1001");
+    try codec.writeMessage(stream, .flow_source, &sql_payload);
+    try stream.flush();
+    try expectServerError(allocator, stream, "RF1001");
 }
 
 fn expectGoodbyeConfirmationAndClose(allocator: std.mem.Allocator, io: Io) !void {
-    const stream = try connectRaw(io);
-    defer stream.close(io);
+    const raw = try connectRaw(allocator, io);
+    defer raw.deinit();
+    const stream = raw.byteStream();
+    try writeHello(stream, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    try expectHelloOk(allocator, stream);
 
-    var read_buf: [1024]u8 = undefined;
-    var write_buf: [1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
-    var writer = stream.writer(io, &write_buf);
-    try writeHello(&writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
-    try expectHelloOk(allocator, &reader.interface);
-
-    try clint.codec.writeMessage(&writer.interface, .goodbye, "");
-    try writer.interface.flush();
+    try codec.writeMessage(stream, .goodbye, "");
+    try stream.flush();
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const response = try clint.codec.readMessage(arena.allocator(), &reader.interface);
+    const response = try codec.readMessage(arena.allocator(), stream);
     switch (response) {
         .goodbye => |goodbye| try std.testing.expectEqualStrings("ok", goodbye.reason),
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.EndOfStream, clint.codec.readMessage(arena.allocator(), &reader.interface));
+    try std.testing.expectError(error.EndOfStream, codec.readMessage(arena.allocator(), stream));
 }
 
 /// Mid-statement cancellation against the real Server process (roadmap Phase 6):
@@ -533,53 +543,53 @@ fn expectMidStatementCancel(gpa: std.mem.Allocator, io: Io) !void {
 
     // The canceler handshakes first so its cancel is ready the instant the
     // target's emit starts scanning.
-    const canceler = try connectRaw(io);
-    defer canceler.close(io);
-    var cancel_buf_r: [1024]u8 = undefined;
-    var cancel_buf_w: [1024]u8 = undefined;
-    var cancel_reader = canceler.reader(io, &cancel_buf_r);
-    var cancel_writer = canceler.writer(io, &cancel_buf_w);
-    try writeHello(&cancel_writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
-    try expectHelloOk(gpa, &cancel_reader.interface);
+    const canceler = try connectRaw(gpa, io);
+    defer canceler.deinit();
+    const cancel_stream = canceler.byteStream();
+    try writeHello(cancel_stream, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    try expectHelloOk(gpa, cancel_stream);
 
-    const target = try connectRaw(io);
-    defer target.close(io);
-    var target_buf_r: [16 * 1024]u8 = undefined;
-    var target_buf_w: [16 * 1024]u8 = undefined;
-    var target_reader = target.reader(io, &target_buf_r);
-    var target_writer = target.writer(io, &target_buf_w);
-    try writeHello(&target_writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
-    const target_credential = try expectHelloOkCredential(gpa, &target_reader.interface);
+    const target = try connectRaw(gpa, io);
+    defer target.deinit();
+    const target_stream = target.byteStream();
+    try writeHello(target_stream, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    const target_credential = try expectHelloOkCredential(gpa, target_stream);
 
     // The target submits the large scan and does not read yet.
     const source = "from docs\n| emit { seq }";
     var source_payload: [4 + source.len]u8 = undefined;
     std.mem.writeInt(u32, source_payload[0..4], source.len, .big);
     @memcpy(source_payload[4..], source);
-    try clint.codec.writeMessage(&target_writer.interface, .flow_source, &source_payload);
-    try target_writer.interface.flush();
+    try codec.writeMessage(target_stream, .flow_source, &source_payload);
+    try target_stream.flush();
 
     // Deliver the cancel fire-and-forget; the Server never replies.
-    try clint.codec.writeMessage(&cancel_writer.interface, .cancel_request, &target_credential);
-    try cancel_writer.interface.flush();
+    try codec.writeMessage(cancel_stream, .cancel_request, &target_credential);
+    try cancel_stream.flush();
 
-    // The canceled statement delivers the CANCELED outcome.
-    try expectServerError(gpa, &target_reader.interface, "RF1006");
+    // The canceled statement delivers the CANCELED outcome. With streaming
+    // (roadmap Phase 6), the mark lands while the server is scanning: if the
+    // cancel was delivered before the first batch, no frame has been sent and
+    // SERVER_ERROR RF1006 is the first frame; otherwise a bounded prefix of
+    // rows is already in flight. Either way the statement ends with
+    // SERVER_ERROR RF1006 — drain until it arrives (COMMAND_COMPLETE is never
+    // sent for a canceled stream).
+    try expectCanceledOutcomeAfterRows(gpa, target_stream);
 
     // The Connection stays usable: a follow-up statement returns a full result.
     const follow_up = "from docs\n| emit { seq }\n| limit 1";
     var follow_payload: [4 + follow_up.len]u8 = undefined;
     std.mem.writeInt(u32, follow_payload[0..4], follow_up.len, .big);
     @memcpy(follow_payload[4..], follow_up);
-    try clint.codec.writeMessage(&target_writer.interface, .flow_source, &follow_payload);
-    try target_writer.interface.flush();
+    try codec.writeMessage(target_stream, .flow_source, &follow_payload);
+    try target_stream.flush();
     {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const aa = arena.allocator();
         var seen_row = false;
         while (true) {
-            const msg = try clint.codec.readMessage(aa, &target_reader.interface);
+            const msg = try codec.readMessage(aa, target_stream);
             switch (msg) {
                 .row_description => {},
                 .row_data => seen_row = true,

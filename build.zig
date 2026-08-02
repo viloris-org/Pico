@@ -20,13 +20,50 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Zig client library module.
-    const clint_mod = b.addModule("clint", .{
-        .root_source_file = b.path("clint/zig/lib.zig"),
+    // ── zquic (vendored pure-Zig QUIC, ADR-0015) ──
+    // Mirrors lib/zquic/build.zig: the vendored TLS module, the vendored
+    // zig_varint package, and the verbose/shadow build options. Apple
+    // platforms link libc; Linux stays pure-Zig (shadow mode unused here).
+    const zquic_needs_libc: bool = switch (target.result.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit => true,
+        else => false,
+    };
+    const zquic_tls_mod = b.createModule(.{
+        .root_source_file = b.path("lib/zquic/vendor/tls/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = zquic_needs_libc,
+    });
+    const zig_varint_mod = b.createModule(.{
+        .root_source_file = b.path("zig-pkg/zig_varint-0.1.0-JouQHUVXAAAGN-XdMYrVEmYrzJd6zXtI7zk9bPnKYXVK/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const zquic_opts = b.addOptions();
+    zquic_opts.addOption(bool, "verbose", false);
+    zquic_opts.addOption(bool, "shadow", false);
+    const zquic_mod = b.addModule("zquic", .{
+        .root_source_file = b.path("lib/zquic/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = zquic_needs_libc,
+    });
+    zquic_mod.addImport("tls", zquic_tls_mod);
+    zquic_mod.addImport("zig_varint", zig_varint_mod);
+    zquic_mod.addOptions("build_options", zquic_opts);
+
+    // The server-side QUIC listener (src/net/quic.zig, ADR-0015/0023) lives in
+    // the `runadb` module and imports the vendored zquic stack.
+    mod.addImport("zquic", zquic_mod);
+
+    // Zig SDK module (official SDK package, ADR-0023).
+    const sdk_zig_mod = b.addModule("sdk_zig", .{
+        .root_source_file = b.path("sdk/zig/lib.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "clint_proto", .module = clint_proto_mod },
+            .{ .name = "zquic", .module = zquic_mod },
         },
     });
 
@@ -72,7 +109,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "clint_proto", .module = clint_proto_mod },
-                .{ .name = "clint", .module = clint_mod },
+                .{ .name = "sdk_zig", .module = sdk_zig_mod },
             },
         }),
     });
@@ -106,18 +143,18 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const clint_tests = b.addTest(.{
-        .root_module = clint_mod,
+        .root_module = sdk_zig_mod,
     });
     const run_clint_tests = b.addRunArtifact(clint_tests);
 
     const clint_integration_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("clint/zig/integration_test.zig"),
+            .root_source_file = b.path("sdk/zig/integration_test.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
             .imports = &.{
-                .{ .name = "clint", .module = clint_mod },
+                .{ .name = "sdk_zig", .module = sdk_zig_mod },
             },
         }),
     });

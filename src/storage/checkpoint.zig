@@ -5,10 +5,12 @@
 //! live WAL. Recovery cost becomes proportional to live data rather than to
 //! total write history, and the WAL stops growing without bound.
 //!
-//! In the current memtable + WAL phase there are no SSTables to materialize
-//! into, so advancing persistent progress *is* the WAL rewrite. When LSM
-//! storage lands, this module becomes flush + manifest publication + WAL
-//! truncation; the externally visible contract (bounded WAL, bounded recovery)
+//! With the on-disk LSM slice (roadmap Phase 5), the engine flushes
+//! primary-key tables into SSTables and publishes the LSM version-set
+//! manifest *before* this rewrite, so the rewritten WAL no longer carries
+//! flushed rows. Heap tables (no single-column primary key) and document,
+//! graph, and evidence objects still reconstruct from the WAL exactly as
+//! before. The externally visible contract (bounded WAL, bounded recovery)
 //! does not change.
 //!
 //! A checkpoint is an internal mechanism for reclaiming WAL space. It is not a

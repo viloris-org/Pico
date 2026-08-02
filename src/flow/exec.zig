@@ -1,4 +1,9 @@
 //! Bind and execute the initial read-only Runa Flow relation slice.
+//!
+//! Execution is backed by the streaming execution program (`program.zig`,
+//! roadmap Phase 6): the materialized entry points below drain the program,
+//! so the validated Runa Query IR execution paths and the protocol layer's
+//! streaming path share one scan implementation by construction.
 
 const std = @import("std");
 const Io = std.Io;
@@ -6,21 +11,28 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const ir = @import("ir.zig");
 const engine_mod = @import("../storage/engine.zig");
-const table_mod = @import("../storage/table.zig");
 const document_mod = @import("../storage/document.zig");
 const value = @import("../storage/value.zig");
-const evidence = @import("../storage/evidence.zig");
 const txn_mod = @import("../txn/transaction.zig");
+const program = @import("program.zig");
 
-pub const ExecError = ast.ParseError || ir.IrError || error{
-    SemanticNameNotFound,
-    FieldNotFound,
-    TypeMismatch,
-    NonComparableColumn,
-    ModelRevisionMismatch,
-    UnsupportedNavigate,
-    Canceled,
-} || Allocator.Error;
+pub const ProgramError = program.ProgramError;
+/// Cooperative cancellation probe (roadmap Phase 6). The caller — a RunaDB
+/// Connection — owns the state and the statement generation that a
+/// `CANCEL_REQUEST` marks; the flow module only calls `check` between bounded
+/// work units during scan execution and never stores the probe past the call.
+/// A null probe disables cancellation, preserving the engine-level and MCP call
+/// paths unchanged.
+pub const CancelProbe = program.CancelProbe;
+/// Per-execution options. The default options carry no cancellation probe.
+pub const ExecOptions = program.ExecOptions;
+/// Streaming execution program: one execution instance of a bound Request
+/// that produces bounded result batches (see `program.zig`).
+pub const Program = program.Program;
+pub const Batch = program.Batch;
+pub const BatchLimit = program.BatchLimit;
+
+pub const ExecError = ProgramError;
 
 pub const Result = struct {
     columns: [][]const u8,
@@ -37,41 +49,6 @@ pub const Result = struct {
     }
 };
 
-/// Cooperative cancellation probe (roadmap Phase 6). The caller — a RunaDB
-/// Connection — owns the state and the statement generation that a
-/// `CANCEL_REQUEST` marks; the flow module only calls `check` between bounded
-/// work units during scan execution and never stores the probe past the call.
-/// A null probe disables cancellation, preserving the engine-level and MCP call
-/// paths unchanged.
-pub const CancelProbe = struct {
-    ctx: *anyopaque,
-    check: *const fn (ctx: *anyopaque) error{Canceled}!void,
-};
-
-/// Per-execution options. The default options carry no cancellation probe.
-pub const ExecOptions = struct {
-    cancel: ?CancelProbe = null,
-};
-
-/// Report the owning Connection's cancellation mark between bounded work units.
-/// A marked statement stops at the next row boundary with `error.Canceled`,
-/// which the protocol layer maps to the delivered `CANCELED` outcome (`RF1006`).
-fn checkCancel(opts: ExecOptions) ExecError!void {
-    if (opts.cancel) |probe| try probe.check(probe.ctx);
-}
-
-/// Duplicate a column name into `owned` and return the owned slice. Result
-/// column metadata is fully owned (Phase 6): a DDL that frees engine column
-/// state cannot race a result still being sent, because no borrowed engine
-/// memory escapes the statement-execution lock. Behavior is byte-identical to
-/// borrowing the name.
-fn ownColumn(gpa: Allocator, owned: *std.ArrayList([]u8), name: []const u8) ![]const u8 {
-    const copy = try gpa.dupe(u8, name);
-    errdefer gpa.free(copy);
-    try owned.append(gpa, copy);
-    return copy;
-}
-
 pub fn compile(gpa: Allocator, source: []const u8) !ir.Request {
     var parsed = try ast.parse(gpa, source);
     defer parsed.deinit(gpa);
@@ -86,125 +63,16 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
 /// check `opts.cancel` between bounded work units, so a Connection's
 /// `CANCEL_REQUEST` mark stops a long scan at the next row boundary. The plain
 /// `execute` entry point passes the default options and never observes
-/// cancellation.
+/// cancellation. Execution drains the streaming program, so the materialized
+/// result is byte-identical to streaming the same program to the wire.
 pub fn executeOpts(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) ExecError!Result {
-    if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
-    if (request.operation != .emit) return error.InvalidOperation;
-    if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request, opts);
-    // Revision 0 is an explicit development binding of relation, document, and
-    // graph names to the existing catalog. It is read-only and is not persisted
-    // as a model.
-    if (eng.getDocumentCollection(request.relation)) |_| {
-        if (request.navigate != null) return error.UnsupportedNavigate;
-        return executeDocument(gpa, eng, request, opts);
-    }
-    if (eng.getGraph(request.relation) != null) return executeGraph(gpa, eng, request, opts);
-    const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
-    if (request.navigate != null) return error.UnsupportedNavigate;
-    const projection = try bindProjection(gpa, table, request.fields);
-    defer gpa.free(projection);
-
-    var owned_text: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (owned_text.items) |text| gpa.free(text);
-        owned_text.deinit(gpa);
-    }
-    const columns = try gpa.alloc([]const u8, projection.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |index, output_index| {
-        columns[output_index] = try ownColumn(gpa, &owned_text, table.columns[index].name);
-    }
-    var cells: std.ArrayList([]?[]const u8) = .empty;
-    errdefer {
-        for (cells.items) |row| gpa.free(row);
-        cells.deinit(gpa);
-    }
-
-    var bound = try bindTableWhere(gpa, table, request.where);
-    defer bound.deinit();
-
-    // Read Committed: the statement takes a fresh snapshot watermark at its
-    // start and interprets only complete commits at or before it. The engine's
-    // snapshot-aware scan registers the watermark for the read's duration and
-    // returns only versions visible at it; the Flow slice keeps reading them
-    // even as later commits land (reads do not wait for writes).
-    const snapshot_seq = eng.publishedSeq();
-    var visible = eng.selectAll(request.relation, snapshot_seq) catch |err| return switch (err) {
-        error.TableNotFound => error.SemanticNameNotFound,
-        error.SnapshotLimitExceeded => error.OutOfMemory,
-        error.OutOfMemory => error.OutOfMemory,
-    };
-    defer visible.deinit();
-
-    const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
-    var emitted: usize = 0;
-    for (visible.rows) |row| {
-        if (emitted >= max_rows) break;
-        try checkCancel(opts);
-        if (!table_mod.valuesMatch(row.values, bound.preds)) continue;
-        try emitRow(gpa, &owned_text, &cells, projection, row.values);
-        emitted += 1;
-    }
-    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
+    var prog = try program.open(gpa, eng, request, opts);
+    defer prog.deinit();
+    return drain(gpa, &prog);
 }
 
-/// Execute a read-only Request over a document collection. Each emitted field
-/// is a dotted path resolved against the document (absent path reads as null);
-/// each `where` predicate evaluates the same way, so a predicate on an absent
-/// or differently typed field does not match that document. Reads follow the
-/// collection's insertion order, matching the relation slice's read order.
-fn executeDocument(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) ExecError!Result {
-    const collection = eng.getDocumentCollection(request.relation) orelse return error.SemanticNameNotFound;
-    const projection = request.fields;
-    var owned_text: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (owned_text.items) |text| gpa.free(text);
-        owned_text.deinit(gpa);
-    }
-    const columns = try gpa.alloc([]const u8, projection.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |path, index| {
-        columns[index] = try ownColumn(gpa, &owned_text, path);
-    }
-
-    var bound = try bindDocumentWhere(gpa, request.where);
-    defer bound.deinit();
-
-    var cells: std.ArrayList([]?[]const u8) = .empty;
-    errdefer {
-        for (cells.items) |row| gpa.free(row);
-        cells.deinit(gpa);
-    }
-
-    const pred_values = try gpa.alloc(value.Value, request.where.len);
-    defer gpa.free(pred_values);
-    const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
-    var emitted: usize = 0;
-    for (collection.order.items) |doc| {
-        if (emitted >= max_rows) break;
-        try checkCancel(opts);
-        for (request.where, 0..) |*predicate, index| {
-            pred_values[index] = doc.pathValue(predicate.column) orelse .null;
-        }
-        if (!table_mod.valuesMatch(pred_values, bound.preds)) continue;
-        const row = try gpa.alloc(?[]const u8, projection.len);
-        errdefer gpa.free(row);
-        for (projection, 0..) |path, index| {
-            row[index] = try valueToText(gpa, &owned_text, doc.pathValue(path) orelse .null);
-        }
-        try cells.append(gpa, row);
-        emitted += 1;
-    }
-    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
-}
-
-/// Execute a read-only Request through an explicit transaction with Read
-/// Committed visibility: a relation `emit` sees committed state merged with the
-/// transaction's private write set (read-your-writes). Each Request re-reads
-/// the latest committed state, so two `emit` calls in one explicit transaction
-/// may observe commits made by other transactions between them. The evidence
-/// view has no private write set in this slice and is read from committed
-/// observations directly.
+/// Execute a Request through an explicit transaction with Read Committed
+/// visibility (read-your-writes). Drains the transaction-scoped program.
 pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, tx: *txn_mod.Transaction) ExecError!Result {
     return executeTxOpts(gpa, eng, request, tx, .{});
 }
@@ -212,497 +80,66 @@ pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Req
 /// Transaction-scoped execution with the same optional cancellation probe as
 /// `executeOpts`.
 pub fn executeTxOpts(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, tx: *txn_mod.Transaction, opts: ExecOptions) ExecError!Result {
-    if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
-    if (request.operation != .emit) return error.InvalidOperation;
-    if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request, opts);
-    // Document and graph collections have no private write set in this slice;
-    // they are read from committed state exactly as outside a transaction.
-    if (eng.getDocumentCollection(request.relation)) |_| {
-        if (request.navigate != null) return error.UnsupportedNavigate;
-        return executeDocument(gpa, eng, request, opts);
-    }
-    if (eng.getGraph(request.relation) != null) return executeGraph(gpa, eng, request, opts);
-    const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
-    if (request.navigate != null) return error.UnsupportedNavigate;
-    const projection = try bindProjection(gpa, table, request.fields);
-    defer gpa.free(projection);
+    var prog = try program.openTx(gpa, eng, request, tx, opts);
+    defer prog.deinit();
+    return drain(gpa, &prog);
+}
 
-    var owned_text: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (owned_text.items) |text| gpa.free(text);
-        owned_text.deinit(gpa);
-    }
-    const columns = try gpa.alloc([]const u8, projection.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |index, output_index| {
-        columns[output_index] = try ownColumn(gpa, &owned_text, table.columns[index].name);
-    }
+/// Streaming entry point (roadmap Phase 6): open an execution program under
+/// the engine's statement-execution lock, then produce bounded batches with
+/// `Program.nextBatch` after the lock is released. Errors during opening map
+/// to the same codes as the materialized path.
+pub const openProgram = program.open;
+pub const openProgramTx = program.openTx;
+
+/// Drain a program into a fully materialized `Result`. Each bounded batch is
+/// released and its rows and text moved into the result, so the drain is
+/// exactly the stream's concatenation; `prog.takeColumns` transfers the owned
+/// column metadata.
+fn drain(gpa: Allocator, prog: *Program) ExecError!Result {
     var cells: std.ArrayList([]?[]const u8) = .empty;
     errdefer {
         for (cells.items) |row| gpa.free(row);
         cells.deinit(gpa);
-    }
-
-    var bound = try bindTableWhere(gpa, table, request.where);
-    defer bound.deinit();
-
-    // Read Committed: each statement in an explicit transaction takes a fresh
-    // published watermark, so it observes commits made by other transactions
-    // between statements while still merging its own private write set. The
-    // engine's snapshot-aware scan registers the watermark for the read.
-    const snapshot_seq = eng.publishedSeq();
-    var merged = eng.selectAllTx(tx, request.relation, snapshot_seq) catch |err| return switch (err) {
-        error.TableNotFound => error.SemanticNameNotFound,
-        error.SnapshotLimitExceeded => error.OutOfMemory,
-        error.OutOfMemory => error.OutOfMemory,
-    };
-    defer merged.deinit();
-
-    const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
-    var emitted: usize = 0;
-    for (merged.rows) |row| {
-        if (emitted >= max_rows) break;
-        try checkCancel(opts);
-        if (!table_mod.valuesMatch(row.values, bound.preds)) continue;
-        try emitRow(gpa, &owned_text, &cells, projection, row.values);
-        emitted += 1;
-    }
-    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
-}
-
-/// Project one row's values into an output cell row and append it to `cells`.
-/// Text rendering is owned through `owned_text`; the caller frees both.
-fn emitRow(gpa: Allocator, owned_text: *std.ArrayList([]u8), cells: *std.ArrayList([]?[]const u8), projection: []const usize, row_values: []const value.Value) !void {
-    const output = try gpa.alloc(?[]const u8, projection.len);
-    errdefer gpa.free(output);
-    for (projection, 0..) |column, output_index| {
-        output[output_index] = try valueToText(gpa, owned_text, row_values[column]);
-    }
-    try cells.append(gpa, output);
-}
-
-const EvidenceField = struct {
-    name: []const u8,
-    type_tag: value.TypeTag,
-};
-
-const evidence_fields = [_]EvidenceField{
-    .{ .name = "evidence_id", .type_tag = .int },
-    .{ .name = "object_id", .type_tag = .text },
-    .{ .name = "modality", .type_tag = .text },
-    .{ .name = "media_type", .type_tag = .text },
-    .{ .name = "observed_at", .type_tag = .text },
-    .{ .name = "origin", .type_tag = .text },
-    .{ .name = "owner", .type_tag = .text },
-    .{ .name = "payload_length", .type_tag = .int },
-    .{ .name = "payload_digest", .type_tag = .text },
-};
-
-fn executeEvidence(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) !Result {
-    const projection = try gpa.alloc(usize, request.fields.len);
-    defer gpa.free(projection);
-    for (request.fields, 0..) |field, output_index| {
-        projection[output_index] = evidenceFieldIndex(field) orelse return error.FieldNotFound;
     }
     var owned_text: std.ArrayList([]u8) = .empty;
     errdefer {
         for (owned_text.items) |text| gpa.free(text);
         owned_text.deinit(gpa);
     }
-    const columns = try gpa.alloc([]const u8, request.fields.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |field_index, index| {
-        columns[index] = try ownColumn(gpa, &owned_text, evidence_fields[field_index].name);
-    }
-    var cells: std.ArrayList([]?[]const u8) = .empty;
-    errdefer {
-        for (cells.items) |row| gpa.free(row);
-        cells.deinit(gpa);
+
+    var batch: Batch = .{ .gpa = gpa };
+    defer batch.deinit();
+    while (true) {
+        try prog.nextBatch(&batch, .{ .max_rows = std.math.maxInt(usize), .max_bytes = std.math.maxInt(u64) });
+        var parts = batch.release();
+        // Move the parts' items into the accumulating lists. On error before
+        // the move completes, `parts.deinit` frees everything it still owns;
+        // after the move, only the parts' containers are freed (the items now
+        // belong to cells/owned_text).
+        errdefer parts.deinit(gpa);
+        try cells.ensureUnusedCapacity(gpa, parts.rows.items.len);
+        try owned_text.ensureUnusedCapacity(gpa, parts.owned_text.items.len);
+        for (parts.rows.items) |row| cells.appendAssumeCapacity(row);
+        for (parts.owned_text.items) |text| owned_text.appendAssumeCapacity(text);
+        var moved_rows = parts.rows;
+        var moved_text = parts.owned_text;
+        moved_rows.deinit(gpa);
+        moved_text.deinit(gpa);
+        if (batch.done) break;
     }
 
-    var bound = try bindEvidenceWhere(gpa, request.where);
-    defer bound.deinit();
-
-    const observations = eng.observationsView();
-    var digest_hex: [2 * evidence.DIGEST_LENGTH]u8 = undefined;
-    var values_buf: [evidence_fields.len]value.Value = undefined;
-    const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
-    var emitted: usize = 0;
-    for (observations) |record| {
-        if (emitted >= max_rows) break;
-        try checkCancel(opts);
-        for (0..values_buf.len) |field_index| values_buf[field_index] = evidenceValue(&record, field_index, &digest_hex);
-        if (!table_mod.valuesMatch(&values_buf, bound.preds)) continue;
-        const row = try gpa.alloc(?[]const u8, projection.len);
-        errdefer gpa.free(row);
-        for (projection, 0..) |field_index, output_index| {
-            row[output_index] = switch (field_index) {
-                0 => try ownedFormat(gpa, &owned_text, "{d}", .{record.evidence_id}),
-                1 => record.object_id,
-                2 => @tagName(record.modality),
-                3 => record.media_type,
-                4 => record.observed_at,
-                5 => record.origin,
-                6 => record.owner,
-                7 => try ownedFormat(gpa, &owned_text, "{d}", .{record.payload_length}),
-                8 => blk: {
-                    const hex = std.fmt.bytesToHex(record.payload_digest, .lower);
-                    const text = try gpa.dupe(u8, &hex);
-                    try owned_text.append(gpa, text);
-                    break :blk text;
-                },
-                else => unreachable,
-            };
-        }
-        try cells.append(gpa, row);
-        emitted += 1;
-    }
-    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
-}
-
-/// Extract a borrowed typed value for one evidence field. The digest hex is
-/// written into `digest_hex`, which must outlive the returned value.
-fn evidenceValue(record: *const evidence.Record, field_index: usize, digest_hex: *[2 * evidence.DIGEST_LENGTH]u8) value.Value {
-    return switch (field_index) {
-        0 => .{ .int = @intCast(record.evidence_id) },
-        1 => .{ .text = record.object_id },
-        2 => .{ .text = @constCast(@tagName(record.modality)) },
-        3 => .{ .text = record.media_type },
-        4 => .{ .text = record.observed_at },
-        5 => .{ .text = record.origin },
-        6 => .{ .text = record.owner },
-        7 => .{ .int = @intCast(record.payload_length) },
-        8 => blk: {
-            const hex = std.fmt.bytesToHex(record.payload_digest, .lower);
-            @memcpy(digest_hex, &hex);
-            break :blk .{ .text = digest_hex[0..] };
-        },
-        else => unreachable,
+    var columns = prog.takeColumns();
+    // Column names and cell text share one owned list (the Result shape):
+    // move the transferred column names into the result's owned text.
+    try owned_text.appendSlice(gpa, columns.column_text.items);
+    columns.column_text.deinit(gpa);
+    return .{
+        .columns = columns.columns,
+        .cells = try cells.toOwnedSlice(gpa),
+        .owned_text = owned_text,
+        .gpa = gpa,
     };
-}
-
-fn evidenceFieldIndex(name: []const u8) ?usize {
-    for (evidence_fields, 0..) |field, index| {
-        if (std.mem.eql(u8, name, field.name)) return index;
-    }
-    return null;
-}
-
-fn ownedFormat(gpa: Allocator, owned: *std.ArrayList([]u8), comptime format: []const u8, args: anytype) ![]const u8 {
-    const text = try std.fmt.allocPrint(gpa, format, args);
-    errdefer gpa.free(text);
-    try owned.append(gpa, text);
-    return text;
-}
-
-fn bindProjection(gpa: Allocator, table: *engine_mod.Table, fields: []const []u8) ![]usize {
-    const projection = try gpa.alloc(usize, fields.len);
-    errdefer gpa.free(projection);
-    for (fields, 0..) |field, field_index| {
-        for (table.columns, 0..) |column, column_index| {
-            if (std.mem.eql(u8, field, column.name)) {
-                projection[field_index] = column_index;
-                break;
-            }
-        } else return error.FieldNotFound;
-    }
-    return projection;
-}
-
-/// Bound predicates plus the value arrays allocated for `in` lists. Text
-/// literals are borrowed from the Request and need no ownership here.
-const BoundWhere = struct {
-    gpa: Allocator,
-    preds: []table_mod.Pred,
-    owned: std.ArrayList([]value.Value) = .empty,
-
-    fn deinit(self: *BoundWhere) void {
-        for (self.owned.items) |values| self.gpa.free(values);
-        self.owned.deinit(self.gpa);
-        self.gpa.free(self.preds);
-    }
-};
-
-fn bindTableWhere(gpa: Allocator, table: *engine_mod.Table, predicates: []const ast.Predicate) !BoundWhere {
-    const preds = try gpa.alloc(table_mod.Pred, predicates.len);
-    errdefer gpa.free(preds);
-    var owned: std.ArrayList([]value.Value) = .empty;
-    errdefer {
-        for (owned.items) |values| gpa.free(values);
-        owned.deinit(gpa);
-    }
-    for (predicates, 0..) |*predicate, index| {
-        const column_index = table.columnIndex(predicate.column) orelse return error.FieldNotFound;
-        preds[index] = try buildPred(gpa, column_index, table.columns[column_index].type_tag, predicate, &owned);
-    }
-    return .{ .gpa = gpa, .preds = preds, .owned = owned };
-}
-
-fn bindEvidenceWhere(gpa: Allocator, predicates: []const ast.Predicate) !BoundWhere {
-    const preds = try gpa.alloc(table_mod.Pred, predicates.len);
-    errdefer gpa.free(preds);
-    var owned: std.ArrayList([]value.Value) = .empty;
-    errdefer {
-        for (owned.items) |values| gpa.free(values);
-        owned.deinit(gpa);
-    }
-    for (predicates, 0..) |*predicate, index| {
-        const field_index = evidenceFieldIndex(predicate.column) orelse return error.FieldNotFound;
-        preds[index] = try buildPred(gpa, field_index, evidence_fields[field_index].type_tag, predicate, &owned);
-    }
-    return .{ .gpa = gpa, .preds = preds, .owned = owned };
-}
-
-/// Execute a read-only Request over a graph. Without `navigate`, nodes read
-/// like documents. With `navigate`, every surviving source node is expanded
-/// into one row per outgoing edge carrying `edge.label`; the destination node
-/// is addressable through `alias.<path>` in the emit, while unqualified paths
-/// resolve against the source node. A node with no matching outgoing edge
-/// produces no row.
-fn executeGraph(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) ExecError!Result {
-    const graph = eng.getGraph(request.relation) orelse return error.SemanticNameNotFound;
-    const navigate = request.navigate;
-
-    const projection = request.fields;
-    var owned_text: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (owned_text.items) |text| gpa.free(text);
-        owned_text.deinit(gpa);
-    }
-    const columns = try gpa.alloc([]const u8, projection.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |path, index| {
-        columns[index] = try ownColumn(gpa, &owned_text, path);
-    }
-
-    var bound = try bindDocumentWhere(gpa, request.where);
-    defer bound.deinit();
-
-    var cells: std.ArrayList([]?[]const u8) = .empty;
-    errdefer {
-        for (cells.items) |row| gpa.free(row);
-        cells.deinit(gpa);
-    }
-
-    const pred_values = try gpa.alloc(value.Value, request.where.len);
-    defer gpa.free(pred_values);
-    const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
-    var emitted: usize = 0;
-
-    if (navigate) |nav| {
-        for (graph.nodes.order.items) |source| {
-            if (emitted >= max_rows) break;
-            try checkCancel(opts);
-            for (request.where, 0..) |*predicate, index| pred_values[index] = source.pathValue(predicate.column) orelse .null;
-            if (!table_mod.valuesMatch(pred_values, bound.preds)) continue;
-            for (graph.edges.items) |*edge_item| {
-                if (emitted >= max_rows) break;
-                try checkCancel(opts);
-                if (!std.mem.eql(u8, edge_item.from, source.id) or !std.mem.eql(u8, edge_item.label, nav.edge)) continue;
-                const dest = graph.nodes.by_id.get(edge_item.to) orelse continue;
-                const row = try gpa.alloc(?[]const u8, projection.len);
-                errdefer gpa.free(row);
-                for (projection, 0..) |path, index| {
-                    const item = graphPathValue(nav.alias, source, dest, path);
-                    row[index] = try valueToText(gpa, &owned_text, item orelse .null);
-                }
-                try cells.append(gpa, row);
-                emitted += 1;
-            }
-        }
-    } else {
-        for (graph.nodes.order.items) |node| {
-            if (emitted >= max_rows) break;
-            try checkCancel(opts);
-            for (request.where, 0..) |*predicate, index| pred_values[index] = node.pathValue(predicate.column) orelse .null;
-            if (!table_mod.valuesMatch(pred_values, bound.preds)) continue;
-            const row = try gpa.alloc(?[]const u8, projection.len);
-            errdefer gpa.free(row);
-            for (projection, 0..) |path, index| {
-                row[index] = try valueToText(gpa, &owned_text, node.pathValue(path) orelse .null);
-            }
-            try cells.append(gpa, row);
-            emitted += 1;
-        }
-    }
-    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
-}
-
-/// Resolve an emit path against a navigate row: `alias.<path>` reads the
-/// destination node, any other path reads the source node.
-fn graphPathValue(alias: []const u8, source: *const document_mod.Document, dest: *const document_mod.Document, path: []const u8) ?value.Value {
-    if (std.mem.startsWith(u8, path, alias) and path.len > alias.len and path[alias.len] == '.') {
-        return dest.pathValue(path[alias.len + 1 ..]);
-    }
-    return source.pathValue(path);
-}
-
-/// Bound predicates for a document collection. Predicate `col_index` is the
-/// predicate's position; `executeDocument` fills a per-document value array at
-/// those positions. `owned` holds the allocated `in`-list value arrays.
-const BoundDocumentWhere = struct {
-    gpa: Allocator,
-    preds: []table_mod.Pred,
-    owned: std.ArrayList([]value.Value) = .empty,
-
-    fn deinit(self: *BoundDocumentWhere) void {
-        for (self.owned.items) |values| self.gpa.free(values);
-        self.owned.deinit(self.gpa);
-        self.gpa.free(self.preds);
-    }
-};
-
-/// Bind document predicates without a declared column type: documents are
-/// variable-shape, so the literal keeps its own type and a predicate matches
-/// only a same-typed field value (`valuesMatch` treats a type mismatch as a
-/// non-match, exactly like an absent field reads as null).
-fn bindDocumentWhere(gpa: Allocator, predicates: []const ast.Predicate) !BoundDocumentWhere {
-    const preds = try gpa.alloc(table_mod.Pred, predicates.len);
-    errdefer gpa.free(preds);
-    var owned: std.ArrayList([]value.Value) = .empty;
-    errdefer {
-        for (owned.items) |values| gpa.free(values);
-        owned.deinit(gpa);
-    }
-    for (predicates, 0..) |*predicate, index| {
-        switch (predicate.op) {
-            .is_null => preds[index] = .{ .is_null = .{ .col_index = index, .negated = false } },
-            .not_null => preds[index] = .{ .is_null = .{ .col_index = index, .negated = true } },
-            .in, .not_in => {
-                const values = try gpa.alloc(value.Value, predicate.list.items.len);
-                errdefer gpa.free(values);
-                for (predicate.list.items, 0..) |*literal, literal_index| {
-                    values[literal_index] = literalToBorrowedValue(literal.*);
-                }
-                try owned.append(gpa, values);
-                preds[index] = .{ .in_list = .{ .col_index = index, .values = values, .negated = predicate.op == .not_in } };
-            },
-            .like, .not_like => {
-                preds[index] = .{ .like = .{ .col_index = index, .pattern = literalToBorrowedValue(predicate.scalar.?), .negated = predicate.op == .not_like } };
-            },
-            else => {
-                const literal = literalToBorrowedValue(predicate.scalar.?);
-                preds[index] = switch (predicate.op) {
-                    .eq => .{ .eq = .{ .col_index = index, .value = literal } },
-                    .neq, .lt, .gt, .lte, .gte => .{ .cmp = .{
-                        .col_index = index,
-                        .op = switch (predicate.op) {
-                            .neq => .neq,
-                            .lt => .lt,
-                            .gt => .gt,
-                            .lte => .lte,
-                            .gte => .gte,
-                            else => unreachable,
-                        },
-                        .value = literal,
-                    } },
-                    else => unreachable,
-                };
-            },
-        }
-    }
-    return .{ .gpa = gpa, .preds = preds, .owned = owned };
-}
-
-/// Convert a Flow literal to a borrowed scalar value. Text is borrowed from the
-/// Request, which outlives the match; no allocation or type coercion occurs.
-fn literalToBorrowedValue(literal: ast.Literal) value.Value {
-    return switch (literal) {
-        .int => |integer| .{ .int = integer },
-        .bool => |boolean| .{ .bool = boolean },
-        .text => |text| .{ .text = text },
-    };
-}
-
-fn buildPred(gpa: Allocator, column_index: usize, column_type: value.TypeTag, predicate: *const ast.Predicate, owned: *std.ArrayList([]value.Value)) !table_mod.Pred {
-    switch (predicate.op) {
-        .is_null => return .{ .is_null = .{ .col_index = column_index, .negated = false } },
-        .not_null => return .{ .is_null = .{ .col_index = column_index, .negated = true } },
-        .in, .not_in => {
-            const values = try gpa.alloc(value.Value, predicate.list.items.len);
-            errdefer gpa.free(values);
-            for (predicate.list.items, 0..) |*literal, index| values[index] = try literalToValue(column_type, literal);
-            try owned.append(gpa, values);
-            return .{ .in_list = .{ .col_index = column_index, .values = values, .negated = predicate.op == .not_in } };
-        },
-        .like, .not_like => {
-            if (column_type != .text) return error.TypeMismatch;
-            return .{ .like = .{ .col_index = column_index, .pattern = try literalToValue(.text, &predicate.scalar.?), .negated = predicate.op == .not_like } };
-        },
-        .eq, .neq, .lt, .gt, .lte, .gte => {
-            switch (predicate.op) {
-                .neq, .lt, .gt, .lte, .gte => if (column_type != .int and column_type != .text) return error.NonComparableColumn,
-                else => {},
-            }
-            const literal = try literalToValue(column_type, &predicate.scalar.?);
-            return switch (predicate.op) {
-                .eq => .{ .eq = .{ .col_index = column_index, .value = literal } },
-                .neq => .{ .cmp = .{ .col_index = column_index, .op = .neq, .value = literal } },
-                .lt => .{ .cmp = .{ .col_index = column_index, .op = .lt, .value = literal } },
-                .gt => .{ .cmp = .{ .col_index = column_index, .op = .gt, .value = literal } },
-                .lte => .{ .cmp = .{ .col_index = column_index, .op = .lte, .value = literal } },
-                .gte => .{ .cmp = .{ .col_index = column_index, .op = .gte, .value = literal } },
-                else => unreachable,
-            };
-        },
-    }
-}
-
-/// Coerce a literal to a column type, rejecting mismatches before execution.
-/// Text bytes are borrowed from the Request and outlive the match.
-fn literalToValue(column_type: value.TypeTag, literal: *const ast.Literal) !value.Value {
-    return switch (literal.*) {
-        .int => |integer| blk: {
-            if (column_type != .int) return error.TypeMismatch;
-            break :blk .{ .int = integer };
-        },
-        .bool => |boolean| blk: {
-            if (column_type != .bool) return error.TypeMismatch;
-            break :blk .{ .bool = boolean };
-        },
-        .text => |text| blk: {
-            if (column_type != .text) return error.TypeMismatch;
-            break :blk .{ .text = text };
-        },
-    };
-}
-
-fn valueToText(gpa: Allocator, owned: *std.ArrayList([]u8), item: value.Value) !?[]const u8 {
-    switch (item) {
-        .null => return null,
-        // Text is copied into `owned` so a rendered row never aliases the
-        // source row: the relation emit path may read through a transient
-        // transaction write set whose rows are freed when the read completes.
-        .text => |text| {
-            const owned_text = try gpa.dupe(u8, text);
-            owned.append(gpa, owned_text) catch |err| {
-                gpa.free(owned_text);
-                return err;
-            };
-            return owned_text;
-        },
-        .bool => |boolean| return if (boolean) "true" else "false",
-        .int => |integer| {
-            const text = try std.fmt.allocPrint(gpa, "{d}", .{integer});
-            try owned.append(gpa, text);
-            return text;
-        },
-        .vector => |items| {
-            var text: std.ArrayList(u8) = .empty;
-            errdefer text.deinit(gpa);
-            try text.append(gpa, '[');
-            for (items, 0..) |component, index| {
-                if (index != 0) try text.append(gpa, ',');
-                const component_text = try std.fmt.allocPrint(gpa, "{d}", .{component});
-                defer gpa.free(component_text);
-                try text.appendSlice(gpa, component_text);
-            }
-            try text.append(gpa, ']');
-            const rendered = try text.toOwnedSlice(gpa);
-            try owned.append(gpa, rendered);
-            return rendered;
-        },
-    }
 }
 
 test "executes a read-only relation flow" {
@@ -779,7 +216,7 @@ test "renders an embedding projection as a vector literal" {
     }
     var embedding: value.Value = .{ .vector = try std.testing.allocator.dupe(f32, &.{ 1, 2.5 }) };
     defer embedding.deinit(std.testing.allocator);
-    const rendered = (try valueToText(std.testing.allocator, &owned, embedding)).?;
+    const rendered = (try program.valueToText(std.testing.allocator, &owned, embedding)).?;
     try std.testing.expectEqualStrings("[1,2.5]", rendered);
 }
 

@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const clint = @import("clint");
+const sdk = @import("sdk_zig");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -14,7 +14,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Parse args
     var host: []const u8 = "127.0.0.1";
-    var port: u16 = 5434;
+    var port: ?u16 = null;
+    // The CLI pins TCP until roadmap Phase 9 verifies the QUIC path
+    // (ADR-0023 §2.2); `--quic` selects the target-design QUIC transport.
+    var kind: sdk.TransportKind = .tcp;
 
     const raw_args = try init.minimal.args.toSlice(arena_alloc);
     var i: usize = 1;
@@ -26,6 +29,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--port") and i + 1 < raw_args.len) {
             i += 1;
             port = try std.fmt.parseInt(u16, raw_args[i], 10);
+        } else if (std.mem.eql(u8, a, "--quic") or std.mem.eql(u8, a, "--udp")) {
+            kind = .quic;
+        } else if (std.mem.eql(u8, a, "--tcp")) {
+            kind = .tcp;
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             try printUsage();
             return;
@@ -37,8 +44,20 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Connect
-    std.log.info("connecting to RunaDB at {s}:{d}...", .{ host, port });
-    var conn = clint.Connection.connect(gpa, io, host, port) catch |err| {
+    const config = sdk.Config{
+        .host = host,
+        .port = port,
+        .kind = kind,
+    };
+    const port_text: []const u8 = if (port) |p| blk: {
+        const buf = try arena_alloc.alloc(u8, 8);
+        break :blk try std.fmt.bufPrint(buf, "{d}", .{p});
+    } else switch (kind) {
+        .quic => "5435",
+        .tcp => "5434",
+    };
+    std.log.info("connecting to RunaDB at {s}:{s} ({s})...", .{ host, port_text, @tagName(kind) });
+    var conn = sdk.Connection.connect(gpa, io, config) catch |err| {
         std.log.err("connection failed: {s}", .{@errorName(err)});
         return err;
     };
@@ -173,7 +192,9 @@ fn printUsage() !void {
         \\
         \\Options:
         \\  --host <addr>    Server address (default 127.0.0.1)
-        \\  --port <port>    Server port (default 5434)
+        \\  --port <port>    Server port (default: 5434 TCP, 5435 QUIC)
+        \\  --tcp            Use native TCP (default until QUIC is verified)
+        \\  --quic, --udp    Use QUIC (target design; requires a server QUIC listener)
         \\  -h, --help       Show help
         \\
         \\Meta commands (inside REPL):

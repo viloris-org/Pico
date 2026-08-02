@@ -282,16 +282,29 @@ VFS or without a versioned validation path.
 
 ### Phase 5: LSM Storage and MVCC Retention
 
-**Status:** The MVCC retention half is implemented as a development slice. Row
-versions carry a creation commit sequence, superseded versions are retained
-with a deletion interval, the engine tracks `oldest_active_snapshot_seq`
-through a bounded snapshot registry, reads interpret only versions committed at
-or before their starting watermark (a snapshot read stays stable across later
-commits and never waits on the write path), and reclamation frees only versions
-invisible to every active snapshot — with deterministic restart, recovery,
-point/range, and snapshot-safety coverage. The remaining work below is the
-on-disk LSM: ordered MemTables, sorted-string tables, flush, compaction, the
-LSM version-set manifest, and secondary indexes.
+**Status:** The on-disk LSM storage slice is implemented as a development
+slice. Table data for single-column integer/text primary keys is materialized
+into immutable, CRC-protected, block-indexed SSTables (`sstable.zig`), flushed
+to an overlapping L0 level and compacted into a sorted, non-overlapping L1
+level with superseded-version dropping and delayed file reclamation
+(`lsm/store.zig`). A versioned LSM manifest (`lsm/manifest.zig`) records the
+per-table schema, serial counter, and file set atomically; recovery rebuilds
+flushed tables from the manifest and SSTables, then replays only the WAL tail
+past the flush watermark, skipping already-materialized batches and idempotent
+catalog records. The checkpoint flushes every primary-key table before its WAL
+rewrite, so the WAL tail no longer carries flushed rows. Heap tables (no
+single-column primary key) and document/graph/evidence objects remain WAL-only.
+Point and range read paths exist behind the storage boundary, exercised by
+recovery, compaction, and direct tests. The MVCC retention half remains
+implemented as before: row versions carry a creation commit sequence,
+superseded versions are retained with a deletion interval, the engine tracks
+`oldest_active_snapshot_seq` through a bounded snapshot registry, reads
+interpret only versions committed at or before their starting watermark, and
+reclamation frees only versions invisible to every active snapshot — with
+deterministic restart, recovery, point/range, and snapshot-safety coverage.
+The remaining work below is the in-memory skiplist MemTable with Bloom
+filters, secondary indexes, background flush/compaction scheduling with
+backpressure, and benchmark baselines.
 
 **Goal:** Move table and index storage from the in-memory baseline to ordered,
 recoverable LSM structures while preserving snapshot visibility.
@@ -315,16 +328,26 @@ machine context, and durability level.
 
 ### Phase 6: Execution and Runtime Evolution
 
-**Status:** Concurrent network work is implemented as a development slice. The listener
-serves each Connection on its own thread behind the engine's statement-execution lock, so
+**Status:** Execution programs with streaming and backpressure are implemented as a development slice.
+The listener serves each Connection on its own thread behind the engine's statement-execution lock, so
 multiple clients make progress concurrently while all logical mutation still routes through
 the single-writer commit coordinator; flow result column metadata is fully owned, so a
-concurrent DDL can never race a result being sent. Mid-statement cancellation delivery is
-implemented: the `emit` scan paths check the Connection's cancellation mark between bounded
-work units, a `CANCEL_REQUEST` routed while a statement is scanning aborts it at the next row
-boundary with the delivered `CANCELED` outcome (`SERVER_ERROR` `RF1006`), and the Connection
-stays usable — with deterministic engine-level, threaded-listener wire, and official-client
-integration coverage, plus registry hit counting. Slow-consumer and connection-loss fault
+concurrent DDL can never race a result being sent. `src/flow/program.zig` is the streaming
+execution program: one execution instance of a bound Request whose cursor produces bounded
+batches (row and byte limits), checks the cancellation probe between rows and batches, and
+tracks resource accounting (batches, rows, rendered bytes, cancel checks, largest batch) at
+the execution-program boundary. The materialized `flow.exec` entry points drain the same
+program, so the validated Runa Query IR execution paths and the streaming path share one scan
+implementation by construction; the `emit` protocol path opens the program under the statement
+lock, releases it, and streams `ROW_DESCRIPTION`/`ROW_DATA` batches with a flush per batch,
+so a slow consumer blocks only its own handler thread and the lock is never held across a send.
+Mid-statement cancellation delivery is implemented on top of the stream: a `CANCEL_REQUEST`
+routed while a statement is scanning aborts it at the next row/batch boundary with the
+delivered `CANCELED` outcome (`SERVER_ERROR` `RF1006`) — before the first batch the error is
+the first frame, and mid-stream the client receives the rows already produced followed by
+`RF1006` as the terminal message — and the Connection stays usable, with deterministic
+engine-level, threaded-listener wire, streaming-cancel, and official-client integration
+coverage, plus registry hit counting. Slow-consumer and connection-loss fault
 regressions are implemented: a Connection that never reads leaves its own handler blocked in
 the result send without holding the engine statement lock, other Connections keep making
 progress, and closing the slow stream unblocks the handler and empties the registry. The bounded
@@ -334,10 +357,9 @@ tick discipline from the I/O scheduling contract (completion extraction records 
 callbacks run within a budget and never drive the platform, and submission follows class priority
 — critical first, foreground round-robin at owner granularity, maintenance with the remaining
 per-tick budget) with high/low backpressure hysteresis, cancellation of queued cancellable work,
-and deterministic regressions against a fake platform backend. The remaining work below is execution
-programs with streaming/backpressure, socket-I/O reactor work and per-Connection backpressure on
-the scheduler, reserved WAL slots for commit, and the queue-saturation and compaction-pressure load
-regressions.
+and deterministic regressions against a fake platform backend. The remaining work below is
+socket-I/O reactor work and per-Connection backpressure on the scheduler, reserved WAL slots for
+commit, and the queue-saturation and compaction-pressure load regressions.
 
 **Goal:** Scale execution and connection handling without crossing ownership
 boundaries or weakening commit correctness.
@@ -406,9 +428,18 @@ RunaDB Wire Protocol.
 **Goal:** Make zquic-based QUIC the primary RunaDB transport while retaining one
 RunaDB application protocol and a controlled TCP migration path.
 
-- Complete QUIC stream dispatch, Stream 0 authentication, per-query stream
-  lifecycle, result sequencing, cancellation, graceful close, and idle-timeout
-  behavior.
+- The official Zig SDK (`sdk/zig/`, ADR-0023) ships its QUIC client transport:
+  control stream 0, per-query streams, ALPN `runadb`, certificate pinning, and
+  explicit `--quic` / `--tcp` selection.
+- The server QUIC listener (`src/net/quic.zig`) implements the ADR-0023 §2.1
+  stream contract and is verified end to end with the SDK QUIC client and the
+  in-process integration test in `src/net/quic.zig` (handshake, per-query
+  streams, concurrent streams, goodbye, idle teardown). Stream 0 carries the
+  v3.0 `hello` exchange today; ADR-0014 Ed25519 challenge-response is target
+  design and replaces the `hello` messages without changing the stream model.
+  The CLI keeps TCP (`--tcp`) as the working default; `--quic` selects QUIC.
+- Complete Stream 0 authentication (ADR-0014), certificate pinning regressions,
+  and idle-timeout behavior against the SDK client.
 - Validate TLS certificates, ALPN, certificate-failure behavior, and transport
   recovery using the vendored pure-Zig zquic dependency.
 - Enable the RunaDB Client QUIC path as the default only after the native TCP and

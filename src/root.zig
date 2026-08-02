@@ -12,6 +12,12 @@ pub const document = @import("storage/document.zig");
 pub const graph = @import("storage/graph.zig");
 pub const manifest = @import("storage/manifest.zig");
 pub const checkpoint = @import("storage/checkpoint.zig");
+pub const lsm = struct {
+    pub const codec = @import("storage/lsm/codec.zig");
+    pub const sstable = @import("storage/lsm/sstable.zig");
+    pub const manifest = @import("storage/lsm/manifest.zig");
+    pub const store = @import("storage/lsm/store.zig");
+};
 pub const evidence = @import("storage/evidence.zig");
 pub const vector = @import("vector.zig");
 pub const engine = @import("storage/engine.zig");
@@ -26,8 +32,10 @@ pub const flow = struct {
     pub const ast = @import("flow/ast.zig");
     pub const ir = @import("flow/ir.zig");
     pub const exec = @import("flow/exec.zig");
+    pub const program = @import("flow/program.zig");
 };
 pub const server = @import("net/server.zig");
+pub const quic = @import("net/quic.zig");
 pub const mcp = @import("net/mcp.zig");
 pub const connection = @import("net/connection.zig");
 pub const registry = @import("net/registry.zig");
@@ -47,6 +55,10 @@ test {
     _ = graph;
     _ = manifest;
     _ = checkpoint;
+    _ = lsm.codec;
+    _ = lsm.sstable;
+    _ = lsm.manifest;
+    _ = lsm.store;
     _ = evidence;
     _ = vector;
     _ = engine;
@@ -56,7 +68,9 @@ test {
     _ = flow.ast;
     _ = flow.ir;
     _ = flow.exec;
+    _ = flow.program;
     _ = server;
+    _ = quic;
     _ = mcp;
     _ = connection;
     _ = registry;

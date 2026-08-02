@@ -12,6 +12,7 @@ const manifest_mod = @import("manifest.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const evidence_mod = @import("evidence.zig");
 const vector_mod = @import("../vector.zig");
+const lsm_store = @import("lsm/store.zig");
 const commit_mod = @import("../commit/coordinator.zig");
 const txn_mod = @import("../txn/transaction.zig");
 
@@ -115,14 +116,25 @@ pub const EvidenceStats = struct {
 const modalityCount = std.enums.values(evidence_mod.Modality).len;
 const rejectReasonCount = std.enums.values(RejectReason).len;
 
-/// Single-writer storage engine: in-memory tables + WAL.
-/// Phase 0 has no SSTables yet. Table storage lives in `table.zig`;
-/// this module owns durability ordering (validate → WAL append → apply).
+/// Single-writer storage engine: in-memory tables (the LSM memtable half) +
+/// WAL + the on-disk LSM store (roadmap Phase 5). Table rows live in
+/// `table.zig`; `lsm/store.zig` materializes durable SSTable snapshots at
+/// flush/checkpoint time, and this module owns durability ordering
+/// (validate → WAL append → apply → publish).
 pub const Engine = struct {
     gpa: Allocator,
     io: Io,
     wal: wal_mod.Wal,
     payloads: evidence_mod.Store,
+    /// On-disk LSM version set (roadmap Phase 5): per-table SSTable levels and
+    /// the durable manifest. The in-memory `Table`s are the memtable half;
+    /// this store materializes durable snapshots at flush/checkpoint time.
+    lsm: lsm_store.Store,
+    /// Recovery watermark of the last LSM flush. WAL records with
+    /// `commit_seq <= lsm_watermark` are already materialized in SSTables and
+    /// are skipped during recovery replay; tables named by the LSM manifest
+    /// are rebuilt from SSTables before the WAL tail is applied.
+    lsm_watermark: u64 = 0,
     tables: std.StringHashMap(Table),
     /// Document collections (roadmap Phase 2). A name is exclusive between
     /// tables and document collections; recovery rebuilds both from the WAL.
@@ -196,11 +208,14 @@ pub const Engine = struct {
         errdefer if (!transferred) wal.deinit();
         var payloads = try evidence_mod.Store.open(io, data_dir, sync_wal);
         errdefer if (!transferred) payloads.deinit();
+        var lsm = try lsm_store.Store.open(gpa, io, data_dir);
+        errdefer if (!transferred) lsm.deinit();
         var eng: Engine = .{
             .gpa = gpa,
             .io = io,
             .wal = wal,
             .payloads = payloads,
+            .lsm = lsm,
             .tables = std.StringHashMap(Table).init(gpa),
             .documents = std.StringHashMap(document_mod.Collection).init(gpa),
             .graphs = std.StringHashMap(graph_mod.Graph).init(gpa),
@@ -236,6 +251,7 @@ pub const Engine = struct {
         for (self.observations.items) |*record| record.deinit(self.gpa);
         self.observations.deinit(self.gpa);
         self.payloads.deinit();
+        self.lsm.deinit();
         self.coordinator.deinit();
         self.snapshot_registry.deinit();
         self.wal.deinit();
@@ -270,7 +286,21 @@ pub const Engine = struct {
     }
 
     fn recover(self: *Engine) !void {
+        // Load the durable LSM version set first: its watermark defines which
+        // WAL records are already materialized, and its tables are rebuilt
+        // from SSTables before the WAL tail replays on top of them.
+        try self.lsm.loadFromDisk(self.gpa);
+        self.lsm_watermark = self.lsm.watermark;
+        self.published_commit_seq = self.lsm_watermark;
+        try self.loadLsmTables();
         try wal_mod.replayWal(&self.wal, self, applyRecord);
+        // The manifest's serial counters are authoritative for flushed tables:
+        // replayed inserts raise next_serial to max(pk)+1, which lags the
+        // live counter whenever a row was deleted before the flush.
+        try self.restoreLsmSerials();
+        // Reclaim SSTable files no version set references (interrupted flushes
+        // or compactions that crashed before their manifest edit).
+        _ = try self.lsm.reclaimOrphans(self.gpa);
         var committed = std.AutoHashMap(u64, usize).init(self.gpa);
         defer committed.deinit();
         for (self.observations.items, 0..) |record, index| try committed.put(record.evidence_id, index);
@@ -278,6 +308,63 @@ pub const Engine = struct {
         self.evidence_stats.recovery_orphans_found = reclaimed.count;
         self.evidence_stats.recovery_orphan_bytes = reclaimed.bytes;
         try self.validateManifest();
+    }
+
+    /// Rebuild every LSM-managed table from its manifest schema and SSTables:
+    /// the manifest's columns create the table, the merged SSTable entries
+    /// restore its rows (skipping delete tombstones), and the manifest's serial
+    /// counter restores its next identifier.
+    fn loadLsmTables(self: *Engine) !void {
+        var it = self.lsm.tables.iterator();
+        while (it.next()) |entry| {
+            const meta = entry.value_ptr;
+            var specs: std.ArrayList(ColumnSpec) = .empty;
+            defer specs.deinit(self.gpa);
+            try specs.ensureTotalCapacity(self.gpa, meta.columns.len);
+            for (meta.columns) |col| {
+                specs.appendAssumeCapacity(.{
+                    .name = col.name,
+                    .type_tag = col.type_tag,
+                    .primary_key = col.primary_key,
+                    .not_null = col.not_null,
+                    .unique = col.unique,
+                    .serial = col.serial,
+                    .default_expr = col.default_expr,
+                });
+            }
+            var table = try Table.create(self.gpa, meta.name, specs.items);
+            errdefer table.deinit(self.gpa);
+
+            const entries = try self.lsm.loadTableEntries(self.gpa, meta.name);
+            defer {
+                for (entries) |*e| e.deinit(self.gpa);
+                self.gpa.free(entries);
+            }
+            for (entries) |e| {
+                if (e.is_delete) continue;
+                const values = try lsm_store.decodeRowForEngine(self.gpa, e.value);
+                defer {
+                    for (values) |*v| v.deinit(self.gpa);
+                    self.gpa.free(values);
+                }
+                try table.insert(self.gpa, values, @min(e.seq, self.lsm_watermark));
+            }
+            table.next_serial = meta.next_serial;
+            try self.tables.put(table.name, table);
+        }
+    }
+
+    /// Restore the manifest serial counters after WAL replay. The manifest's
+    /// value is authoritative for identifiers retired before the flush, but
+    /// replayed post-flush inserts raise the counter further; the live counter
+    /// is the maximum of the two.
+    fn restoreLsmSerials(self: *Engine) !void {
+        var it = self.lsm.tables.iterator();
+        while (it.next()) |entry| {
+            if (self.tables.getPtr(entry.key_ptr.*)) |table| {
+                table.next_serial = @max(table.next_serial, entry.value_ptr.next_serial);
+            }
+        }
     }
 
     /// Validate the durable checkpoint manifest against the catalog rebuilt
@@ -304,12 +391,16 @@ pub const Engine = struct {
     fn applyRecord(self: *Engine, view: wal_mod.RecordView) !void {
         switch (view) {
             .txn_batch => |batch| {
+                // A batch at or below the LSM watermark is already materialized
+                // in SSTables; replaying it would duplicate its rows.
+                if (batch.commit_seq != 0 and batch.commit_seq <= self.lsm_watermark) return;
                 if (batch.commit_seq != 0 and batch.commit_seq > self.published_commit_seq) {
                     self.published_commit_seq = batch.commit_seq;
                 }
                 try wal_mod.forEachTxnBatchOp(self.gpa, batch.body, self.wal.file_version, self, applyRecord);
             },
             .set_commit_seq => |seq| {
+                if (seq <= self.lsm_watermark) return;
                 if (seq > self.published_commit_seq) self.published_commit_seq = seq;
             },
             else => try self.applyOne(view),
@@ -320,6 +411,10 @@ pub const Engine = struct {
         switch (view) {
             .txn_batch, .set_commit_seq => return error.InvalidWal,
             .create_table => |ct| {
+                // A table loaded from the LSM manifest already exists; this is
+                // the crash-window leftover of a checkpoint that flushed but
+                // did not finish its WAL rewrite.
+                if (self.tables.contains(ct.name)) return;
                 try self.registerTable(ct.name, ct.columns);
             },
             // Recovery stamps version intervals from the watermark rebuilt by
@@ -356,6 +451,10 @@ pub const Engine = struct {
             },
             .add_column => |add| {
                 const table = self.tables.getPtr(add.table) orelse return error.TableNotFound;
+                // Idempotent replay: the column may already be present because
+                // the LSM manifest captured a post-ALTER schema and the WAL
+                // rewrite of the interrupted checkpoint was never published.
+                if (table.columnIndex(add.column.name) != null) return;
                 const col: value.Column = .{
                     .name = @constCast(add.column.name),
                     .type_tag = add.column.type_tag,
@@ -371,12 +470,18 @@ pub const Engine = struct {
             },
             .drop_column => |drop| {
                 const table = self.tables.getPtr(drop.table) orelse return error.TableNotFound;
+                // Idempotent replay, mirroring `add_column`.
+                if (table.columnIndex(drop.column) == null) return;
                 try table.dropColumn(self.gpa, drop.column);
             },
             // Checkpoint-only record. Replayed inserts raise `next_serial` to
             // `max(pk)+1`; this restores the counter the instance actually
             // reached, so identifiers retired by DELETE are not handed out again.
             .set_serial => |ss| {
+                // LSM-managed tables restore their serial counter from the LSM
+                // manifest (see `restoreLsmSerials`); a leftover pre-flush
+                // record must not rewind it.
+                if (self.lsm.hasTable(ss.table)) return;
                 const table = self.tables.getPtr(ss.table) orelse return error.TableNotFound;
                 table.next_serial = ss.next_serial;
             },
@@ -1302,11 +1407,32 @@ pub const Engine = struct {
         try self.writer_mutex.lock(self.io);
         defer self.writer_mutex.unlock(self.io);
 
-        var refs: std.ArrayList(*const Table) = .empty;
-        defer refs.deinit(self.gpa);
-        try refs.ensureTotalCapacity(self.gpa, self.tables.count());
-        var it = self.tables.iterator();
-        while (it.next()) |entry| refs.appendAssumeCapacity(entry.value_ptr);
+        const watermark = self.publishedSeq();
+
+        // PK-addressable tables are materialized into L0 SSTables; the LSM
+        // manifest becomes the durable home of their schema, serial counter,
+        // and rows. Heap tables (no single-column primary key) cannot be
+        // addressed by key and stay in the rewritten WAL.
+        var heap_refs: std.ArrayList(*const Table) = .empty;
+        defer heap_refs.deinit(self.gpa);
+        try heap_refs.ensureTotalCapacity(self.gpa, self.tables.count());
+        var flushed_tables: usize = 0;
+        var flushed_rows: usize = 0;
+        var table_it = self.tables.iterator();
+        while (table_it.next()) |entry| {
+            const table = entry.value_ptr;
+            if (table.pk_index) |pk_index| {
+                const flush_stats = try self.lsm.flushTable(self.gpa, table.name, table.columns, pk_index, table.next_serial, table.rows.items, watermark);
+                flushed_tables += 1;
+                flushed_rows += @intCast(flush_stats.entries);
+            } else {
+                heap_refs.appendAssumeCapacity(table);
+            }
+        }
+        // Publish the LSM version set before rewriting the WAL so a crash
+        // between the two leaves SSTables that the (still complete) WAL tail
+        // replays on top of without duplication.
+        try self.lsm.publishManifest(self.gpa);
 
         var doc_refs: std.ArrayList(*const document_mod.Collection) = .empty;
         defer doc_refs.deinit(self.gpa);
@@ -1320,7 +1446,11 @@ pub const Engine = struct {
         var graph_it = self.graphs.iterator();
         while (graph_it.next()) |entry| graph_refs.appendAssumeCapacity(entry.value_ptr);
 
-        const stats = try checkpoint_mod.run(&self.wal, refs.items, doc_refs.items, graph_refs.items, self.observations.items, self.publishedSeq());
+        var stats = try checkpoint_mod.run(&self.wal, heap_refs.items, doc_refs.items, graph_refs.items, self.observations.items, watermark);
+        // Reported counts cover the whole checkpoint: tables flushed to SSTables
+        // plus heap tables rewritten into the WAL.
+        stats.tables += flushed_tables;
+        stats.rows += flushed_rows;
 
         // Publish the durable manifest boundary only after the WAL rewrite has
         // committed, so the manifest always describes state the rewritten WAL
@@ -1329,8 +1459,8 @@ pub const Engine = struct {
         var objects: std.ArrayList(manifest_mod.CatalogObject) = .empty;
         defer objects.deinit(self.gpa);
         try objects.ensureTotalCapacity(self.gpa, self.tables.count() + self.documents.count() + self.graphs.count());
-        var table_it = self.tables.iterator();
-        while (table_it.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .table, .name = entry.key_ptr.* });
+        var table_it2 = self.tables.iterator();
+        while (table_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .table, .name = entry.key_ptr.* });
         var doc_it2 = self.documents.iterator();
         while (doc_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .document, .name = entry.key_ptr.* });
         var graph_it2 = self.graphs.iterator();
@@ -1338,6 +1468,30 @@ pub const Engine = struct {
         const manifest = manifest_mod.Manifest{ .commit_seq = self.publishedSeq(), .objects = objects.items };
         try manifest_mod.publish(&self.wal.vfs, self.gpa, &manifest);
         return stats;
+    }
+
+    /// Flush one table into an L0 SSTable and publish the LSM manifest (the
+    /// manual FLUSH analog). The WAL keeps its frames; recovery skips batches
+    /// at or below the new watermark because their state is in the SSTable.
+    pub fn flush(self: *Engine, table_name: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
+        const pk_index = table.pk_index orelse return error.PrimaryKeyNotFound;
+        _ = try self.lsm.flushTable(self.gpa, table.name, table.columns, pk_index, table.next_serial, table.rows.items, self.publishedSeq());
+        try self.lsm.publishManifest(self.gpa);
+    }
+
+    /// Compact one table's L0 files (with overlapping L1 files) into L1.
+    pub fn compact(self: *Engine, table_name: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        _ = try self.lsm.compactTable(self.gpa, table_name);
+    }
+
+    /// Instance-wide LSM observability counters.
+    pub fn lsmStats(self: *const Engine) lsm_store.Stats {
+        return self.lsm.stats;
     }
 };
 
@@ -2159,4 +2313,360 @@ test "checkpoint publishes a durable manifest that restart validates" {
         try atomic.commit();
     }
     try std.testing.expectError(error.InvalidManifest, Engine.open(gpa, io, dir_name, true));
+}
+
+// ── LSM flush / compaction integration (roadmap Phase 5) ──
+
+test "manual flush materializes rows and restart skips the wal tail without duplicates" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-flush";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true, .serial = true },
+            .{ .name = try gpa.dupe(u8, "v"), .type_tag = .int },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 10 } });
+        try eng.insert("t", &.{ .{ .int = 2 }, .{ .int = 20 } });
+
+        // Flush publishes the LSM manifest but leaves the WAL untouched: this
+        // is the crash window between manifest publication and the WAL
+        // rewrite of a full checkpoint.
+        try eng.flush("t");
+        try std.testing.expect(eng.lsmStats().flushed_files == 1);
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("t", eng.publishedSeq());
+        defer all.deinit();
+        // Exactly the two flushed rows: pre-flush batches were skipped.
+        try std.testing.expectEqual(@as(usize, 2), all.rows.len);
+        try std.testing.expectEqual(@as(i64, 10), all.rows[0].values[1].int);
+        try std.testing.expectEqual(@as(i64, 20), all.rows[1].values[1].int);
+
+        // And a fresh serial is not reused after recovery.
+        try std.testing.expectEqual(@as(i64, 3), try eng.allocSerial("t"));
+    }
+}
+
+test "writes after a manual flush survive restart without duplication" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-flush-append";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.insert("t", &.{.{ .int = 1 }});
+        try eng.insert("t", &.{.{ .int = 2 }});
+        try eng.flush("t");
+        // Post-flush commits ride in the WAL tail.
+        try eng.insert("t", &.{.{ .int = 3 }});
+        try eng.update("t", .{ .int = 2 }, &.{.{ .int = 2 }});
+        try eng.delete("t", .{ .int = 1 });
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("t", eng.publishedSeq());
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 2), all.rows.len);
+        var by_pk = try eng.selectByPk("t", .{ .int = 2 }, eng.publishedSeq());
+        defer by_pk.deinit();
+        try std.testing.expectEqual(@as(usize, 1), by_pk.rows.len);
+        var gone = try eng.selectByPk("t", .{ .int = 1 }, eng.publishedSeq());
+        defer gone.deinit();
+        try std.testing.expectEqual(@as(usize, 0), gone.rows.len);
+    }
+}
+
+test "checkpoint after a flush reuses the lsm store and compaction reclaims space" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-compact";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+            .{ .name = try gpa.dupe(u8, "v"), .type_tag = .int },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 10 } });
+        try eng.insert("t", &.{ .{ .int = 2 }, .{ .int = 20 } });
+        try eng.flush("t");
+
+        // A second flush at the next checkpoint captures updates; the older
+        // SSTable still holds the superseded versions.
+        try eng.update("t", .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 11 } });
+        try eng.insert("t", &.{ .{ .int = 3 }, .{ .int = 30 } });
+        _ = try eng.checkpoint();
+        try std.testing.expect(eng.lsmStats().flushed_files == 2);
+
+        // Compaction merges the two L0 files into one L1 file.
+        try eng.compact("t");
+        const stats = eng.lsmStats();
+        try std.testing.expectEqual(@as(u64, 1), stats.compaction_runs);
+        try std.testing.expectEqual(@as(u64, 2), stats.files_reclaimed);
+        // One superseded version was dropped (row 1's pre-update value).
+        try std.testing.expect(stats.compaction_dropped_entries >= 1);
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("t", eng.publishedSeq());
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 3), all.rows.len);
+        var r1 = try eng.selectByPk("t", .{ .int = 1 }, eng.publishedSeq());
+        defer r1.deinit();
+        try std.testing.expectEqual(@as(i64, 11), r1.rows[0].values[1].int);
+        var r3 = try eng.selectByPk("t", .{ .int = 3 }, eng.publishedSeq());
+        defer r3.deinit();
+        try std.testing.expectEqual(@as(i64, 30), r3.rows[0].values[1].int);
+    }
+}
+
+test "lsm flush collapses alter history and retained versions like a checkpoint" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-alter";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+            .{ .name = try gpa.dupe(u8, "name"), .type_tag = .text },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+        try eng.createTable("t", &cols);
+        var a: value.Value = .{ .text = try gpa.dupe(u8, "alice") };
+        defer a.deinit(gpa);
+        try eng.insert("t", &.{ .{ .int = 1 }, a });
+        try eng.flush("t");
+
+        var extra: value.Column = .{ .name = try gpa.dupe(u8, "tier"), .type_tag = .int };
+        defer extra.deinit(gpa);
+        try eng.addColumn("t", extra, false);
+        try eng.dropColumn("t", "name", false);
+        // The ALTER records stay in the WAL; recovery replays them over the
+        // manifest's pre-ALTER schema.
+        try eng.flush("t");
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        const table = eng.getTable("t").?;
+        try std.testing.expectEqual(@as(usize, 2), table.columns.len);
+        try std.testing.expectEqualStrings("id", table.columns[0].name);
+        try std.testing.expectEqualStrings("tier", table.columns[1].name);
+        var all = try eng.selectAll("t", eng.publishedSeq());
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+    }
+}
+
+test "heap tables stay wal-backed while pk tables flush to sstables" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-heap";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("pk_t", &cols);
+        try eng.insert("pk_t", &.{.{ .int = 1 }});
+
+        var heap_cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "note"), .type_tag = .text }};
+        defer heap_cols[0].deinit(gpa);
+        try eng.createTable("heap_t", &heap_cols);
+        var note: value.Value = .{ .text = try gpa.dupe(u8, "hello") };
+        defer note.deinit(gpa);
+        try eng.insert("heap_t", &.{note});
+
+        _ = try eng.checkpoint();
+        // Only the pk table materialized into the LSM.
+        try std.testing.expectEqual(@as(usize, 1), eng.lsm.tableCount());
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var pk_rows = try eng.selectAll("pk_t", eng.publishedSeq());
+        defer pk_rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), pk_rows.rows.len);
+        var heap_rows = try eng.selectAll("heap_t", eng.publishedSeq());
+        defer heap_rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), heap_rows.rows.len);
+        try std.testing.expectEqualStrings("hello", heap_rows.rows[0].values[0].text);
+    }
+}
+
+test "text primary keys flush, compact, and recover" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-text-pk";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "key"), .type_tag = .text, .primary_key = true },
+            .{ .name = try gpa.dupe(u8, "v"), .type_tag = .int },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+        try eng.createTable("t", &cols);
+        var a: value.Value = .{ .text = try gpa.dupe(u8, "alpha") };
+        defer a.deinit(gpa);
+        var b: value.Value = .{ .text = try gpa.dupe(u8, "beta") };
+        defer b.deinit(gpa);
+        var c: value.Value = .{ .text = try gpa.dupe(u8, "gamma") };
+        defer c.deinit(gpa);
+        try eng.insert("t", &.{ a, .{ .int = 1 } });
+        try eng.insert("t", &.{ b, .{ .int = 2 } });
+        try eng.insert("t", &.{ c, .{ .int = 3 } });
+        try eng.flush("t");
+
+        try eng.update("t", b, &.{ b, .{ .int = 20 } });
+        try eng.delete("t", c);
+        _ = try eng.checkpoint();
+        try eng.compact("t");
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("t", eng.publishedSeq());
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 2), all.rows.len);
+        var beta_pk: value.Value = .{ .text = try gpa.dupe(u8, "beta") };
+        defer beta_pk.deinit(gpa);
+        var beta = try eng.selectByPk("t", beta_pk, eng.publishedSeq());
+        defer beta.deinit();
+        try std.testing.expectEqual(@as(i64, 20), beta.rows[0].values[1].int);
+        var gamma_pk: value.Value = .{ .text = try gpa.dupe(u8, "gamma") };
+        defer gamma_pk.deinit(gpa);
+        var gamma = try eng.selectByPk("t", gamma_pk, eng.publishedSeq());
+        defer gamma.deinit();
+        try std.testing.expectEqual(@as(usize, 0), gamma.rows.len);
+    }
+}
+
+test "a corrupt sstable fails recovery rather than being ignored" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-corrupt-sst";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.insert("t", &.{.{ .int = 1 }});
+        try eng.flush("t");
+    }
+    // Corrupt the first byte of the single SSTable.
+    {
+        var root = try Io.Dir.cwd().openDir(io, dir_name, .{});
+        defer root.close(io);
+        var lsm_dir = try root.openDir(io, "lsm", .{ .iterate = true });
+        defer lsm_dir.close(io);
+        var it = lsm_dir.iterate();
+        var target: ?[]const u8 = null;
+        while (try it.next(io)) |entry| {
+            if (std.mem.startsWith(u8, entry.name, "sst_")) target = entry.name;
+        }
+        const name = target orelse return error.NotFound;
+        var file = try lsm_dir.openFile(io, name, .{ .mode = .read_write });
+        defer file.close(io);
+        var byte: [1]u8 = undefined;
+        _ = try file.readPositionalAll(io, &byte, 0);
+        byte[0] ^= 0xFF;
+        try file.writePositionalAll(io, &byte, 0);
+        try file.sync(io);
+    }
+    try std.testing.expectError(error.CorruptSst, Engine.open(gpa, io, dir_name, true));
+}
+
+test "post-flush serial allocations survive recovery without reuse" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-serial";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true, .serial = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.insert("t", &.{.{ .int = 1 }});
+        try eng.flush("t"); // manifest serial = 2
+
+        // A post-flush insert raises the in-memory counter beyond the manifest.
+        try eng.insert("t", &.{.{ .int = 100 }});
+        try std.testing.expectEqual(@as(i64, 101), eng.allocSerial("t"));
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        // The replayed post-flush insert (pk 100) raised the counter to 101;
+        // a fresh allocation must continue from there, never falling back to
+        // the manifest's stale value of 2 (which would reuse pk 2).
+        try std.testing.expectEqual(@as(i64, 101), try eng.allocSerial("t"));
+    }
+}
+
+test "checkpoint flushes an empty pk table into the manifest" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-empty";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true, .serial = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+        _ = try eng.checkpoint();
+        try std.testing.expectEqual(@as(usize, 1), eng.lsm.tableCount());
+    }
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        const table = eng.getTable("t") orelse return error.NotFound;
+        try std.testing.expectEqual(@as(usize, 0), table.rows.items.len);
+        try std.testing.expectEqual(@as(i64, 1), try eng.allocSerial("t"));
+    }
 }

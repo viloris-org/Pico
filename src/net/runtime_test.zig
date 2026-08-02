@@ -809,8 +809,17 @@ test "a slow reader does not hold the engine lock and closes cleanly" {
         .stop = &stop,
     }});
 
-    // The slow Connection submits the large emit and never reads, so its
-    // handler blocks in the result send once the socket buffers fill.
+    // Hold the engine statement lock; the slow handler blocks on it, so it
+    // cannot even open its streaming program until we release. This makes the
+    // test deterministic: after release, the handler opens the program (a
+    // bounded, fast operation under the lock), releases the lock, and then
+    // blocks in the result send for the rest of the test because slow never
+    // reads and the ~30 MiB result far exceeds any pair of socket buffers.
+    try eng.lock(io);
+    var lock_held = true;
+    defer if (lock_held) eng.unlock(io);
+
+    // The slow Connection submits the large emit and never reads.
     var slow: TestClient = undefined;
     try slow.connect(gpa, io, port);
     const source = "from bigdocs\n| emit { payload }";
@@ -820,27 +829,32 @@ test "a slow reader does not hold the engine lock and closes cleanly" {
     try slow.sendFrame(.flow_source, payload[0 .. 4 + source.len]);
     try slow.writer.interface.flush();
 
-    // Observe the statement lock go busy (the handler is materializing the
-    // ~30 MiB result under the lock) and then free (it released the lock to
-    // start sending). The send cannot finish because slow never reads, so at
-    // the free moment the handler is provably blocked in the send with the
-    // lock released: a slow reader does not hold the engine lock.
-    var observed_busy = false;
+    // Give the handler time to register and reach the statement lock.
+    for (0..1000) |_| {
+        if (registry.liveCount() >= 1) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try Io.sleep(io, .fromMilliseconds(20), .awake);
+
+    // Release the lock: the handler opens its streaming program (bounded
+    // work under the lock), releases it, and blocks in the result send. The
+    // statement lock must be acquirable the whole time the handler is blocked
+    // in the send — a slow reader does not hold the engine lock, even
+    // mid-stream.
+    eng.unlock(io);
+    lock_held = false;
     var acquired = false;
     for (0..1000) |_| {
         if (eng.tryLock()) {
-            if (observed_busy) {
-                acquired = true;
-                break;
-            }
-            eng.unlock(io);
-        } else {
-            observed_busy = true;
+            acquired = true;
+            break;
         }
-        try Io.sleep(io, .fromMilliseconds(10), .awake);
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
     }
-    try std.testing.expect(observed_busy);
     try std.testing.expect(acquired);
+    eng.unlock(io);
+    try Io.sleep(io, .fromMilliseconds(5), .awake);
+    try std.testing.expect(eng.tryLock());
     eng.unlock(io);
 
     // Another Connection still makes progress while slow's send is blocked.
@@ -862,6 +876,229 @@ test "a slow reader does not hold the engine lock and closes cleanly" {
     try std.testing.expectEqual(@as(usize, 0), registry.liveCount());
 
     stop.store(true, .release);
+    const sentinel = listener.socket.address.connect(io, .{ .mode = .stream }) catch null;
+    accept_thread.join();
+    if (sentinel) |s| s.close(io);
+}
+
+// ── Streaming result production (Phase 6) ──
+
+// A relation emit larger than one batch is delivered as `ROW_DESCRIPTION`
+// followed by every row and `COMMAND_COMPLETE`, in scan order, even though
+// the server produces it in bounded batches (64 rows / 1 MiB). This verifies
+// the streaming program loop end to end over the wire.
+test "a large emit streams across batches with ordered, complete results" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-runtime-streaming";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    {
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("streamed", &cols);
+        const count: usize = 300; // five 64-row batches
+        for (0..count) |i| try eng.insert("streamed", &.{.{ .int = @intCast(i) }});
+    }
+
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var registry = registry_mod.Registry.init(gpa, io, .{});
+    defer registry.deinit();
+
+    var stop = std.atomic.Value(bool).init(false);
+    const accept_thread = try std.Thread.spawn(.{}, AcceptLoop.run, .{AcceptLoop{
+        .gpa = gpa,
+        .io = io,
+        .listener = &listener,
+        .eng = &eng,
+        .registry = &registry,
+        .stop = &stop,
+    }});
+
+    var client: TestClient = undefined;
+    try client.connect(gpa, io, port);
+    defer client.close();
+
+    const source = "from streamed\n| emit { id }";
+    var payload: [4 + 128]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], @intCast(source.len), .big);
+    @memcpy(payload[4..][0..source.len], source);
+    try client.sendFrame(.flow_source, payload[0 .. 4 + source.len]);
+    try client.writer.interface.flush();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var seen_rows: usize = 0;
+    var last: i64 = -1;
+    while (true) {
+        const frame = try readFrame(&client.reader.interface, arena.allocator());
+        switch (frame.msg_type) {
+            .row_description => {},
+            .row_data => {
+                // Each row carries exactly one non-null int cell; scan order
+                // is preserved across batches.
+                const id = try parseSingleIntColumn(frame.payload);
+                if (id != @as(u64, @intCast(last + 1))) return error.OutOfOrder;
+                last = @intCast(id);
+                seen_rows += 1;
+            },
+            .command_complete => {
+                const affected = std.mem.readInt(u64, frame.payload[0..8], .big);
+                if (affected != 300 or seen_rows != 300) return error.Protocol;
+                break;
+            },
+            else => return error.Protocol,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 300), seen_rows);
+
+    try client.goodbye();
+    for (0..1000) |_| {
+        if (registry.liveCount() == 0) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), registry.liveCount());
+
+    stop.store(true, .release);
+    const sentinel = listener.socket.address.connect(io, .{ .mode = .stream }) catch null;
+    accept_thread.join();
+    if (sentinel) |s| s.close(io);
+}
+
+// A stream already in flight is canceled at the next batch boundary: the
+// client receives the rows produced up to that point followed by the
+// delivered `CANCELED` outcome (`SERVER_ERROR` `RF1006`) — never a
+// `COMMAND_COMPLETE` — and the Connection stays usable. This is the
+// streaming half of the cancellation contract; the lock-held test above
+// covers the first-frame `RF1006` case (no rows sent yet). The seed is ~6 MiB
+// of rendered rows, far larger than any socket buffer, so the handler is
+// provably blocked in a result send when the mark is delivered: it cannot
+// have finished the stream, and rows were already in flight.
+test "a mid-stream cancel ends with RF1006 after the rows already sent" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-runtime-streaming-cancel";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    {
+        try eng.createDocument("bigdocs");
+        var text_buf: [3072]u8 = undefined;
+        @memset(&text_buf, 'x');
+        const text = try gpa.dupe(u8, &text_buf);
+        defer gpa.free(text);
+        var fields: [2]document_mod.Field = undefined;
+        fields[0] = .{ .path = try gpa.dupe(u8, "seq"), .item = .{ .int = 0 } };
+        defer gpa.free(fields[0].path);
+        fields[1] = .{ .path = try gpa.dupe(u8, "payload"), .item = .{ .text = text } };
+        defer gpa.free(fields[1].path);
+        var id_buf: [16]u8 = undefined;
+        for (0..2_000) |i| {
+            fields[0].item = .{ .int = @intCast(i) };
+            const id = std.fmt.bufPrint(&id_buf, "d{d}", .{i}) catch unreachable;
+            try eng.insertDocument("bigdocs", id, &fields);
+        }
+    }
+
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var registry = registry_mod.Registry.init(gpa, io, .{});
+    defer registry.deinit();
+
+    var stop = std.atomic.Value(bool).init(false);
+    const accept_thread = try std.Thread.spawn(.{}, AcceptLoop.run, .{AcceptLoop{
+        .gpa = gpa,
+        .io = io,
+        .listener = &listener,
+        .eng = &eng,
+        .registry = &registry,
+        .stop = &stop,
+    }});
+
+    // The target submits the large emit and never reads: its handler opens
+    // the streaming program and streams batches until the socket buffers
+    // fill, then blocks in a result send.
+    var target: TestClient = undefined;
+    try target.connect(gpa, io, port);
+    defer target.close();
+
+    const source = "from bigdocs\n| emit { payload }";
+    var payload: [4 + 128]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], @intCast(source.len), .big);
+    @memcpy(payload[4..][0..source.len], source);
+    try target.sendFrame(.flow_source, payload[0 .. 4 + source.len]);
+    try target.writer.interface.flush();
+
+    // Wait for the handler to register and to be provably blocked in the
+    // send: 6 MiB of rows cannot have been delivered into the socket buffers
+    // without reads, and the streaming program checks the mark only between
+    // batches, so the mark delivered now lands mid-stream.
+    for (0..1000) |_| {
+        if (registry.liveCount() >= 1) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try Io.sleep(io, .fromMilliseconds(100), .awake);
+
+    // A second connection delivers the cancel while the stream is in flight.
+    var canceler: TestClient = undefined;
+    try canceler.connect(gpa, io, port);
+    defer canceler.close();
+    try canceler.sendFrame(.cancel_request, &target.cancel_credential);
+    try canceler.writer.interface.flush();
+
+    // Now read: row_description and the rows already produced arrive
+    // (unblocking the handler), then the next batch boundary observes the
+    // mark and the statement ends with RF1006 — no COMMAND_COMPLETE.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var saw_header = false;
+    var saw_row = false;
+    var saw_canceled = false;
+    while (true) {
+        const frame = try readFrame(&target.reader.interface, arena.allocator());
+        switch (frame.msg_type) {
+            .row_description => saw_header = true,
+            .row_data => saw_row = true,
+            .server_error => {
+                const code = try parseServerErrorCode(frame.payload);
+                try std.testing.expectEqualStrings("RF1006", code);
+                saw_canceled = true;
+                break;
+            },
+            .command_complete => return error.Protocol,
+            else => return error.Protocol,
+        }
+    }
+    try std.testing.expect(saw_header);
+    try std.testing.expect(saw_row);
+    try std.testing.expect(saw_canceled);
+
+    // The Connection stays usable: a small follow-up statement completes.
+    const seqs = try execCollectInts(&target, gpa, "from bigdocs\n| emit { seq }\n| limit 1");
+    defer gpa.free(seqs);
+    try std.testing.expectEqual(@as(usize, 1), seqs.len);
+
+    try target.goodbye();
+    try canceler.goodbye();
+    for (0..1000) |_| {
+        if (registry.liveCount() == 0) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), registry.liveCount());
+
+stop.store(true, .release);
     const sentinel = listener.socket.address.connect(io, .{ .mode = .stream }) catch null;
     accept_thread.join();
     if (sentinel) |s| s.close(io);

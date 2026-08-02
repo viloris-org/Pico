@@ -262,16 +262,22 @@ During startup recovery:
 
 ## Current Implementation vs. Target
 
-| Feature | Phase 0 (current) | Phase 1 target | Phase 2+ target |
-|------|----------------|-------------|--------------|
-| MemTable | `ArrayList(Row)` + `HashMap` primary-key index | Ordered in-memory table (skiplist or sorted vector) | Skiplist with Bloom filter |
-| Persistence | In-memory only (WAL replay recovery) | Flush to L0 SST | Full SST levels |
-| SST format | None | Formatted SST files | Prefix compression + optional block compression |
-| Compaction | None | L0 -> L1 merge | All levels |
-| Manifest | In-engine `StringHashMap(Table)` | Persistent Manifest file | Manifest with version numbers and snapshot tracking |
-| Bloom filter | None | Optional full-key Bloom filter | Prefix Bloom filter |
-| Memory limit control | None | WriteBufferManager | Write stall |
-| Secondary indexes | `CREATE INDEX` -> `NotImplemented` | Implemented as independent LSM structures | Covering indexes (Index-Only Scan) |
+| Feature | Current slice | Target |
+|------|----------------|-------------|
+| MemTable | In-memory `Table` (rows + PK index + retained versions) remains the write and live-read front | Skiplist with Bloom filter |
+| Persistence | Flush to L0 SST (int/text single-column PK tables) | Full SST levels |
+| SST format | Block-indexed SSTables with per-block CRC (`lsm/sstable.zig`) | Prefix compression + optional block compression |
+| Compaction | L0 + overlapping L1 -> sorted non-overlapping L1 (`lsm/store.zig`) | Size-tiered all-level compaction |
+| Manifest | Versioned LSM version-set manifest, atomically rewritten (`lsm/manifest.zig`) | Append-style version_edit records with snapshot tracking |
+| Bloom filter | None | Optional full-key Bloom filter |
+| Memory limit control | None | WriteBufferManager / write stall |
+| Secondary indexes | Not implemented | Independent LSM structures, then covering indexes (Index-Only Scan) |
+
+The write path is WAL -> in-memory table; flush materializes a durable
+snapshot of the table's live rows (with tombstones for keys that were live in
+earlier SSTables but are no longer live) into L0, and the checkpoint rewrites
+the WAL to exclude flushed rows. Recovery loads the LSM manifest and its
+SSTables first, then replays only the WAL tail past the flush watermark.
 
 ---
 

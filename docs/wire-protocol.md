@@ -37,6 +37,13 @@ without changing shared state. A framed Request with an invalid payload returns
 4. Server responds with `ROW_DESCRIPTION` (`0x11`), zero or more `ROW_DATA`
    (`0x12`) messages, and `COMMAND_COMPLETE` (`0x13`), or with `SERVER_ERROR`
    (`0x14`). The initial Flow slice's successful completion tag is `EMIT`.
+   Result production is streamed: the Server produces bounded batches of rows
+   (a bounded row count and byte budget per batch) and flushes each batch
+   before producing the next, so a slow reader never forces the whole result
+   to be materialized. A statement that ends in error after `ROW_DESCRIPTION`
+   has been sent — for example, a cancellation delivered mid-stream — sends
+   `SERVER_ERROR` after the rows already produced; that error is the
+   statement's terminal message, and no `COMMAND_COMPLETE` follows.
 5. At any point after the handshake, a client may send `CANCEL_REQUEST`
    (`0x30`) with the 16-byte credential of another live Connection to request
    cooperative cancellation of that Connection's currently executing statement
@@ -69,7 +76,13 @@ observe the mark between bounded work units. With the Phase 6 concurrent
 listener, each Connection runs on its own thread and the `emit` scan paths check
 the mark between rows, so a `CANCEL_REQUEST` delivered while a statement is
 scanning aborts that statement at the next row boundary and the Server returns
-`SERVER_ERROR` with code `RF1006` — the delivered `CANCELED` outcome. The
+`SERVER_ERROR` with code `RF1006` — the delivered `CANCELED` outcome. Because
+result production is streamed in bounded batches, the cancel is observed at the
+next row boundary inside the current batch and at the next batch boundary
+between sends: if the mark lands before the first batch, `RF1006` is the first
+frame of the statement (no rows are sent); if the stream is already in flight,
+the client receives the rows produced up to the boundary followed by `RF1006`
+as the statement's terminal message — never a `COMMAND_COMPLETE`. The
 Connection stays usable: its next statement starts on a fresh generation. Before
 the irreversible commit
 point, a cancelled transaction discards its private write set and any queued

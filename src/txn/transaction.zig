@@ -224,7 +224,14 @@ pub const Transaction = struct {
         errdefer self.gpa.free(ops);
         for (self.write_set.items, 0..) |*op, i| {
             switch (op.op) {
-                .insert => ops[i] = .{ .insert = .{ .table = op.table, .values = op.values } },
+                .insert => {
+                    ops[i] = .{ .insert = .{ .table = op.table, .values = op.values } };
+                    // The insert's primary key lives inside `values`; the
+                    // separate shadow copy (for same-round conflict checks) is
+                    // released here since the WAL op does not carry it.
+                    var shadow_pk = op.pk;
+                    shadow_pk.deinit(self.gpa);
+                },
                 .update => ops[i] = .{ .update = .{ .table = op.table, .pk = op.pk, .values = op.values } },
                 .delete => ops[i] = .{ .delete = .{ .table = op.table, .pk = op.pk } },
             }

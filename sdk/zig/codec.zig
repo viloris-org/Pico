@@ -1,11 +1,14 @@
-//! RunaDB wire protocol codec — read/write protocol messages to a stream.
-//! Used by the client library. The server handler uses its own read/write
-//! but consumes clint_proto type definitions.
+//! RunaDB wire protocol codec — read/write protocol messages over a byte
+//! stream. Used by the RunaDB Zig SDK (`sdk/zig/`). The server handler has
+//! its own read/write but consumes `clint_proto` type definitions.
+//!
+//! The codec is transport-agnostic: it operates on a `Stream`, an opaque
+//! bidirectional byte stream. TCP provides one stream per Connection; QUIC
+//! provides the control stream plus one stream per request (ADR-0023 §2.1).
 
 const std = @import("std");
 const proto = @import("clint_proto");
 const Allocator = std.mem.Allocator;
-const Io = std.Io;
 
 pub const ProtocolError = error{
     UnexpectedEof,
@@ -16,7 +19,57 @@ pub const ProtocolError = error{
     StringTooLarge,
     EndOfStream,
     ReadFailed,
+    Timeout,
+    ConnectionClosed,
+    ConnectionReset,
+    QuicUnavailable,
+    QuicRejected,
+    HandshakeTimeout,
+    CertificateMismatch,
+    UnsupportedAddress,
+    StatementInProgress,
 } || Allocator.Error;
+
+/// An opaque bidirectional byte stream carrying RunaDB Wire Protocol
+/// messages. The vtable functions are provided by the transport
+/// implementation (TCP or QUIC).
+pub const Stream = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Read exactly `buf.len` bytes. Errors: `EndOfStream` (peer finished
+        /// the stream before `buf.len` bytes), `Timeout`, `ConnectionReset`,
+        /// `ConnectionClosed`, `ReadFailed`.
+        readAll: *const fn (ctx: *anyopaque, buf: []u8) anyerror!void,
+        /// Write bytes. May buffer; call `flush` to send.
+        writeAll: *const fn (ctx: *anyopaque, bytes: []const u8) anyerror!void,
+        /// Send any buffered bytes.
+        flush: *const fn (ctx: *anyopaque) anyerror!void,
+        /// Half-close the send side. No-op on transports without half-close
+        /// (TCP: the Connection owns stream lifetime).
+        fin: *const fn (ctx: *anyopaque) anyerror!void,
+        /// Release the stream (QUIC: free the raw-app slot; TCP: no-op —
+        /// closing the Connection closes its single stream).
+        close: *const fn (ctx: *anyopaque) void,
+    };
+
+    pub fn readAll(self: Stream, buf: []u8) anyerror!void {
+        return self.vtable.readAll(self.ptr, buf);
+    }
+    pub fn writeAll(self: Stream, bytes: []const u8) anyerror!void {
+        return self.vtable.writeAll(self.ptr, bytes);
+    }
+    pub fn flush(self: Stream) anyerror!void {
+        return self.vtable.flush(self.ptr);
+    }
+    pub fn fin(self: Stream) anyerror!void {
+        return self.vtable.fin(self.ptr);
+    }
+    pub fn close(self: Stream) void {
+        self.vtable.close(self.ptr);
+    }
+};
 
 pub const Message = union(enum) {
     hello_ok: struct {
@@ -57,9 +110,10 @@ pub const Message = union(enum) {
 
 /// Read one protocol message from a stream.
 /// Caller owns allocated memory (strings are arena-allocated from arena).
-pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
+pub fn readMessage(arena: Allocator, stream: Stream) ProtocolError!Message {
     // Read header: 4-byte length + 1-byte type
-    const header = try reader.takeArray(proto.HEADER_SIZE);
+    var header: [proto.HEADER_SIZE]u8 = undefined;
+    stream.readAll(&header) catch |err| return mapReadError(err);
     const body_len = std.mem.readInt(u32, header[0..4], .big);
     if (body_len < 1) return error.Protocol;
     if (body_len > proto.MAX_BODY_LENGTH) return error.MessageTooLarge;
@@ -68,8 +122,7 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
     const payload_len: usize = @intCast(body_len - 1);
     const payload = try arena.alloc(u8, payload_len);
     if (payload_len > 0) {
-        const body = try reader.take(payload_len);
-        @memcpy(payload, body);
+        stream.readAll(payload) catch |err| return mapReadError(err);
     }
     var pos: usize = 0;
 
@@ -181,17 +234,44 @@ pub fn readMessage(arena: Allocator, reader: anytype) ProtocolError!Message {
     return message;
 }
 
-/// Write a protocol message to a stream.
-pub fn writeMessage(writer: *Io.Writer, msg_type: proto.Type, payload: []const u8) !void {
+/// Map a stream read error onto the protocol error set.
+fn mapReadError(err: anyerror) ProtocolError {
+    return switch (err) {
+        error.EndOfStream => error.EndOfStream,
+        error.Timeout => error.Timeout,
+        error.ConnectionReset => error.ConnectionReset,
+        error.ConnectionClosed => error.ConnectionClosed,
+        error.QuicUnavailable => error.QuicUnavailable,
+        error.QuicRejected => error.QuicRejected,
+        error.HandshakeTimeout => error.HandshakeTimeout,
+        error.CertificateMismatch => error.CertificateMismatch,
+        error.UnsupportedAddress => error.UnsupportedAddress,
+        else => error.ReadFailed,
+    };
+}
+
+/// Write a protocol message to a stream. The caller is responsible for
+/// flushing when the request is complete.
+pub fn writeMessage(stream: Stream, msg_type: proto.Type, payload: []const u8) ProtocolError!void {
     if (payload.len > proto.MAX_BODY_LENGTH - 1) return error.MessageTooLarge;
     const body_len: u32 = @intCast(1 + payload.len); // type byte + payload
     var header: [5]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], body_len, .big);
     header[4] = @intFromEnum(msg_type);
-    try writer.writeAll(&header);
+    stream.writeAll(&header) catch |err| return mapWriteError(err);
     if (payload.len > 0) {
-        try writer.writeAll(payload);
+        stream.writeAll(payload) catch |err| return mapWriteError(err);
     }
+}
+
+fn mapWriteError(err: anyerror) ProtocolError {
+    return switch (err) {
+        error.ConnectionClosed => error.ConnectionClosed,
+        error.ConnectionReset => error.ConnectionReset,
+        error.QuicUnavailable => error.QuicUnavailable,
+        error.Timeout => error.Timeout,
+        else => error.ReadFailed,
+    };
 }
 
 // ── String wire format: u32(BE) len + bytes ──
@@ -208,13 +288,13 @@ fn readString(arena: Allocator, buf: []const u8, pos: *usize) ProtocolError![]co
     return slice;
 }
 
-pub fn writeString(writer: anytype, s: []const u8) !void {
+pub fn writeString(stream: Stream, s: []const u8) !void {
     if (s.len > proto.MAX_STRING_LENGTH) return error.StringTooLarge;
     const len: u32 = @intCast(s.len);
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, len, .big);
-    try writer.writeAll(&len_buf);
-    try writer.writeAll(s);
+    try stream.writeAll(&len_buf);
+    try stream.writeAll(s);
 }
 
 /// Build a hello payload.
@@ -225,6 +305,58 @@ pub fn buildHelloPayload(allocator: Allocator) ![]u8 {
     return payload;
 }
 
+// ── Tests ──
+
+/// In-memory byte stream used by codec tests (and connection tests): reads
+/// from `input`, writes are appended to `sink`.
+pub const TestStream = struct {
+    input: []const u8,
+    pos: usize = 0,
+    sink: std.ArrayList(u8) = .empty,
+    allocator: Allocator,
+    closed: bool = false,
+
+    pub fn init(input: []const u8, allocator: Allocator) TestStream {
+        return .{ .input = input, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *TestStream) void {
+        self.sink.deinit(self.allocator);
+    }
+
+    fn readAll(ctx: *anyopaque, buf: []u8) anyerror!void {
+        const self: *TestStream = @ptrCast(@alignCast(ctx));
+        if (self.pos + buf.len > self.input.len) return error.EndOfStream;
+        @memcpy(buf, self.input[self.pos..][0..buf.len]);
+        self.pos += buf.len;
+    }
+    fn writeAll(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *TestStream = @ptrCast(@alignCast(ctx));
+        try self.sink.appendSlice(self.allocator, bytes);
+    }
+    fn flush(ctx: *anyopaque) anyerror!void {
+        _ = ctx;
+    }
+    fn fin(ctx: *anyopaque) anyerror!void {
+        _ = ctx;
+    }
+    fn closeFn(ctx: *anyopaque) void {
+        const self: *TestStream = @ptrCast(@alignCast(ctx));
+        self.closed = true;
+    }
+
+    pub fn stream(self: *TestStream) Stream {
+        const vtable = Stream.VTable{
+            .readAll = readAll,
+            .writeAll = writeAll,
+            .flush = flush,
+            .fin = fin,
+            .close = closeFn,
+        };
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
 test "codec decodes a complete command response" {
     const bytes = [_]u8{
         0,   0,   0,   19,  @intFromEnum(proto.Type.command_complete),
@@ -233,11 +365,12 @@ test "codec decodes a complete command response" {
         0,   6,   'I', 'N', 'S',
         'E', 'R', 'T',
     };
-    var reader: Io.Reader = .fixed(&bytes);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var ts = TestStream.init(&bytes, std.testing.allocator);
+    defer ts.deinit();
 
-    const message = try readMessage(arena.allocator(), &reader);
+    const message = try readMessage(arena.allocator(), ts.stream());
     switch (message) {
         .command_complete => |complete| {
             try std.testing.expectEqual(@as(u64, 3), complete.affected_rows);
@@ -264,20 +397,56 @@ test "codec rejects malformed message payloads" {
     };
 
     for (cases) |case| {
-        var reader: Io.Reader = .fixed(case.bytes);
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        try std.testing.expectError(case.expected, readMessage(arena.allocator(), &reader));
+        var ts = TestStream.init(case.bytes, std.testing.allocator);
+        defer ts.deinit();
+        try std.testing.expectError(case.expected, readMessage(arena.allocator(), ts.stream()));
+    }
+}
+
+test "codec round-trips a message through write then read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts = TestStream.init("", std.testing.allocator);
+    defer ts.deinit();
+
+    // command_complete payload: affected_rows (u64 BE) + length-prefixed tag.
+    var payload: [8 + 4 + 8]u8 = undefined;
+    std.mem.writeInt(u64, payload[0..8], 3, .big);
+    std.mem.writeInt(u32, payload[8..12], 8, .big);
+    @memcpy(payload[12..], "SELECT 3");
+    try writeMessage(ts.stream(), .command_complete, &payload);
+
+    // Feed the captured bytes back in and decode.
+    var reader = TestStream.init(ts.sink.items, std.testing.allocator);
+    defer reader.deinit();
+    const message = try readMessage(arena.allocator(), reader.stream());
+    switch (message) {
+        .command_complete => |complete| {
+            try std.testing.expectEqual(@as(u64, 3), complete.affected_rows);
+            try std.testing.expectEqualStrings("SELECT 3", complete.tag);
+        },
+        else => return error.TestUnexpectedResult,
     }
 }
 
 test "codec rejects oversized outbound frames before writing" {
     var payload: [proto.MAX_BODY_LENGTH]u8 = undefined;
-    var output: [1]u8 = undefined;
-    var writer: Io.Writer = .fixed(&output);
+    var ts = TestStream.init("", std.testing.allocator);
+    defer ts.deinit();
 
     try std.testing.expectError(
         error.MessageTooLarge,
-        writeMessage(&writer, .goodbye, &payload),
+        writeMessage(ts.stream(), .goodbye, &payload),
     );
+}
+
+test "stream reports end-of-stream on truncated input" {
+    const bytes = [_]u8{ 0, 0, 0, 10, @intFromEnum(proto.Type.row_description), 0, 1 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts = TestStream.init(&bytes, std.testing.allocator);
+    defer ts.deinit();
+    try std.testing.expectError(error.EndOfStream, readMessage(arena.allocator(), ts.stream()));
 }
