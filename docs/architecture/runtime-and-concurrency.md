@@ -12,9 +12,11 @@ identity, statement generation, and cancellation mark; `src/net/registry.zig` is
 credential → Connection table used for constant-time cancellation routing; and
 `CANCEL_REQUEST` is a wire-protocol contract with official-client and malformed-input coverage.
 Because the listener is sequential, a `CANCEL_REQUEST` from another Connection is delivered
-only between statements today (a no-op by design); concurrent mid-statement delivery,
-admission, commit queues, and I/O scheduling become implementation guarantees only after the
-Phase 6 runtime and its regressions land.
+only between statements today (a no-op by design); the registry counts those as no-ops, and
+a `hit` requires a statement actually executing. A malformed `CANCEL_REQUEST` is a protocol
+error: the Server replies `CN1001` and closes the Connection. Concurrent mid-statement
+delivery, admission, commit queues, and I/O scheduling become implementation guarantees only
+after the Phase 6 runtime and its regressions land.
 
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 
@@ -29,7 +31,7 @@ defines their ownership and scheduling boundaries in the connection, queue, and 
 
 ## RunaDB Runtime Boundary
 
-Each RunaDB **connection** owns protocol, cancellation, session, and input/output quota state. The runtime owns connection registration, admission, bounded queues, and controlled callback execution. A cancellation mark applies only to the current statement and is observed at defined cancellation points. The single writer serializes commit publication and watermark advancement; snapshot and reclamation boundaries remain independently verifiable. RunaDB does not expose an embedded API threading model, a multi-process lock manager, or a platform-specific I/O runtime as product contracts.
+Each RunaDB **connection** owns protocol, cancellation, session, and input/output quota state. The runtime owns connection registration, admission, bounded queues, and controlled callback execution. A cancellation mark applies only to the statement generation observed when routing and is observed at defined cancellation points. The single writer serializes commit publication and watermark advancement; snapshot and reclamation boundaries remain independently verifiable. RunaDB does not expose an embedded API threading model, a multi-process lock manager, or a platform-specific I/O runtime as product contracts.
 
 The ownership split gives connection loss a deterministic meaning. Before the irreversible commit point, closing a connection abandons its statement and private write set. After that point, the single writer finishes the WAL and publication work even if there is no connection left to receive the result. This avoids both false success (a response without durable publication) and false rollback (claiming that a confirmed change was undone because the client disconnected).
 
@@ -90,7 +92,12 @@ drain the socket or wait for `commit` before reclaiming the registration.
 
 Cancellation is a cooperative request to stop the current statement, not a rollback of a
 committed transaction, a change to commit order, or instance shutdown. Increment the statement
-generation on each `ready -> executing` transition and clear its flag. Parsing, scanning,
+generation on each `ready -> executing` transition and clear its flag. In `src/net/connection.zig`
+the generation, the executing flag, and the mark are one atomic word: statement entry, statement
+exit, and the router's mark are each a single compare-and-swap, so a mark is bound to the
+generation the router observed and a cancel that races a statement boundary (the Connection goes
+idle or starts its next statement between the router's read and the mark) is a no-op rather than
+an abort of the later statement. Parsing, scanning,
 result streaming, commit-queue waits, and pre-WAL-sync execution must inspect the flag between
 bounded work units.
 

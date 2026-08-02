@@ -12,7 +12,7 @@ multiple data models, multimodal values, AI-assisted execution, continuum-scale
 deployment, long-lived history, privacy, and sustainable operation. This
 roadmap begins with the recoverable single-instance OLTP foundation, then moves
 the public request boundary to Runa Flow, Runa Query IR, and a semantic model as
-defined by ADR-0017. RunaDB Wire Protocol v2 has removed the legacy SQL and
+defined by ADR-0017. RunaDB Wire Protocol v3 has removed the legacy SQL and
 PostgreSQL endpoints. RunaDB Client and RunaDB Server communicate only through
 versioned protocol definitions and the public error model. PostgreSQL
 compatibility and treating a checkpoint as a backup remain out of scope;
@@ -33,12 +33,12 @@ capabilities exist but are not collectively a release claim:
 | --- | --- | --- |
 | Runa Flow | Read-only relation projection from source or canonical Runa Query IR | [Runa Flow](docs/runa-flow.md) |
 | Persistence | WAL-backed table changes, CRC32 validation, and recovery of a valid committed prefix | [WAL and crash recovery](docs/architecture/wal-and-recovery.md) |
-| Native client path | RunaDB Wire Protocol v2 over sequential TCP and a RunaDB Zig client integration suite | [RunaDB Wire Protocol v2](docs/wire-protocol.md) |
-| Observation Evidence | Immutable evidence ingestion, metadata inspection, bounded payload retrieval, checkpoint retention, restart recovery, orphan reclamation, and startup rejection of corrupt committed payloads through the official RunaDB Client | [Runa Flow](docs/runa-flow.md), [Wire Protocol v2](docs/wire-protocol.md), [ADR-0019](docs/adr/0019-observation-evidence-payload-storage.md) |
+| Native client path | RunaDB Wire Protocol v3 over sequential TCP and a RunaDB Zig client integration suite | [RunaDB Wire Protocol v3](docs/wire-protocol.md) |
+| Observation Evidence | Immutable evidence ingestion, metadata inspection, bounded payload retrieval, checkpoint retention, restart recovery, orphan reclamation, and startup rejection of corrupt committed payloads through the official RunaDB Client | [Runa Flow](docs/runa-flow.md), [Wire Protocol v3](docs/wire-protocol.md), [ADR-0019](docs/adr/0019-observation-evidence-payload-storage.md) |
 | MCP stdio adapter | Opt-in `--mcp-stdio` process mode serving the read-only `runadb_flow_emit` tool over MCP `2025-11-25` JSON-RPC | [ADR-0021](docs/adr/0021-native-mcp-stdio-adapter.md) |
 | Transaction semantics | Single-writer commit coordinator, `txn` write sets with commit/rollback, group commit, observed-version write-write conflict detection, and a recovered commit watermark | [Write Path and WriteBatch](docs/architecture/write-path.md), [Concurrency Control](docs/architecture/concurrency-control.md) |
 | Target architecture | LSM storage, MVCC, single-writer commits, group commit, VFS, Pager, execution programs, and asynchronous runtime boundaries are designed but not all implemented | [Architecture](docs/ARCHITECTURE.md) |
-| Public development contract | Runa Flow, Runa Query IR, semantic model revision `0`, and RunaDB Wire Protocol v2 | [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md) |
+| Public development contract | Runa Flow, Runa Query IR, semantic model revision `0`, and RunaDB Wire Protocol v3 | [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md) |
 | Accepted later work | Interactive RunaDB Client, Ed25519 authentication and permissions, and QUIC transport | [ADRs](docs/adr/) |
 | Frozen internal slice | `runadb.vector` column ranking and vector WAL values remain implemented in-process but are not exposed through Runa Flow, Runa Query IR, or the wire protocol; deprecated and permanently frozen | [ADR-0020](docs/adr/0020-embedding-and-vector-retrieval-primitives.md) |
 
@@ -97,7 +97,7 @@ format migration, observability, recovery, and evidence requirements.
 client APIs, and protocol v0.1 endpoint have been removed.
 
 **Exit evidence:** The build graph contains no SQL or PostgreSQL protocol
-module; Wire Protocol v2 rejects old peers by major version; current public
+module; Wire Protocol v3 rejects old peers by major version; current public
 documentation describes only Flow/IR request execution.
 
 ### Phase 1: Runa Flow Contract and Protocol Major
@@ -130,7 +130,7 @@ because its source syntax or IR shape exists.
 before adding mutations or declaring multiple data models supported.
 
 **Status:** The relation slice and the Observation Evidence slice (ADR-0019) are
-implemented through the official RunaDB Client as a protocol v2 development
+implemented through the official RunaDB Client as a protocol v3 development
 capability, including immutable evidence ingestion, metadata inspection, bounded
 payload retrieval, checkpoint retention, restart recovery, orphan reclamation,
 and startup rejection of corrupt committed payloads. The opt-in MCP stdio
@@ -170,11 +170,14 @@ isolation-level definition in `docs/architecture/concurrency-control.md` — is
 implemented and deterministically tested at the engine level; it is not yet
 exposed through the wire protocol. Connection-level cancellation delivery is
 implemented at its ownership boundaries: the coordinator withdraws queued
-commit requests before a commit sequence is assigned and terminates marked
-requests before the WAL durability boundary; a per-connection cancellation
+commit requests before a commit sequence is assigned and terminates in-round
+marked requests deterministically at admission; a per-connection cancellation
 state machine and a bounded credential registry own the mark and its routing;
 and `CANCEL_REQUEST` is a wire-protocol contract with deterministic engine,
-unit, and official-client integration coverage. Deterministic tests now cover
+unit, and official-client integration coverage. In the sequential listener a
+`CANCEL_REQUEST` is delivered only between statements (a no-op by design);
+mid-statement delivery, including the delivered `CANCELED` outcome, is the Phase
+6 guarantee. Deterministic tests now cover
 autocommit, multi-statement commit, rollback, failed transactions, visibility,
 conflicts, cancellation, and bounded contention. The remaining items below are
 production support verification and the concurrent mid-statement cancellation

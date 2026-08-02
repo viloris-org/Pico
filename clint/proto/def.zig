@@ -1,16 +1,27 @@
 //! RunaDB Wire Protocol — shared message type definitions.
 //! Used by both RunaDB Server (src/net/runadb.zig) and RunaDB Client (clint/).
-//! Version: v2.0 (development contract; incompatible with the retired SQL endpoint).
+//! Version: v3.0 (development contract; incompatible with the retired SQL endpoint).
 
-pub const PROTOCOL_VERSION_MAJOR: u16 = 2;
+/// The major version negotiated in HELLO. A peer whose major differs is
+/// rejected with HELLO_ERROR before any v3-only framing is parsed, so a v2
+/// peer can never misparse the trailing credential that v3 HELLO_OK appends.
+pub const PROTOCOL_VERSION_MAJOR: u16 = 3;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
 pub const IR_FORMAT_VERSION: u16 = 4;
+
+/// HELLO_OK (server -> client) layout — the shared parsing contract. The body
+/// is a length-prefixed server version string, then exactly
+/// CANCEL_CREDENTIAL_LENGTH bytes of cancellation credential, in that order
+/// with nothing after. The Server writes them in this order (sendHelloOk in
+/// src/net/runadb.zig) and the Client reads them in this order (readMessage in
+/// clint/zig/codec.zig), so both must change together if this layout does.
 
 /// Message type identifiers.
 pub const Type = enum(u8) {
     /// Client → Server: initiates connection, carries protocol version.
     hello = 0x01,
-    /// Server → Client: accepts connection, carries server version string.
+    /// Server → Client: accepts connection; carries the server version string
+    /// followed by the Connection's CANCEL_CREDENTIAL_LENGTH-byte credential.
     hello_ok = 0x02,
     /// Server → Client: rejects connection with a reason.
     hello_error = 0x03,
@@ -41,8 +52,10 @@ pub const Type = enum(u8) {
 
     /// Client -> Server: requests cooperative cancellation of the statement
     /// currently executing on the Connection named by the credential.
-    /// Fire-and-forget: the Server never replies. Unknown, mismatched, closed,
-    /// or expired credentials finish as a no-op.
+    /// Fire-and-forget: the Server never replies to a well-formed request.
+    /// Unknown, mismatched, closed, or expired credentials finish as a no-op.
+    /// A malformed payload is a protocol error: the Server replies with CN1001
+    /// and closes the Connection.
     cancel_request = 0x30,
 
     /// Either side: clean close.

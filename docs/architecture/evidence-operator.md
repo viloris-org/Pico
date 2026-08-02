@@ -1,6 +1,6 @@
 # Evidence Operator Contract
 
-Status: Implemented at the engine level as a protocol v2 development capability.
+Status: Implemented at the engine level as a protocol v3 development capability.
 The metrics, quotas, and staged-upload accounting below are enforced and counted
 by RunaDB Server. Exposing them through an operator request surface is
 administration-request work (roadmap Phase 7); until then they are readable

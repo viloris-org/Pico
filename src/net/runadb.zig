@@ -61,12 +61,8 @@ pub fn handleConnection(
     const w = &writer.interface;
 
     var conn = connection_mod.State.init(0, credential);
-    registry.register(&conn) catch |err| {
-        try sendHelloError(w, "instance connection table full");
-        try w.flush();
-        return err;
-    };
-    defer registry.unregister(&conn);
+    var registered = false;
+    defer if (registered) registry.unregister(&conn);
 
     // ── Handshake: read HELLO ──
     {
@@ -82,6 +78,23 @@ pub fn handleConnection(
             return error.VersionMismatch;
         }
         _ = minor;
+
+        // Register only after the version check: a peer that never completes
+        // the handshake, or is rejected on version, must not hold a slot in
+        // the bounded connection table. The credential is delivered in
+        // HELLO_OK immediately after, so no cancel can arrive before this
+        // registration. Admission errors are reported distinctly: capacity
+        // exhaustion is not an allocation failure.
+        registry.register(&conn) catch |err| {
+            try sendHelloError(w, switch (err) {
+                error.RegistryFull => "instance connection table full",
+                error.OutOfMemory => "instance out of memory",
+                else => "connection rejected",
+            });
+            try w.flush();
+            return err;
+        };
+        registered = true;
 
         try sendHelloOk(w, conn.credential);
         try w.flush();
@@ -102,13 +115,21 @@ pub fn handleConnection(
             else => return err,
         };
 
-        // Each frame after the handshake is a statement boundary: a fresh
-        // generation clears any stale cancellation mark, so a cancel delivered
-        // while idle never aborts a later statement.
-        conn.beginStatement();
-
         switch (msg_type) {
             .flow_source => {
+                // Statement start: a fresh generation clears any stale mark so
+                // a cancel delivered while idle never aborts this statement.
+                // Entry and exit are single atomic transitions on the
+                // connection state, and the cooperative check is the Phase 6
+                // seam; in the sequential listener a cancel is delivered only
+                // between statements, so these never fire here.
+                conn.beginStatement();
+                defer conn.endStatement();
+                conn.checkCancelled() catch |err| {
+                    try sendError(w, 2, "RF1002", @errorName(err));
+                    try w.flush();
+                    continue;
+                };
                 var pos: usize = 0;
                 const source = readStringFromPayload(payload, &pos) catch {
                     try sendError(w, 2, "RF1000", "invalid Runa Flow source payload");
@@ -141,6 +162,14 @@ pub fn handleConnection(
                 try w.flush();
             },
             .flow_ir => {
+                // Statement start (see .flow_source for the Phase 6 seam note).
+                conn.beginStatement();
+                defer conn.endStatement();
+                conn.checkCancelled() catch |err| {
+                    try sendError(w, 2, "RF1002", @errorName(err));
+                    try w.flush();
+                    continue;
+                };
                 if (payload.len < 2) {
                     try sendError(w, 2, "RF1003", "invalid Runa Query IR payload");
                     try w.flush();
@@ -286,14 +315,16 @@ pub fn handleConnection(
                 attachment = null;
             },
             .cancel_request => {
-                // Fire-and-forget: no response frame is defined. Missing,
-                // mismatched, closed, or expired credentials finish as a
-                // no-op; only the observability counters change. A malformed
-                // payload is a request error that leaves the Connection usable.
+                // Fire-and-forget: no response frame is defined for a
+                // well-formed request. Missing, mismatched, closed, or expired
+                // credentials finish as a no-op; only the observability
+                // counters change. A malformed payload is a protocol error:
+                // the Server replies CN1001 and closes the Connection, so the
+                // error can never be misattributed to a later pipelined frame.
                 if (payload.len != proto.CANCEL_CREDENTIAL_LENGTH) {
                     try sendError(w, 2, "CN1001", "malformed cancel request payload");
                     try w.flush();
-                    continue;
+                    return;
                 }
                 var credential_bytes: [proto.CANCEL_CREDENTIAL_LENGTH]u8 = undefined;
                 @memcpy(&credential_bytes, payload);

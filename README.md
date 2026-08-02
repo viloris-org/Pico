@@ -11,7 +11,7 @@ service. It is one of two independently released RunaDB products; RunaDB Client
 provides the CLI, drivers, and developer tools.
 
 Runa Flow is RunaDB's native public request language. The implemented Wire
-Protocol v2.0 development slice accepts `from <relation> | where <predicate>
+Protocol v3.0 development slice accepts `from <relation> | where <predicate>
 | emit { <field> }` as source or canonical Runa Query IR. It also supports
 immutable Observation Evidence ingestion, metadata inspection, and bounded
 payload retrieval through the official RunaDB Client. SQL text is not an
@@ -153,7 +153,7 @@ currently implemented components.
 
 - [Documentation standard](docs/DOCUMENTATION.md)
 - [Runa Flow and Runa Query IR](docs/runa-flow.md)
-- [RunaDB Wire Protocol v2.0](docs/wire-protocol.md)
+- [RunaDB Wire Protocol v3.0](docs/wire-protocol.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Architecture decision records](docs/adr/)
 - [Domain terminology and product constraints](CONTEXT.md)

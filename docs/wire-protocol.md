@@ -1,4 +1,4 @@
-# RunaDB Wire Protocol v2.0
+# RunaDB Wire Protocol v3.0
 
 Status: Implemented development contract. This native TCP protocol is the
 incompatible successor to the removed SQL-text v0.1 endpoint. It does not
@@ -7,9 +7,12 @@ promise compatibility with the PostgreSQL Frontend/Backend Protocol.
 ## Compatibility
 
 The protocol version is a `(major, minor)` pair. The checked-out Server and
-Client implement `2.0`. A `HELLO` with a major other than `2` receives
+Client implement `3.0`. A `HELLO` with a major other than `3` receives
 `HELLO_ERROR` with `unsupported protocol version`, then the Connection closes.
-Minor-version compatibility has not yet been defined.
+Minor-version compatibility has not yet been defined. The major bump from `2`
+to `3` is the negotiated surface for the cancellation credential that `HELLO_OK`
+now appends: a `v2` peer is rejected at the version check before that framing is
+parsed, so it never sees an ambiguous trailing-payload error.
 
 ## Framing
 
@@ -47,28 +50,37 @@ this version.
 
 `CANCEL_REQUEST` (`0x30`) carries the 16-byte credential delivered in
 `HELLO_OK`. The Server looks the credential up in its bounded connection table
-and marks the named Connection's current statement; the executing statement
-stops at its next cooperative cancellation point with a `CANCELED` outcome.
-Delivery is fire-and-forget: the Server never replies to a `CANCEL_REQUEST`.
-Missing, mismatched, closed, or expired credentials finish as a protocol no-op;
-only the Server's observability counters change. A payload that is not exactly
-16 bytes is a malformed request: the Server returns `SERVER_ERROR` with code
-`CN1001` and leaves the sending Connection available for another Request.
+and, when the named Connection has a statement executing, marks that statement
+for cooperative cancellation. Delivery is fire-and-forget: the Server never
+replies to a well-formed `CANCEL_REQUEST`. Missing, mismatched, closed, or
+expired credentials finish as a protocol no-op; only the Server's observability
+counters change. A payload that is not exactly 16 bytes is a malformed request:
+the Server returns `SERVER_ERROR` with code `CN1001` and then closes the
+Connection, so the error cannot be misattributed to a later pipelined frame.
 
-A cancellation mark applies only to the statement running when it arrives and
-is cleared when that Connection starts its next statement. Cancellation is
-cooperative: parsing, scanning, result streaming, commit-queue waits, and
-pre-sync execution observe the mark between bounded work units. Before the
-irreversible commit point, a cancelled transaction discards its private write
-set and any queued commit request; once a complete commit record has reached
-the selected durability level, cancellation cannot make it uncommitted. The
-single writer still publishes, and the response is discarded or delivered
-according to Connection liveness. Cancelling a committed transaction is a
-no-op; a stale mark never aborts a later statement.
+A cancellation mark applies only to the statement generation the Server
+observed while routing the credential: it is bound to that generation by a
+single atomic transition and is cleared when that Connection starts its next
+statement. A cancel that races the boundary — the Connection goes idle or starts
+its next statement between the Server's read and the mark — is dropped as a
+no-op and can never abort the later statement. Cancellation is cooperative:
+parsing, scanning, result streaming, commit-queue waits, and pre-sync execution
+observe the mark between bounded work units. In the current sequential listener
+a `CANCEL_REQUEST` from another Connection is delivered only between statements
+— a no-op by design — so the executing statement does not yet observe a
+`CANCELED` outcome. Concurrent mid-statement delivery, including the delivered
+`CANCELED` outcome, becomes a guarantee with the Phase 6 runtime (see
+`docs/architecture/runtime-and-concurrency.md`). Before the irreversible commit
+point, a cancelled transaction discards its private write set and any queued
+commit request; once a complete commit record has reached the selected
+durability level, cancellation cannot make it uncommitted. The single writer
+still publishes, and the response is discarded or delivered according to
+Connection liveness. Cancelling a committed transaction is a no-op; a stale mark
+never aborts a later statement.
 
 ## Observation Evidence Attachments
 
-Protocol v2 implements bounded payload transfer for a canonical `observe` IR
+Protocol v3 implements bounded payload transfer for a canonical `observe` IR
 request. One Connection may stage one attachment at a time:
 
 1. `ATTACHMENT_BEGIN` (`0x20`) carries a big-endian `u64` upload ID, a
@@ -113,7 +125,7 @@ length-prefixed text representation. `COMMAND_COMPLETE` contains a big-endian
 | `EV1003` | Observation Evidence validation or commit failure |
 | `EV1004` | Evidence payload not found or unreadable |
 
-These errors and the relation binding are development-only. Protocol v2
+These errors and the relation binding are development-only. Protocol v3
 implements durable Observation Evidence writes, metadata reads, and payload
 reads; other World Continuum mutations remain unsupported.
 In particular, an IR payload with an empty projection or a relation or field
