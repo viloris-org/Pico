@@ -3,9 +3,11 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const value = @import("value.zig");
 const wal_mod = @import("wal.zig");
+const vfs_mod = @import("vfs.zig");
 const table_mod = @import("table.zig");
 const document_mod = @import("document.zig");
 const graph_mod = @import("graph.zig");
+const manifest_mod = @import("manifest.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const evidence_mod = @import("evidence.zig");
 const vector_mod = @import("../vector.zig");
@@ -229,6 +231,28 @@ pub const Engine = struct {
         const reclaimed = try self.payloads.reclaimOrphans(&committed);
         self.evidence_stats.recovery_orphans_found = reclaimed.count;
         self.evidence_stats.recovery_orphan_bytes = reclaimed.bytes;
+        try self.validateManifest();
+    }
+
+    /// Validate the durable checkpoint manifest against the catalog rebuilt
+    /// from the WAL. A manifest published by an incompatible build, a torn
+    /// checkpoint, or an inconsistent data directory fails startup rather than
+    /// being silently accepted (roadmap Phase 4 format rejection).
+    fn validateManifest(self: *Engine) !void {
+        const manifest = try manifest_mod.read(self.gpa, &self.wal.vfs) orelse return;
+        defer {
+            for (manifest.objects) |*object| self.gpa.free(object.name);
+            self.gpa.free(manifest.objects);
+        }
+        if (self.published_commit_seq < manifest.commit_seq) return error.CorruptManifest;
+        for (manifest.objects) |*object| {
+            const exists = switch (object.kind) {
+                .table => self.tables.contains(object.name),
+                .document => self.documents.contains(object.name),
+                .graph => self.graphs.contains(object.name),
+            };
+            if (!exists) return error.CorruptManifest;
+        }
     }
 
     fn applyRecord(self: *Engine, view: wal_mod.RecordView) !void {
@@ -1192,7 +1216,24 @@ pub const Engine = struct {
         var graph_it = self.graphs.iterator();
         while (graph_it.next()) |entry| graph_refs.appendAssumeCapacity(entry.value_ptr);
 
-        return checkpoint_mod.run(&self.wal, refs.items, doc_refs.items, graph_refs.items, self.observations.items, self.publishedSeq());
+        const stats = try checkpoint_mod.run(&self.wal, refs.items, doc_refs.items, graph_refs.items, self.observations.items, self.publishedSeq());
+
+        // Publish the durable manifest boundary only after the WAL rewrite has
+        // committed, so the manifest always describes state the rewritten WAL
+        // reconstructs. The catalog objects are borrowed for the synchronous
+        // encode inside publish.
+        var objects: std.ArrayList(manifest_mod.CatalogObject) = .empty;
+        defer objects.deinit(self.gpa);
+        try objects.ensureTotalCapacity(self.gpa, self.tables.count() + self.documents.count() + self.graphs.count());
+        var table_it = self.tables.iterator();
+        while (table_it.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .table, .name = entry.key_ptr.* });
+        var doc_it2 = self.documents.iterator();
+        while (doc_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .document, .name = entry.key_ptr.* });
+        var graph_it2 = self.graphs.iterator();
+        while (graph_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .graph, .name = entry.key_ptr.* });
+        const manifest = manifest_mod.Manifest{ .commit_seq = self.publishedSeq(), .objects = objects.items };
+        try manifest_mod.publish(&self.wal.vfs, self.gpa, &manifest);
+        return stats;
     }
 };
 
@@ -1942,4 +1983,76 @@ test "graph collections survive restart and checkpoint" {
         try std.testing.expectEqualStrings("mentors", graph.edges.items[0].label);
         try std.testing.expectEqualStrings("2", graph.edges.items[0].to);
     }
+}
+
+test "checkpoint publishes a durable manifest that restart validates" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-engine-manifest";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.createDocument("docs");
+        try eng.createGraph("g");
+        _ = try eng.checkpoint();
+    }
+
+    // A clean restart rebuilds the catalog from the rewritten WAL and accepts
+    // the manifest published by the checkpoint.
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        try std.testing.expect(eng.getTable("t") != null);
+        try std.testing.expect(eng.getDocumentCollection("docs") != null);
+        try std.testing.expect(eng.getGraph("g") != null);
+    }
+
+    // A manifest naming an object absent from the rebuilt catalog is an
+    // inconsistent checkpoint: startup rejects it rather than proceeding.
+    {
+        var vfs = try vfs_mod.Vfs.open(io, dir_name);
+        defer vfs.close();
+        var objects = [_]manifest_mod.CatalogObject{.{ .kind = .table, .name = "ghost" }};
+        const bad = manifest_mod.Manifest{ .commit_seq = 0, .objects = objects[0..] };
+        try manifest_mod.publish(&vfs, gpa, &bad);
+    }
+    try std.testing.expectError(error.CorruptManifest, Engine.open(gpa, io, dir_name, true));
+
+    // A manifest written by an incompatible (future) build is rejected.
+    {
+        var vfs = try vfs_mod.Vfs.open(io, dir_name);
+        defer vfs.close();
+        var objects = [_]manifest_mod.CatalogObject{.{ .kind = .table, .name = "t" }};
+        const good = manifest_mod.Manifest{ .commit_seq = 1, .objects = objects[0..] };
+        const bytes = try manifest_mod.encode(gpa, &good);
+        defer gpa.free(bytes);
+        var future = try gpa.dupe(u8, bytes);
+        defer gpa.free(future);
+        std.mem.writeInt(u32, future["RUNADB_MAN".len..][0..4], manifest_mod.FORMAT_VERSION + 1, .little);
+        var atomic = try vfs.createAtomicFile("manifest");
+        defer atomic.deinit();
+        try atomic.writeAtAll(future, 0);
+        try atomic.sync();
+        try atomic.commit();
+    }
+    try std.testing.expectError(error.UnsupportedManifest, Engine.open(gpa, io, dir_name, true));
+
+    // A corrupt complete manifest is rejected, leaving the data directory for
+    // forensics rather than silently recovering around it.
+    {
+        var vfs = try vfs_mod.Vfs.open(io, dir_name);
+        defer vfs.close();
+        var atomic = try vfs.createAtomicFile("manifest");
+        defer atomic.deinit();
+        try atomic.writeAtAll("this is not a manifest", 0);
+        try atomic.sync();
+        try atomic.commit();
+    }
+    try std.testing.expectError(error.InvalidManifest, Engine.open(gpa, io, dir_name, true));
 }

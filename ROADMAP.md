@@ -245,6 +245,21 @@ restart exposes only the confirmed commit prefix.
 
 ### Phase 4: Durable Storage Foundation
 
+**Status:** Substantially implemented. The VFS data-directory fence, logical
+filename validation, instance locking, positional I/O, synchronization, and
+atomic artifact publication are complete and tested. The fixed-size Pager and
+static page cache with explicit pinning, dirty writeback, exhaustion, and
+truncation behavior are complete and tested. The WAL, evidence payload store,
+and the new manifest use self-identifying, versioned formats, and recovery
+rejects unknown or corrupt complete formats rather than replaying or ignoring
+them. A checkpoint rewrites the WAL atomically and then publishes a versioned
+manifest (`src/storage/manifest.zig`) recording the commit watermark and the
+covered catalog objects; recovery validates the manifest against the catalog
+rebuilt from the WAL and rejects an incompatible, corrupt, or inconsistent
+manifest. Catalog recovery is covered for tables, document collections, and
+graphs together. The remaining work below is wiring the Pager to an on-disk
+page-backed structure, which arrives with LSM storage (Phase 5).
+
 **Goal:** Establish the data-directory and file-management primitives required
 for durable LSM storage.
 

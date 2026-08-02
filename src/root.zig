@@ -8,6 +8,7 @@ pub const wal = @import("storage/wal.zig");
 pub const table = @import("storage/table.zig");
 pub const document = @import("storage/document.zig");
 pub const graph = @import("storage/graph.zig");
+pub const manifest = @import("storage/manifest.zig");
 pub const checkpoint = @import("storage/checkpoint.zig");
 pub const evidence = @import("storage/evidence.zig");
 pub const vector = @import("vector.zig");
@@ -38,6 +39,7 @@ test {
     _ = table;
     _ = document;
     _ = graph;
+    _ = manifest;
     _ = checkpoint;
     _ = evidence;
     _ = vector;

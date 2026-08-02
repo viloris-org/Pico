@@ -246,13 +246,13 @@ An explicit transaction's write set is stored in a `txn_batch` frame:
 
 | Feature | Current (Phase 0) | Target |
 |------|----------------|------|
-| File layout | Single WAL file; checkpoint rewrites it atomically via `AtomicFile` | WAL rotation + manifest + LSM flush |
-| WAL reclamation | **Implemented**: checkpoint (`src/storage/checkpoint.zig`) collapses history into the minimal record set that restores committed state | LSM flush + manifest publication |
+| File layout | Single WAL file; checkpoint rewrites it atomically via `AtomicFile` and publishes a versioned `manifest` boundary record (`src/storage/manifest.zig`) | WAL rotation + manifest + LSM flush |
+| WAL reclamation | **Implemented**: checkpoint (`src/storage/checkpoint.zig`) collapses history into the minimal record set that restores committed state; the manifest records the commit watermark and covered catalog objects, and recovery rejects an incompatible or inconsistent manifest | LSM flush + manifest publication |
 | Group Commit | WAL-layer shared `fdatasync` rounds among concurrent appenders | Engine commit queue + batched writes + shared durability |
 | Recovery modes | Tolerate truncation (implicit) | Strict + tolerant + skip-corruption (configurable) |
 | CRC algorithm | CRC32 | Upgradeable to CRC32C |
 | WAL compression | None | Optional compression (zstd) |
-| WAL tracking | None | Manifest records size and position of closed WALs |
+| WAL tracking | Manifest records the commit watermark and covered catalog objects | Manifest records size and position of closed WALs |
 | WAL checksum chain | None | Each new WAL record includes the previous WAL checksum |
 
 ## RunaDB Decisions

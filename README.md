@@ -37,7 +37,9 @@ RunaDB Server is under active development. The current implementation provides:
 - Immutable Observation Evidence payload storage and verified recovery
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
-- WAL checkpoint (compaction): bounded WAL size and bounded recovery time
+- WAL checkpoint (compaction): bounded WAL size and bounded recovery time,
+  with a versioned manifest boundary record published atomically and validated
+  at startup
 - A single-writer commit coordinator: transaction write sets with commit/rollback,
   group commit, observed-version write-write conflict detection, bounded commit
   admission, and a durable MVCC commit watermark recovered on restart
