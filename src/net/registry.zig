@@ -22,12 +22,13 @@ const connection_mod = @import("connection.zig");
 /// Outcome of a cancellation lookup, for observability. Both outcomes are
 /// protocol no-ops on the wire; only the counters differ.
 pub const CancelOutcome = enum {
-    /// The credential named a Connection with a statement currently executing
-    /// and that statement was marked.
+    /// The credential named a Connection with a statement executing and the
+    /// mark was atomically committed onto that statement.
     hit,
     /// The credential named no live Connection, named a Connection with no
-    /// statement executing (idle or between statements), or was already
-    /// revoked. Defined by the protocol as a no-op.
+    /// statement executing (idle or between statements), named a statement
+    /// already marked by an earlier cancel, or was already revoked. Defined by
+    /// the protocol as a no-op.
     noop,
 };
 
@@ -91,12 +92,17 @@ pub const Registry = struct {
     }
 
     /// Route a cancellation request. Constant-time lookup; marks the target
-    /// Connection's current statement only while it is executing. No waiting,
-    /// no execution context, no response frame — missing, revoked, or idle
-    /// credentials are protocol no-ops. In the sequential listener every wire
-    /// cancel targets an idle Connection, so `cancel_noops` is the honest
-    /// counter there; `cancel_hits` becomes meaningful under the concurrent
-    /// (Phase 6) runtime.
+    /// Connection's statement only while it is executing. No waiting, no
+    /// execution context, no response frame — missing, revoked, idle, or
+    /// already-marked credentials are protocol no-ops. The mark is bound to the
+    /// statement state the router observes under the mutex: the connection
+    /// thread advances statement state without this mutex, so `markCancelled`
+    /// compare-and-swaps, and if the Connection starts its next statement (or
+    /// goes idle) between the read and the mark, the mark is dropped and
+    /// counted as a no-op instead of aborting the later statement. In the
+    /// sequential listener every wire cancel targets an idle Connection, so
+    /// `cancel_noops` is the honest counter there; `cancel_hits` becomes
+    /// meaningful under the concurrent (Phase 6) runtime.
     pub fn cancelByCredential(self: *Registry, credential: connection_mod.Credential) !CancelOutcome {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
@@ -104,13 +110,12 @@ pub const Registry = struct {
             self.cancel_noops += 1;
             return .noop;
         };
-        if (!entry.*.executing.load(.acquire)) {
-            self.cancel_noops += 1;
-            return .noop;
+        if (entry.*.markCancelled()) {
+            self.cancel_hits += 1;
+            return .hit;
         }
-        entry.*.markCancelled();
-        self.cancel_hits += 1;
-        return .hit;
+        self.cancel_noops += 1;
+        return .noop;
     }
 
     /// Number of currently registered Connections, under the mutex so the
@@ -134,21 +139,29 @@ test "registry routes a credential to the right connection" {
     try registry.register(&conn_b);
     try std.testing.expectEqual(@as(usize, 2), registry.liveCount());
 
+    // beginStatement enters the executing region, so routing sees a live
+    // statement.
     conn_a.beginStatement();
     conn_b.beginStatement();
-    conn_a.setExecuting(true);
-    conn_b.setExecuting(true);
     try std.testing.expectEqual(.hit, try registry.cancelByCredential(conn_a.credential));
     try std.testing.expectError(error.Canceled, conn_a.checkCancelled());
     try conn_b.checkCancelled(); // untouched
     try std.testing.expectEqual(@as(u64, 1), registry.cancel_hits);
 
-    // An idle Connection (not executing) is a no-op, not a hit.
-    conn_a.setExecuting(false);
-    conn_a.beginStatement(); // clears the stale mark
+    // A redundant cancel of the same (already marked) statement is a no-op,
+    // not another hit: the mark is single-shot.
     try std.testing.expectEqual(.noop, try registry.cancelByCredential(conn_a.credential));
     try std.testing.expectEqual(@as(u64, 1), registry.cancel_hits);
     try std.testing.expectEqual(@as(u64, 1), registry.cancel_noops);
+
+    // After the statement ends, an idle Connection is a no-op, not a hit, and
+    // the mark does not leak into the next statement.
+    conn_a.endStatement();
+    try std.testing.expectEqual(.noop, try registry.cancelByCredential(conn_a.credential));
+    try std.testing.expectEqual(@as(u64, 1), registry.cancel_hits);
+    try std.testing.expectEqual(@as(u64, 2), registry.cancel_noops);
+    conn_a.beginStatement();
+    try conn_a.checkCancelled();
 }
 
 test "unknown and revoked credentials are protocol no-ops" {

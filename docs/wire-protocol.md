@@ -58,14 +58,18 @@ counters change. A payload that is not exactly 16 bytes is a malformed request:
 the Server returns `SERVER_ERROR` with code `CN1001` and then closes the
 Connection, so the error cannot be misattributed to a later pipelined frame.
 
-A cancellation mark applies only to the statement running when it arrives and
-is cleared when that Connection starts its next statement. Cancellation is
-cooperative: parsing, scanning, result streaming, commit-queue waits, and
-pre-sync execution observe the mark between bounded work units. In the current
-sequential listener a `CANCEL_REQUEST` from another Connection is delivered only
-between statements — a no-op by design — so the executing statement does not yet
-observe a `CANCELED` outcome. Concurrent mid-statement delivery, including the
-delivered `CANCELED` outcome, becomes a guarantee with the Phase 6 runtime (see
+A cancellation mark applies only to the statement generation the Server
+observed while routing the credential: it is bound to that generation by a
+single atomic transition and is cleared when that Connection starts its next
+statement. A cancel that races the boundary — the Connection goes idle or starts
+its next statement between the Server's read and the mark — is dropped as a
+no-op and can never abort the later statement. Cancellation is cooperative:
+parsing, scanning, result streaming, commit-queue waits, and pre-sync execution
+observe the mark between bounded work units. In the current sequential listener
+a `CANCEL_REQUEST` from another Connection is delivered only between statements
+— a no-op by design — so the executing statement does not yet observe a
+`CANCELED` outcome. Concurrent mid-statement delivery, including the delivered
+`CANCELED` outcome, becomes a guarantee with the Phase 6 runtime (see
 `docs/architecture/runtime-and-concurrency.md`). Before the irreversible commit
 point, a cancelled transaction discards its private write set and any queued
 commit request; once a complete commit record has reached the selected

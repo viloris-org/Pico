@@ -119,12 +119,12 @@ pub fn handleConnection(
             .flow_source => {
                 // Statement start: a fresh generation clears any stale mark so
                 // a cancel delivered while idle never aborts this statement.
-                // The cooperative check and the executing flag are the Phase 6
+                // Entry and exit are single atomic transitions on the
+                // connection state, and the cooperative check is the Phase 6
                 // seam; in the sequential listener a cancel is delivered only
                 // between statements, so these never fire here.
                 conn.beginStatement();
-                conn.setExecuting(true);
-                defer conn.setExecuting(false);
+                defer conn.endStatement();
                 conn.checkCancelled() catch |err| {
                     try sendError(w, 2, "RF1002", @errorName(err));
                     try w.flush();
@@ -164,8 +164,7 @@ pub fn handleConnection(
             .flow_ir => {
                 // Statement start (see .flow_source for the Phase 6 seam note).
                 conn.beginStatement();
-                conn.setExecuting(true);
-                defer conn.setExecuting(false);
+                defer conn.endStatement();
                 conn.checkCancelled() catch |err| {
                     try sendError(w, 2, "RF1002", @errorName(err));
                     try w.flush();
