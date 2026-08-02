@@ -315,6 +315,19 @@ machine context, and durability level.
 
 ### Phase 6: Execution and Runtime Evolution
 
+**Status:** Concurrent network work is implemented as a development slice. The listener
+serves each Connection on its own thread behind the engine's statement-execution lock, so
+multiple clients make progress concurrently while all logical mutation still routes through
+the single-writer commit coordinator; flow result column metadata is fully owned, so a
+concurrent DDL can never race a result being sent. Mid-statement cancellation delivery is
+implemented: the `emit` scan paths check the Connection's cancellation mark between bounded
+work units, a `CANCEL_REQUEST` routed while a statement is scanning aborts it at the next row
+boundary with the delivered `CANCELED` outcome (`SERVER_ERROR` `RF1006`), and the Connection
+stays usable — with deterministic engine-level, threaded-listener wire, and official-client
+integration coverage, plus registry hit counting. The remaining work below is execution
+programs with streaming/backpressure, the runtime I/O scheduler and bounded work queues, and
+the Phase 6 load and fault regressions.
+
 **Goal:** Scale execution and connection handling without crossing ownership
 boundaries or weakening commit correctness.
 

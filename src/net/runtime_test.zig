@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const flow = @import("../flow/exec.zig");
 const engine_mod = @import("../storage/engine.zig");
 const value = @import("../storage/value.zig");
+const document_mod = @import("../storage/document.zig");
 const registry_mod = @import("registry.zig");
 const server = @import("server.zig");
 const proto = @import("clint_proto");
@@ -248,6 +249,9 @@ const TestClient = struct {
     reader: Io.net.Stream.Reader,
     writer: Io.net.Stream.Writer,
     closed: bool = false,
+    /// Cancellation credential delivered in HELLO_OK; names this Connection
+    /// for the Server's cancellation routing.
+    cancel_credential: [proto.CANCEL_CREDENTIAL_LENGTH]u8 = .{0} ** proto.CANCEL_CREDENTIAL_LENGTH,
 
     fn connect(self: *TestClient, gpa: Allocator, io: Io, port: u16) !void {
         const addr = try Io.net.IpAddress.parse("127.0.0.1", port);
@@ -276,6 +280,12 @@ const TestClient = struct {
         defer arena.deinit();
         const frame = try readFrame(&self.reader.interface, arena.allocator());
         if (frame.msg_type != .hello_ok) return error.Protocol;
+        // HELLO_OK payload: [u32 version length][version][16-byte credential].
+        const payload = frame.payload;
+        if (payload.len < 4) return error.Protocol;
+        const version_len = std.mem.readInt(u32, payload[0..4], .big);
+        if (payload.len != 4 + version_len + proto.CANCEL_CREDENTIAL_LENGTH) return error.Protocol;
+        @memcpy(&self.cancel_credential, payload[4 + version_len ..]);
     }
 
     fn sendFrame(self: *TestClient, msg_type: proto.Type, payload: []const u8) !void {
@@ -599,6 +609,148 @@ test "threaded listener serves concurrent connections with snapshot-consistent, 
 
     // Stop the accept loop: the sentinel connect unblocks the pending accept;
     // the loop sees `stop` and exits without dispatching it.
+    stop.store(true, .release);
+    const sentinel = listener.socket.address.connect(io, .{ .mode = .stream }) catch null;
+    accept_thread.join();
+    if (sentinel) |s| s.close(io);
+}
+
+// ── Mid-statement cancellation delivery (Phase 6 Part B) ──
+
+/// Extract the error code from a SERVER_ERROR payload:
+/// [severity u8][code_len u32 BE][code][msg_len u32 BE][msg].
+fn parseServerErrorCode(payload: []const u8) ![]const u8 {
+    if (payload.len < 1 + 4) return error.Protocol;
+    const code_len = std.mem.readInt(u32, payload[1..][0..4], .big);
+    if (payload.len < 1 + 4 + code_len) return error.Protocol;
+    return payload[1 + 4 ..][0..code_len];
+}
+
+/// Read the next frame and expect exactly the delivered CANCELED outcome
+/// (`SERVER_ERROR` with code `RF1006`): the statement was aborted by a
+/// `CANCEL_REQUEST` routed while it was scanning.
+fn expectCanceledOutcome(client: *TestClient, gpa: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const frame = try readFrame(&client.reader.interface, arena.allocator());
+    if (frame.msg_type != .server_error) return error.Protocol;
+    const code = try parseServerErrorCode(frame.payload);
+    if (!std.mem.eql(u8, code, "RF1006")) return error.WrongCanceledCode;
+}
+
+test "a CANCEL_REQUEST aborts a mid-statement scan and keeps the connection usable" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-runtime-mid-statement-cancel";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+
+    // Seed a document collection so the target has a real scan to abort. The
+    // deterministic part of the test is the engine lock: the test holds it, so
+    // the target's handler is provably inside its statement (blocked at the
+    // statement lock) when the cancel lands, and cannot finish before the mark.
+    {
+        try eng.createDocument("docs");
+        var fields: [1]document_mod.Field = undefined;
+        fields[0] = .{ .path = try gpa.dupe(u8, "seq"), .item = .{ .int = 0 } };
+        defer fields[0].deinit(gpa);
+        var id_buf: [16]u8 = undefined;
+        for (0..2_000) |i| {
+            fields[0].item = .{ .int = @intCast(i) };
+            const id = std.fmt.bufPrint(&id_buf, "d{d}", .{i}) catch unreachable;
+            try eng.insertDocument("docs", id, &fields);
+        }
+    }
+
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var registry = registry_mod.Registry.init(gpa, io, .{});
+    defer registry.deinit();
+
+    var stop = std.atomic.Value(bool).init(false);
+    const accept_thread = try std.Thread.spawn(.{}, AcceptLoop.run, .{AcceptLoop{
+        .gpa = gpa,
+        .io = io,
+        .listener = &listener,
+        .eng = &eng,
+        .registry = &registry,
+        .stop = &stop,
+    }});
+
+    // Hold the engine statement lock; the target handler blocks on it.
+    try eng.lock(io);
+    var lock_held = true;
+    defer if (lock_held) eng.unlock(io);
+
+    var target: TestClient = undefined;
+    try target.connect(gpa, io, port);
+    defer target.close();
+
+    // The target submits a scan over the seeded collection and does not read;
+    // its handler thread blocks at the statement lock we hold.
+    const source = "from docs\n| emit { seq }";
+    var payload: [4 + 128]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], @intCast(source.len), .big);
+    @memcpy(payload[4..][0..source.len], source);
+    try target.sendFrame(.flow_source, payload[0 .. 4 + source.len]);
+    try target.writer.interface.flush();
+
+    // Give the handler time to register and reach the statement lock. It must:
+    // with the lock held, the statement cannot complete before the cancel.
+    for (0..1000) |_| {
+        if (registry.liveCount() >= 1) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try Io.sleep(io, .fromMilliseconds(20), .awake);
+
+    // A second connection delivers the cancel with the target's credential.
+    var canceler: TestClient = undefined;
+    try canceler.connect(gpa, io, port);
+    defer canceler.close();
+    try canceler.sendFrame(.cancel_request, &target.cancel_credential);
+    try canceler.writer.interface.flush();
+
+    // The mark lands on the executing statement: the registry reports a hit.
+    var hit = false;
+    for (0..1000) |_| {
+        if (registry.cancel_hits == 1) {
+            hit = true;
+            break;
+        }
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(hit);
+
+    // Release the lock: the target's scan runs, observes the mark at its first
+    // bounded work unit, and delivers the CANCELED outcome over the wire.
+    eng.unlock(io);
+    lock_held = false;
+    try expectCanceledOutcome(&target, gpa);
+
+    // The Connection stays usable: its next statement executes normally.
+    const ids = try execCollectInts(&target, gpa, "from docs\n| emit { seq }\n| limit 2");
+    defer gpa.free(ids);
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqual(@as(u64, 0), ids[0]);
+    try std.testing.expectEqual(@as(u64, 1), ids[1]);
+
+    try target.goodbye();
+    try canceler.goodbye();
+
+    // Wait for every connection handler thread to unregister before tearing
+    // the engine down, so no handler outlives the test.
+    for (0..1000) |_| {
+        if (registry.liveCount() == 0) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), registry.liveCount());
+
     stop.store(true, .release);
     const sentinel = listener.socket.address.connect(io, .{ .mode = .stream }) catch null;
     accept_thread.join();

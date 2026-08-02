@@ -65,12 +65,13 @@ statement. A cancel that races the boundary — the Connection goes idle or star
 its next statement between the Server's read and the mark — is dropped as a
 no-op and can never abort the later statement. Cancellation is cooperative:
 parsing, scanning, result streaming, commit-queue waits, and pre-sync execution
-observe the mark between bounded work units. In the current sequential listener
-a `CANCEL_REQUEST` from another Connection is delivered only between statements
-— a no-op by design — so the executing statement does not yet observe a
-`CANCELED` outcome. Concurrent mid-statement delivery, including the delivered
-`CANCELED` outcome, becomes a guarantee with the Phase 6 runtime (see
-`docs/architecture/runtime-and-concurrency.md`). Before the irreversible commit
+observe the mark between bounded work units. With the Phase 6 concurrent
+listener, each Connection runs on its own thread and the `emit` scan paths check
+the mark between rows, so a `CANCEL_REQUEST` delivered while a statement is
+scanning aborts that statement at the next row boundary and the Server returns
+`SERVER_ERROR` with code `RF1006` — the delivered `CANCELED` outcome. The
+Connection stays usable: its next statement starts on a fresh generation. Before
+the irreversible commit
 point, a cancelled transaction discards its private write set and any queued
 commit request; once a complete commit record has reached the selected
 durability level, cancellation cannot make it uncommitted. The single writer
@@ -142,6 +143,7 @@ length-prefixed text representation. `COMMAND_COMPLETE` contains a big-endian
 | `RF1003` | Malformed Runa Query IR payload |
 | `RF1004` | Unsupported Runa Query IR format version |
 | `RF1005` | Unknown message type after handshake |
+| `RF1006` | Statement canceled by a `CANCEL_REQUEST` during execution |
 | `CN1001` | Malformed `CANCEL_REQUEST` payload |
 | `EV1001` | Attachment state, limit, length, or digest failure |
 | `EV1002` | Invalid modality |

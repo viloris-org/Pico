@@ -2,21 +2,24 @@
 
 ## Status and Scope
 
-This is the target RunaDB v1 runtime design, not a claim that Phase 0 implements it. The
-current `src/net/server.zig` handles connections in `accept -> handleConnection` order and
-exists only to validate the migration adapter's minimal working loop. The cancellation slice
+This document is the target RunaDB v1 runtime design; part of it is now implemented as a
+development slice and the rest remains target. The Phase 6 listener (`src/net/server.zig`)
+serves each Connection on its own thread behind the engine's statement-execution lock, so
+multiple clients make progress concurrently while every logical mutation still routes through
+the single-writer coordinator. The cancellation slice
 is implemented at the ownership boundaries that Phase 6 builds on: `src/commit/coordinator.zig`
 withdraws queued commit requests before a commit sequence is assigned and terminates marked
 requests before the WAL durability boundary; `src/net/connection.zig` owns the per-Connection
 identity, statement generation, and cancellation mark; `src/net/registry.zig` is the bounded
 credential → Connection table used for constant-time cancellation routing; and
 `CANCEL_REQUEST` is a wire-protocol contract with official-client and malformed-input coverage.
-Because the listener is sequential, a `CANCEL_REQUEST` from another Connection is delivered
-only between statements today (a no-op by design); the registry counts those as no-ops, and
-a `hit` requires a statement actually executing. A malformed `CANCEL_REQUEST` is a protocol
-error: the Server replies `CN1001` and closes the Connection. Concurrent mid-statement
-delivery, admission, commit queues, and I/O scheduling become implementation guarantees only
-after the Phase 6 runtime and its regressions land.
+With the concurrent listener, a `CANCEL_REQUEST` from another Connection is delivered
+mid-statement: the `emit` scan paths (`src/flow/exec.zig`) check the mark between bounded work
+units, so a canceled scan stops at the next row boundary and the Server returns `SERVER_ERROR`
+`RF1006` (the delivered `CANCELED` outcome) while keeping the Connection usable. A malformed
+`CANCEL_REQUEST` is a protocol error: the Server replies `CN1001` and closes the Connection.
+Streaming results with backpressure, the I/O scheduler, bounded work queues, and the Phase 6
+load and fault regressions remain target work.
 
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 

@@ -60,6 +60,7 @@ test "RunaDB Client v3 protocol lifecycle, evidence, and request errors" {
     try expectMalformedRequestsKeepConnectionUsable(gpa, io);
     try expectCancellationNoOps(gpa, io);
     try expectClientCancelIsNoop(gpa, io);
+    try expectMidStatementCancel(gpa, io);
     try expectGoodbyeConfirmationAndClose(gpa, io);
 }
 
@@ -345,6 +346,18 @@ fn expectHelloOk(allocator: std.mem.Allocator, reader: *Io.Reader) !void {
     try std.testing.expect(response == .hello_ok);
 }
 
+/// Read HELLO_OK and return the Connection's cancellation credential, which
+/// names that Connection for the Server's cancellation routing.
+fn expectHelloOkCredential(allocator: std.mem.Allocator, reader: *Io.Reader) ![proto.CANCEL_CREDENTIAL_LENGTH]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const response = try clint.codec.readMessage(arena.allocator(), reader);
+    switch (response) {
+        .hello_ok => |ok| return ok.cancel_credential,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 fn expectServerError(
     allocator: std.mem.Allocator,
     reader: *Io.Reader,
@@ -487,4 +500,93 @@ fn expectGoodbyeConfirmationAndClose(allocator: std.mem.Allocator, io: Io) !void
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectError(error.EndOfStream, clint.codec.readMessage(arena.allocator(), &reader.interface));
+}
+
+/// Mid-statement cancellation against the real Server process (roadmap Phase 6):
+/// a large `emit` scan on the target Connection is aborted by a
+/// `CANCEL_REQUEST` carrying the target's credential, delivered fire-and-forget
+/// on a second Connection. The statement ends with `SERVER_ERROR` `RF1006` (the
+/// delivered `CANCELED` outcome) and the target Connection stays usable. The
+/// collection is seeded through the official client; the cancel delivery uses
+/// raw framing with the official client's codec, like the other cancellation
+/// regressions, because the client API cancels only the sending Connection.
+/// The seed is sized so the scan window is orders of magnitude longer than the
+/// cancel delivery time, so the mark lands while the statement is scanning.
+fn expectMidStatementCancel(gpa: std.mem.Allocator, io: Io) !void {
+    const doc_count: usize = 20_000;
+
+    // Seed a document collection through the official client so the target has
+    // a long scan to abort. Each insert is committed and drained.
+    {
+        var seeder = try connectWhenReady(gpa, io);
+        defer seeder.deinit(io);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        for (0..doc_count) |i| {
+            const id_text = try std.fmt.allocPrint(aa, "d{d}", .{i});
+            const fields = [_]proto.DocumentField{.{ .path = "seq", .value = .{ .int = @intCast(i) } }};
+            var inserted = try seeder.insertDocument("docs", id_text, &fields);
+            try inserted.drain(aa);
+        }
+    }
+
+    // The canceler handshakes first so its cancel is ready the instant the
+    // target's emit starts scanning.
+    const canceler = try connectRaw(io);
+    defer canceler.close(io);
+    var cancel_buf_r: [1024]u8 = undefined;
+    var cancel_buf_w: [1024]u8 = undefined;
+    var cancel_reader = canceler.reader(io, &cancel_buf_r);
+    var cancel_writer = canceler.writer(io, &cancel_buf_w);
+    try writeHello(&cancel_writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    try expectHelloOk(gpa, &cancel_reader.interface);
+
+    const target = try connectRaw(io);
+    defer target.close(io);
+    var target_buf_r: [16 * 1024]u8 = undefined;
+    var target_buf_w: [16 * 1024]u8 = undefined;
+    var target_reader = target.reader(io, &target_buf_r);
+    var target_writer = target.writer(io, &target_buf_w);
+    try writeHello(&target_writer.interface, proto.PROTOCOL_VERSION_MAJOR, proto.PROTOCOL_VERSION_MINOR);
+    const target_credential = try expectHelloOkCredential(gpa, &target_reader.interface);
+
+    // The target submits the large scan and does not read yet.
+    const source = "from docs\n| emit { seq }";
+    var source_payload: [4 + source.len]u8 = undefined;
+    std.mem.writeInt(u32, source_payload[0..4], source.len, .big);
+    @memcpy(source_payload[4..], source);
+    try clint.codec.writeMessage(&target_writer.interface, .flow_source, &source_payload);
+    try target_writer.interface.flush();
+
+    // Deliver the cancel fire-and-forget; the Server never replies.
+    try clint.codec.writeMessage(&cancel_writer.interface, .cancel_request, &target_credential);
+    try cancel_writer.interface.flush();
+
+    // The canceled statement delivers the CANCELED outcome.
+    try expectServerError(gpa, &target_reader.interface, "RF1006");
+
+    // The Connection stays usable: a follow-up statement returns a full result.
+    const follow_up = "from docs\n| emit { seq }\n| limit 1";
+    var follow_payload: [4 + follow_up.len]u8 = undefined;
+    std.mem.writeInt(u32, follow_payload[0..4], follow_up.len, .big);
+    @memcpy(follow_payload[4..], follow_up);
+    try clint.codec.writeMessage(&target_writer.interface, .flow_source, &follow_payload);
+    try target_writer.interface.flush();
+    {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        var seen_row = false;
+        while (true) {
+            const msg = try clint.codec.readMessage(aa, &target_reader.interface);
+            switch (msg) {
+                .row_description => {},
+                .row_data => seen_row = true,
+                .command_complete => break,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        if (!seen_row) return error.TestUnexpectedResult;
+    }
 }

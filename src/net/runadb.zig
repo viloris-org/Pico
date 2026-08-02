@@ -71,6 +71,16 @@ const EngineGuard = struct {
     }
 };
 
+/// Cooperative cancellation probe bound to a Connection's statement state
+/// (roadmap Phase 6): the flow scan loops call it between bounded work units,
+/// and it reports when the registry routed a `CANCEL_REQUEST` for this
+/// Connection. It reads only the connection's atomic mark, so it never needs a
+/// lock and cannot deadlock inside the statement-execution lock.
+fn cancelProbe(ctx: *const anyopaque) error{Canceled}!void {
+    const state: *const connection_mod.State = @ptrCast(@alignCast(ctx));
+    return state.checkCancelled();
+}
+
 /// Handle one RunaDB protocol connection until terminate or error. The
 /// connection registers with the instance registry after accept and revokes
 /// its credential on every exit path, so a disconnected connection can never
@@ -186,10 +196,20 @@ pub fn handleConnection(
                     continue;
                 };
                 defer request.deinit(gpa);
-                var result = flow.execute(gpa, eng, &request) catch |err| {
-                    try sendError(w, 2, "RF1002", @errorName(err));
-                    try w.flush();
-                    continue;
+                // A `CANCEL_REQUEST` routed while this statement scans aborts it
+                // at the next bounded work unit with the delivered `CANCELED`
+                // outcome; the Connection stays usable for its next statement.
+                var result = flow.executeOpts(gpa, eng, &request, .{ .cancel = .{ .ctx = &conn, .check = cancelProbe } }) catch |err| switch (err) {
+                    error.Canceled => {
+                        try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
+                        try w.flush();
+                        continue;
+                    },
+                    else => {
+                        try sendError(w, 2, "RF1002", @errorName(err));
+                        try w.flush();
+                        continue;
+                    },
                 };
                 defer result.deinit();
 
@@ -232,10 +252,17 @@ pub fn handleConnection(
                     .emit => {
                         var guard = try EngineGuard.acquire(eng, io);
                         defer guard.deinit();
-                        var result = flow.execute(gpa, eng, &request) catch |err| {
-                            try sendError(w, 2, "RF1002", @errorName(err));
-                            try w.flush();
-                            continue;
+                        var result = flow.executeOpts(gpa, eng, &request, .{ .cancel = .{ .ctx = &conn, .check = cancelProbe } }) catch |err| switch (err) {
+                            error.Canceled => {
+                                try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
+                                try w.flush();
+                                continue;
+                            },
+                            else => {
+                                try sendError(w, 2, "RF1002", @errorName(err));
+                                try w.flush();
+                                continue;
+                            },
                         };
                         defer result.deinit();
                         guard.release();

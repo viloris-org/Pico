@@ -19,6 +19,7 @@ pub const ExecError = ast.ParseError || ir.IrError || error{
     NonComparableColumn,
     ModelRevisionMismatch,
     UnsupportedNavigate,
+    Canceled,
 } || Allocator.Error;
 
 pub const Result = struct {
@@ -35,6 +36,29 @@ pub const Result = struct {
         self.owned_text.deinit(self.gpa);
     }
 };
+
+/// Cooperative cancellation probe (roadmap Phase 6). The caller — a RunaDB
+/// Connection — owns the state and the statement generation that a
+/// `CANCEL_REQUEST` marks; the flow module only calls `check` between bounded
+/// work units during scan execution and never stores the probe past the call.
+/// A null probe disables cancellation, preserving the engine-level and MCP call
+/// paths unchanged.
+pub const CancelProbe = struct {
+    ctx: *anyopaque,
+    check: *const fn (ctx: *anyopaque) error{Canceled}!void,
+};
+
+/// Per-execution options. The default options carry no cancellation probe.
+pub const ExecOptions = struct {
+    cancel: ?CancelProbe = null,
+};
+
+/// Report the owning Connection's cancellation mark between bounded work units.
+/// A marked statement stops at the next row boundary with `error.Canceled`,
+/// which the protocol layer maps to the delivered `CANCELED` outcome (`RF1006`).
+fn checkCancel(opts: ExecOptions) ExecError!void {
+    if (opts.cancel) |probe| try probe.check(probe.ctx);
+}
 
 /// Duplicate a column name into `owned` and return the owned slice. Result
 /// column metadata is fully owned (Phase 6): a DDL that frees engine column
@@ -55,17 +79,26 @@ pub fn compile(gpa: Allocator, source: []const u8) !ir.Request {
 }
 
 pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
+    return executeOpts(gpa, eng, request, .{});
+}
+
+/// Execute a Request with optional cooperative cancellation: the scan loops
+/// check `opts.cancel` between bounded work units, so a Connection's
+/// `CANCEL_REQUEST` mark stops a long scan at the next row boundary. The plain
+/// `execute` entry point passes the default options and never observes
+/// cancellation.
+pub fn executeOpts(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) ExecError!Result {
     if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
     if (request.operation != .emit) return error.InvalidOperation;
-    if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
+    if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request, opts);
     // Revision 0 is an explicit development binding of relation, document, and
     // graph names to the existing catalog. It is read-only and is not persisted
     // as a model.
     if (eng.getDocumentCollection(request.relation)) |_| {
         if (request.navigate != null) return error.UnsupportedNavigate;
-        return executeDocument(gpa, eng, request);
+        return executeDocument(gpa, eng, request, opts);
     }
-    if (eng.getGraph(request.relation) != null) return executeGraph(gpa, eng, request);
+    if (eng.getGraph(request.relation) != null) return executeGraph(gpa, eng, request, opts);
     const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
     if (request.navigate != null) return error.UnsupportedNavigate;
     const projection = try bindProjection(gpa, table, request.fields);
@@ -107,6 +140,7 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
     var emitted: usize = 0;
     for (visible.rows) |row| {
         if (emitted >= max_rows) break;
+        try checkCancel(opts);
         if (!table_mod.valuesMatch(row.values, bound.preds)) continue;
         try emitRow(gpa, &owned_text, &cells, projection, row.values);
         emitted += 1;
@@ -119,7 +153,7 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
 /// each `where` predicate evaluates the same way, so a predicate on an absent
 /// or differently typed field does not match that document. Reads follow the
 /// collection's insertion order, matching the relation slice's read order.
-fn executeDocument(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
+fn executeDocument(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) ExecError!Result {
     const collection = eng.getDocumentCollection(request.relation) orelse return error.SemanticNameNotFound;
     const projection = request.fields;
     var owned_text: std.ArrayList([]u8) = .empty;
@@ -148,6 +182,7 @@ fn executeDocument(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.R
     var emitted: usize = 0;
     for (collection.order.items) |doc| {
         if (emitted >= max_rows) break;
+        try checkCancel(opts);
         for (request.where, 0..) |*predicate, index| {
             pred_values[index] = doc.pathValue(predicate.column) orelse .null;
         }
@@ -171,16 +206,22 @@ fn executeDocument(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.R
 /// view has no private write set in this slice and is read from committed
 /// observations directly.
 pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, tx: *txn_mod.Transaction) ExecError!Result {
+    return executeTxOpts(gpa, eng, request, tx, .{});
+}
+
+/// Transaction-scoped execution with the same optional cancellation probe as
+/// `executeOpts`.
+pub fn executeTxOpts(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, tx: *txn_mod.Transaction, opts: ExecOptions) ExecError!Result {
     if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
     if (request.operation != .emit) return error.InvalidOperation;
-    if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
+    if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request, opts);
     // Document and graph collections have no private write set in this slice;
     // they are read from committed state exactly as outside a transaction.
     if (eng.getDocumentCollection(request.relation)) |_| {
         if (request.navigate != null) return error.UnsupportedNavigate;
-        return executeDocument(gpa, eng, request);
+        return executeDocument(gpa, eng, request, opts);
     }
-    if (eng.getGraph(request.relation) != null) return executeGraph(gpa, eng, request);
+    if (eng.getGraph(request.relation) != null) return executeGraph(gpa, eng, request, opts);
     const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
     if (request.navigate != null) return error.UnsupportedNavigate;
     const projection = try bindProjection(gpa, table, request.fields);
@@ -221,6 +262,7 @@ pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Req
     var emitted: usize = 0;
     for (merged.rows) |row| {
         if (emitted >= max_rows) break;
+        try checkCancel(opts);
         if (!table_mod.valuesMatch(row.values, bound.preds)) continue;
         try emitRow(gpa, &owned_text, &cells, projection, row.values);
         emitted += 1;
@@ -256,7 +298,7 @@ const evidence_fields = [_]EvidenceField{
     .{ .name = "payload_digest", .type_tag = .text },
 };
 
-fn executeEvidence(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) !Result {
+fn executeEvidence(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) !Result {
     const projection = try gpa.alloc(usize, request.fields.len);
     defer gpa.free(projection);
     for (request.fields, 0..) |field, output_index| {
@@ -288,6 +330,7 @@ fn executeEvidence(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.R
     var emitted: usize = 0;
     for (observations) |record| {
         if (emitted >= max_rows) break;
+        try checkCancel(opts);
         for (0..values_buf.len) |field_index| values_buf[field_index] = evidenceValue(&record, field_index, &digest_hex);
         if (!table_mod.valuesMatch(&values_buf, bound.preds)) continue;
         const row = try gpa.alloc(?[]const u8, projection.len);
@@ -416,7 +459,7 @@ fn bindEvidenceWhere(gpa: Allocator, predicates: []const ast.Predicate) !BoundWh
 /// is addressable through `alias.<path>` in the emit, while unqualified paths
 /// resolve against the source node. A node with no matching outgoing edge
 /// produces no row.
-fn executeGraph(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
+fn executeGraph(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) ExecError!Result {
     const graph = eng.getGraph(request.relation) orelse return error.SemanticNameNotFound;
     const navigate = request.navigate;
 
@@ -449,10 +492,12 @@ fn executeGraph(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Requ
     if (navigate) |nav| {
         for (graph.nodes.order.items) |source| {
             if (emitted >= max_rows) break;
+            try checkCancel(opts);
             for (request.where, 0..) |*predicate, index| pred_values[index] = source.pathValue(predicate.column) orelse .null;
             if (!table_mod.valuesMatch(pred_values, bound.preds)) continue;
             for (graph.edges.items) |*edge_item| {
                 if (emitted >= max_rows) break;
+                try checkCancel(opts);
                 if (!std.mem.eql(u8, edge_item.from, source.id) or !std.mem.eql(u8, edge_item.label, nav.edge)) continue;
                 const dest = graph.nodes.by_id.get(edge_item.to) orelse continue;
                 const row = try gpa.alloc(?[]const u8, projection.len);
@@ -468,6 +513,7 @@ fn executeGraph(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Requ
     } else {
         for (graph.nodes.order.items) |node| {
             if (emitted >= max_rows) break;
+            try checkCancel(opts);
             for (request.where, 0..) |*predicate, index| pred_values[index] = node.pathValue(predicate.column) orelse .null;
             if (!table_mod.valuesMatch(pred_values, bound.preds)) continue;
             const row = try gpa.alloc(?[]const u8, projection.len);
@@ -1290,3 +1336,104 @@ test "navigate on a relation is rejected" {
     defer request.deinit(gpa);
     try std.testing.expectError(error.UnsupportedNavigate, execute(gpa, &eng, &request));
 }
+
+// ── Cooperative cancellation probe (roadmap Phase 6) ──
+
+/// Test probe that permits `remaining` bounded work units and then reports
+/// cancellation, mirroring a Connection whose statement was marked by a
+/// `CANCEL_REQUEST` while the scan was between two rows.
+const CountingProbe = struct {
+    remaining: usize,
+
+    fn check(ctx: *anyopaque) error{Canceled}!void {
+        const self: *CountingProbe = @ptrCast(@alignCast(ctx));
+        if (self.remaining == 0) return error.Canceled;
+        self.remaining -= 1;
+    }
+};
+
+fn probeOpts(probe: *CountingProbe) ExecOptions {
+    return .{ .cancel = .{ .ctx = probe, .check = CountingProbe.check } };
+}
+
+test "a cancellation probe stops a relation scan between bounded work units" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-cancel-relation";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    var columns = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+    defer columns[0].deinit(gpa);
+    try eng.createTable("items", &columns);
+    for (0..10) |i| try eng.insert("items", &.{.{ .int = @intCast(i) }});
+
+    var request = try compile(gpa, "from items\n| emit { id }");
+    defer request.deinit(gpa);
+
+    // A probe that never fires leaves the scan untouched: identical result to
+    // the plain execute path.
+    var silent = CountingProbe{ .remaining = std.math.maxInt(usize) };
+    var full = try executeOpts(gpa, &eng, &request, probeOpts(&silent));
+    defer full.deinit();
+    try std.testing.expectEqual(@as(usize, 10), full.cells.len);
+
+    // A probe that fires after three rows stops the scan with error.Canceled;
+    // the partially built result and the snapshot are released by the error
+    // path, so the engine lock remains available to the caller.
+    var firing = CountingProbe{ .remaining = 3 };
+    try std.testing.expectError(error.Canceled, executeOpts(gpa, &eng, &request, probeOpts(&firing)));
+}
+
+test "a cancellation probe stops document and navigate scans" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-cancel-doc-graph";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try insertTestDocuments(gpa, &eng);
+    try insertTestGraph(gpa, &eng);
+
+    var doc_request = try compile(gpa, "from books\n| emit { title }");
+    defer doc_request.deinit(gpa);
+    var doc_probe = CountingProbe{ .remaining = 1 };
+    try std.testing.expectError(error.Canceled, executeOpts(gpa, &eng, &doc_request, probeOpts(&doc_probe)));
+
+    var nav_request = try compile(gpa, "from social\n| navigate mentors as mentee\n| emit { name, mentee.name }");
+    defer nav_request.deinit(gpa);
+    var nav_probe = CountingProbe{ .remaining = 1 };
+    try std.testing.expectError(error.Canceled, executeOpts(gpa, &eng, &nav_request, probeOpts(&nav_probe)));
+
+    // The evidence view observes the same cooperative boundary: the scan loop
+    // checks the probe per committed observation record.
+    _ = try eng.observe("camera_1", .image, "image/png", "2026-07-31T12:00:00+08:00", "test-camera", "development", "payload");
+    var ev_probe = CountingProbe{ .remaining = 0 };
+    var ev_request = try compile(gpa, "from observation_evidence\n| emit { object_id }");
+    defer ev_request.deinit(gpa);
+    try std.testing.expectError(error.Canceled, executeOpts(gpa, &eng, &ev_request, probeOpts(&ev_probe)));
+}
+
+test "a cancellation probe applies to transaction-scoped reads" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-cancel-tx";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    var columns = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+    defer columns[0].deinit(gpa);
+    try eng.createTable("items", &columns);
+    for (0..10) |i| try eng.insert("items", &.{.{ .int = @intCast(i) }});
+
+    var request = try compile(gpa, "from items\n| emit { id }");
+    defer request.deinit(gpa);
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    var probe = CountingProbe{ .remaining = 2 };
+    try std.testing.expectError(error.Canceled, executeTxOpts(gpa, &eng, &request, &tx, probeOpts(&probe)));
+}
+
