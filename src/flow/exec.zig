@@ -7,6 +7,7 @@ const ast = @import("ast.zig");
 const ir = @import("ir.zig");
 const engine_mod = @import("../storage/engine.zig");
 const table_mod = @import("../storage/table.zig");
+const document_mod = @import("../storage/document.zig");
 const value = @import("../storage/value.zig");
 const evidence = @import("../storage/evidence.zig");
 const txn_mod = @import("../txn/transaction.zig");
@@ -49,8 +50,10 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
     // for reads over older snapshots arrives with LSM storage (Phase 5).
     _ = eng.publishedSeq();
     if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
-    // Revision 0 is an explicit development binding of relation names to the
-    // existing table catalog. It is read-only and is not persisted as a model.
+    // Revision 0 is an explicit development binding of relation and document
+    // collection names to the existing catalog. It is read-only and is not
+    // persisted as a model.
+    if (eng.getDocumentCollection(request.relation) != null) return executeDocument(gpa, eng, request);
     const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
     const projection = try bindProjection(gpa, table, request.fields);
     defer gpa.free(projection);
@@ -85,6 +88,53 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
     return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
 }
 
+/// Execute a read-only Request over a document collection. Each emitted field
+/// is a dotted path resolved against the document (absent path reads as null);
+/// each `where` predicate evaluates the same way, so a predicate on an absent
+/// or differently typed field does not match that document. Reads follow the
+/// collection's insertion order, matching the relation slice's read order.
+fn executeDocument(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
+    const collection = eng.getDocumentCollection(request.relation) orelse return error.SemanticNameNotFound;
+    const projection = request.fields;
+    const columns = try gpa.alloc([]const u8, projection.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |path, index| columns[index] = path;
+
+    var bound = try bindDocumentWhere(gpa, request.where);
+    defer bound.deinit();
+
+    var owned_text: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (owned_text.items) |text| gpa.free(text);
+        owned_text.deinit(gpa);
+    }
+    var cells: std.ArrayList([]?[]const u8) = .empty;
+    errdefer {
+        for (cells.items) |row| gpa.free(row);
+        cells.deinit(gpa);
+    }
+
+    const pred_values = try gpa.alloc(value.Value, request.where.len);
+    defer gpa.free(pred_values);
+    const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
+    var emitted: usize = 0;
+    for (collection.order.items) |doc| {
+        if (emitted >= max_rows) break;
+        for (request.where, 0..) |*predicate, index| {
+            pred_values[index] = doc.pathValue(predicate.column) orelse .null;
+        }
+        if (!table_mod.valuesMatch(pred_values, bound.preds)) continue;
+        const row = try gpa.alloc(?[]const u8, projection.len);
+        errdefer gpa.free(row);
+        for (projection, 0..) |path, index| {
+            row[index] = try valueToText(gpa, &owned_text, doc.pathValue(path) orelse .null);
+        }
+        try cells.append(gpa, row);
+        emitted += 1;
+    }
+    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
+}
+
 /// Execute a read-only Request through an explicit transaction with Read
 /// Committed visibility: a relation `emit` sees committed state merged with the
 /// transaction's private write set (read-your-writes). Each Request re-reads
@@ -96,6 +146,9 @@ pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Req
     if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
     if (request.operation != .emit) return error.InvalidOperation;
     if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
+    // Document collections have no private write set in this slice; they are
+    // read from committed state exactly as outside a transaction.
+    if (eng.getDocumentCollection(request.relation) != null) return executeDocument(gpa, eng, request);
     const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
     const projection = try bindProjection(gpa, table, request.fields);
     defer gpa.free(projection);
@@ -316,6 +369,83 @@ fn bindEvidenceWhere(gpa: Allocator, predicates: []const ast.Predicate) !BoundWh
         preds[index] = try buildPred(gpa, field_index, evidence_fields[field_index].type_tag, predicate, &owned);
     }
     return .{ .gpa = gpa, .preds = preds, .owned = owned };
+}
+
+/// Bound predicates for a document collection. Predicate `col_index` is the
+/// predicate's position; `executeDocument` fills a per-document value array at
+/// those positions. `owned` holds the allocated `in`-list value arrays.
+const BoundDocumentWhere = struct {
+    gpa: Allocator,
+    preds: []table_mod.Pred,
+    owned: std.ArrayList([]value.Value) = .empty,
+
+    fn deinit(self: *BoundDocumentWhere) void {
+        for (self.owned.items) |values| self.gpa.free(values);
+        self.owned.deinit(self.gpa);
+        self.gpa.free(self.preds);
+    }
+};
+
+/// Bind document predicates without a declared column type: documents are
+/// variable-shape, so the literal keeps its own type and a predicate matches
+/// only a same-typed field value (`valuesMatch` treats a type mismatch as a
+/// non-match, exactly like an absent field reads as null).
+fn bindDocumentWhere(gpa: Allocator, predicates: []const ast.Predicate) !BoundDocumentWhere {
+    const preds = try gpa.alloc(table_mod.Pred, predicates.len);
+    errdefer gpa.free(preds);
+    var owned: std.ArrayList([]value.Value) = .empty;
+    errdefer {
+        for (owned.items) |values| gpa.free(values);
+        owned.deinit(gpa);
+    }
+    for (predicates, 0..) |*predicate, index| {
+        switch (predicate.op) {
+            .is_null => preds[index] = .{ .is_null = .{ .col_index = index, .negated = false } },
+            .not_null => preds[index] = .{ .is_null = .{ .col_index = index, .negated = true } },
+            .in, .not_in => {
+                const values = try gpa.alloc(value.Value, predicate.list.items.len);
+                errdefer gpa.free(values);
+                for (predicate.list.items, 0..) |*literal, literal_index| {
+                    values[literal_index] = literalToBorrowedValue(literal.*);
+                }
+                try owned.append(gpa, values);
+                preds[index] = .{ .in_list = .{ .col_index = index, .values = values, .negated = predicate.op == .not_in } };
+            },
+            .like, .not_like => {
+                preds[index] = .{ .like = .{ .col_index = index, .pattern = literalToBorrowedValue(predicate.scalar.?), .negated = predicate.op == .not_like } };
+            },
+            else => {
+                const literal = literalToBorrowedValue(predicate.scalar.?);
+                preds[index] = switch (predicate.op) {
+                    .eq => .{ .eq = .{ .col_index = index, .value = literal } },
+                    .neq, .lt, .gt, .lte, .gte => .{ .cmp = .{
+                        .col_index = index,
+                        .op = switch (predicate.op) {
+                            .neq => .neq,
+                            .lt => .lt,
+                            .gt => .gt,
+                            .lte => .lte,
+                            .gte => .gte,
+                            else => unreachable,
+                        },
+                        .value = literal,
+                    } },
+                    else => unreachable,
+                };
+            },
+        }
+    }
+    return .{ .gpa = gpa, .preds = preds, .owned = owned };
+}
+
+/// Convert a Flow literal to a borrowed scalar value. Text is borrowed from the
+/// Request, which outlives the match; no allocation or type coercion occurs.
+fn literalToBorrowedValue(literal: ast.Literal) value.Value {
+    return switch (literal) {
+        .int => |integer| .{ .int = integer },
+        .bool => |boolean| .{ .bool = boolean },
+        .text => |text| .{ .text = text },
+    };
 }
 
 fn buildPred(gpa: Allocator, column_index: usize, column_type: value.TypeTag, predicate: *const ast.Predicate, owned: *std.ArrayList([]value.Value)) !table_mod.Pred {
@@ -831,4 +961,107 @@ test "source and equivalent IR produce the same error" {
     var rel_b = try ir.decode(gpa, rel_bytes);
     defer rel_b.deinit(gpa);
     try std.testing.expectError(error.SemanticNameNotFound, execute(gpa, &eng, &rel_b));
+}
+
+// ── Document collection slice (roadmap Phase 2) ──
+
+fn insertTestDocuments(gpa: Allocator, eng: *engine_mod.Engine) !void {
+    try eng.createDocument("books");
+    var dune: [3]document_mod.Field = undefined;
+    dune[0] = .{ .path = try gpa.dupe(u8, "title"), .item = .{ .text = try gpa.dupe(u8, "Dune") } };
+    dune[1] = .{ .path = try gpa.dupe(u8, "author.name"), .item = .{ .text = try gpa.dupe(u8, "Herbert") } };
+    dune[2] = .{ .path = try gpa.dupe(u8, "pages"), .item = .{ .int = 412 } };
+    defer for (&dune) |*f| f.deinit(gpa);
+    try eng.insertDocument("books", "1", &dune);
+
+    var snow: [3]document_mod.Field = undefined;
+    snow[0] = .{ .path = try gpa.dupe(u8, "title"), .item = .{ .text = try gpa.dupe(u8, "Snow Crash") } };
+    snow[1] = .{ .path = try gpa.dupe(u8, "author.name"), .item = .{ .text = try gpa.dupe(u8, "Stephenson") } };
+    snow[2] = .{ .path = try gpa.dupe(u8, "pages"), .item = .{ .int = 480 } };
+    defer for (&snow) |*f| f.deinit(gpa);
+    try eng.insertDocument("books", "2", &snow);
+}
+
+test "reads a document collection with path projection and predicates" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-documents";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try insertTestDocuments(gpa, &eng);
+
+    var request = try compile(gpa, "from books\n| where author.name = 'Herbert'\n| emit { title, author.name, pages }\n| limit 5");
+    defer request.deinit(gpa);
+    var result = try execute(gpa, &eng, &request);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.cells.len);
+    try std.testing.expectEqualStrings("title", result.columns[0]);
+    try std.testing.expectEqualStrings("author.name", result.columns[1]);
+    try std.testing.expectEqualStrings("pages", result.columns[2]);
+    try std.testing.expectEqualStrings("Dune", result.cells[0][0].?);
+    try std.testing.expectEqualStrings("Herbert", result.cells[0][1].?);
+    try std.testing.expectEqualStrings("412", result.cells[0][2].?);
+
+    // Numeric predicate over a path; a path absent from a document reads null
+    // and never matches.
+    var pages = try compile(gpa, "from books\n| where pages >= 450\n| emit { title }");
+    defer pages.deinit(gpa);
+    var pages_result = try execute(gpa, &eng, &pages);
+    defer pages_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pages_result.cells.len);
+    try std.testing.expectEqualStrings("Snow Crash", pages_result.cells[0][0].?);
+
+    var absent = try compile(gpa, "from books\n| where genre = 'scifi'\n| emit { title, genre }");
+    defer absent.deinit(gpa);
+    var absent_result = try execute(gpa, &eng, &absent);
+    defer absent_result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), absent_result.cells.len);
+}
+
+test "document source and equivalent IR produce the same result" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-document-ir";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try insertTestDocuments(gpa, &eng);
+
+    const source = "from books\n| where pages > 400\n| emit { title, author.name }";
+    var request_a = try compile(gpa, source);
+    defer request_a.deinit(gpa);
+    var result_a = try execute(gpa, &eng, &request_a);
+    defer result_a.deinit();
+
+    const bytes = try ir.encode(gpa, &request_a);
+    defer gpa.free(bytes);
+    var request_b = try ir.decode(gpa, bytes);
+    defer request_b.deinit(gpa);
+    var result_b = try execute(gpa, &eng, &request_b);
+    defer result_b.deinit();
+
+    try std.testing.expectEqual(result_a.cells.len, result_b.cells.len);
+    try std.testing.expectEqual(@as(usize, 2), result_a.cells.len);
+    for (result_a.cells, 0..) |row, i| {
+        try std.testing.expectEqualStrings(row[0].?, result_b.cells[i][0].?);
+        try std.testing.expectEqualStrings(row[1].?, result_b.cells[i][1].?);
+    }
+}
+
+test "reading an unknown name still fails when a document collection exists" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-document-missing";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try insertTestDocuments(gpa, &eng);
+
+    var request = try compile(gpa, "from nothing\n| emit { title }");
+    defer request.deinit(gpa);
+    try std.testing.expectError(error.SemanticNameNotFound, execute(gpa, &eng, &request));
 }

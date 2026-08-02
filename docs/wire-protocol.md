@@ -104,6 +104,18 @@ or more `PAYLOAD_CHUNK` (`0x29`) frames, and `PAYLOAD_FINISH` (`0x2a`), followed
 by `COMMAND_COMPLETE`. The official RunaDB Client validates the returned ID,
 length, chunk bounds, and BLAKE3-256 digest.
 
+## Document Collections
+
+A canonical `document_insert` IR request ingests one document into a named
+document collection (a read-only vertical slice). Its payload is the collection
+name, the document id, and an ordered list of `(dotted-path, scalar value)`
+fields. The Server creates the collection on its first insert, rejects a
+duplicate document id, and returns one `document_id` row with
+`COMMAND_COMPLETE(INSERT DOCUMENT, 1)`. Field values are scalar (null, integer,
+text, boolean); a vector value is rejected as malformed. Reads use the ordinary
+`emit` Flow request over the collection, with dotted-path projection and
+`where` predicates.
+
 ## Result And Errors
 
 `ROW_DESCRIPTION` begins with a `u16` column count and names. `ROW_DATA` begins
@@ -124,6 +136,7 @@ length-prefixed text representation. `COMMAND_COMPLETE` contains a big-endian
 | `EV1002` | Invalid modality |
 | `EV1003` | Observation Evidence validation or commit failure |
 | `EV1004` | Evidence payload not found or unreadable |
+| `DF1001` | Document collection insert failure (unknown collection, duplicate id, or invalid field) |
 
 These errors and the relation binding are development-only. Protocol v3
 implements durable Observation Evidence writes, metadata reads, and payload

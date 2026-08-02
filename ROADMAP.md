@@ -138,8 +138,14 @@ adapter (ADR-0021) exposes the same read-only boundary through
 `runadb_flow_emit`. The evidence operator contract (metrics, instance-wide
 staging and retained-byte quotas, and staged-upload accounting) is implemented
 at the engine level; exposing it through an operator request surface is Phase 7
-administration work. The document and graph slices and the remaining World
-Continuum inspection forms remain outstanding below.
+administration work. The document collection slice is implemented through the
+official RunaDB Client: dotted-path `emit` fields and `where` predicates read
+variable-shape documents from durable, recoverable collections; the
+`document_insert` canonical IR operation ingests documents and creates the
+collection on its first insert; source and equivalent canonical IR produce the
+same result or error, verified end to end over the wire protocol; and
+collections survive checkpoint and restart. The graph slice and the remaining
+World Continuum inspection forms remain outstanding below.
 
 - Build relation, document, and graph read-only vertical slices through the
   official RunaDB Client, from Runa Flow source through binding and canonical

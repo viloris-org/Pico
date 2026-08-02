@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const value = @import("value.zig");
 const wal_mod = @import("wal.zig");
 const table_mod = @import("table.zig");
+const document_mod = @import("document.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const evidence_mod = @import("evidence.zig");
 const vector_mod = @import("../vector.zig");
@@ -119,6 +120,9 @@ pub const Engine = struct {
     wal: wal_mod.Wal,
     payloads: evidence_mod.Store,
     tables: std.StringHashMap(Table),
+    /// Document collections (roadmap Phase 2). A name is exclusive between
+    /// tables and document collections; recovery rebuilds both from the WAL.
+    documents: std.StringHashMap(document_mod.Collection),
     observations: std.ArrayList(evidence_mod.Record),
     next_evidence_id: u64 = 1,
     evidence_stats: EvidenceStats = .{},
@@ -175,6 +179,7 @@ pub const Engine = struct {
             .wal = wal,
             .payloads = payloads,
             .tables = std.StringHashMap(Table).init(gpa),
+            .documents = std.StringHashMap(document_mod.Collection).init(gpa),
             .observations = .empty,
             .coordinator = Coordinator.init(gpa, io),
         };
@@ -193,6 +198,11 @@ pub const Engine = struct {
             entry.value_ptr.deinit(self.gpa);
         }
         self.tables.deinit();
+        var doc_it = self.documents.iterator();
+        while (doc_it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.documents.deinit();
         for (self.observations.items) |*record| record.deinit(self.gpa);
         self.observations.deinit(self.gpa);
         self.payloads.deinit();
@@ -306,6 +316,27 @@ pub const Engine = struct {
                 self.next_evidence_id = metadata.evidence_id + 1;
                 self.evidence_stats.committed_count += 1;
                 self.evidence_stats.committed_bytes += metadata.payload_length;
+            },
+            .create_document => |create| {
+                if (self.documents.contains(create.name) or self.tables.contains(create.name)) return error.TableExists;
+                var collection = try document_mod.Collection.create(self.gpa, create.name);
+                errdefer collection.deinit();
+                try self.documents.put(collection.name, collection);
+            },
+            .insert_document => |ins| {
+                const collection = self.documents.getPtr(ins.collection) orelse return error.TableNotFound;
+                var fields: std.ArrayList(document_mod.Field) = .empty;
+                defer {
+                    for (fields.items) |*field| field.deinit(self.gpa);
+                    fields.deinit(self.gpa);
+                }
+                try fields.ensureTotalCapacity(self.gpa, ins.fields.len);
+                for (ins.fields) |*field| {
+                    const path = try self.gpa.dupe(u8, field.path);
+                    const item = try field.item.clone(self.gpa);
+                    fields.appendAssumeCapacity(.{ .path = path, .item = item });
+                }
+                try collection.insert(ins.id, fields.items);
             },
         }
     }
@@ -446,7 +477,7 @@ pub const Engine = struct {
     }
 
     fn createTableLocked(self: *Engine, name: []const u8, columns: []const value.Column) !void {
-        if (self.tables.contains(name)) return error.TableExists;
+        if (self.tables.contains(name) or self.documents.contains(name)) return error.TableExists;
 
         var specs: std.ArrayList(ColumnSpec) = .empty;
         defer specs.deinit(self.gpa);
@@ -477,6 +508,65 @@ pub const Engine = struct {
         defer self.writer_mutex.unlock(self.io);
         if (self.tables.contains(name)) return;
         try self.createTableLocked(name, columns);
+    }
+
+    // ── Document collections (roadmap Phase 2) ──
+
+    /// Create an empty document collection. The name is exclusive with tables;
+    /// the WAL record makes the collection durable before it is registered.
+    pub fn createDocument(self: *Engine, name: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        try self.createDocumentLocked(name);
+    }
+
+    fn createDocumentLocked(self: *Engine, name: []const u8) !void {
+        if (self.documents.contains(name) or self.tables.contains(name)) return error.TableExists;
+
+        try self.wal.appendCreateDocument(.{ .name = name });
+
+        var collection = try document_mod.Collection.create(self.gpa, name);
+        errdefer collection.deinit();
+        try self.documents.put(collection.name, collection);
+    }
+
+    /// Insert a document into a collection, rejecting a duplicate id. The
+    /// caller owns `fields`; the collection clones them. The document slice's
+    /// ingest is self-contained: inserting into a nonexistent collection
+    /// creates it (mirroring `observe`), and a table with the same name is
+    /// rejected.
+    pub fn insertDocument(self: *Engine, collection_name: []const u8, id: []const u8, fields: []const document_mod.Field) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+
+        // Validate before touching state or the WAL so a rejected insert leaves
+        // no record and creates no collection.
+        if (id.len == 0) return error.MissingDocumentId;
+        for (fields) |*field| if (field.path.len == 0) return error.EmptyFieldPath;
+
+        if (self.documents.getPtr(collection_name) == null) {
+            try self.createDocumentLocked(collection_name);
+        }
+        const collection = self.documents.getPtr(collection_name) orelse return error.TableNotFound;
+
+        // Reject a duplicate id before touching the WAL so a rejected insert
+        // leaves no record, mirroring the relation slice's pre-validation.
+        if (collection.contains(id)) return error.DuplicateDocumentId;
+
+        const records = try self.gpa.alloc(wal_mod.DocumentFieldRecord, fields.len);
+        defer self.gpa.free(records);
+        for (fields, 0..) |*field, index| {
+            records[index] = .{ .path = field.path, .item = field.item };
+        }
+        try self.wal.appendInsertDocument(.{ .collection = collection_name, .id = id, .fields = records });
+
+        try collection.insert(id, fields);
+    }
+
+    /// Look up a document collection, or null when no collection or table with
+    /// that name exists. Used by the semantic binding to route Flow requests.
+    pub fn getDocumentCollection(self: *Engine, name: []const u8) ?*document_mod.Collection {
+        return self.documents.getPtr(name);
     }
 
     /// Rank non-null embeddings in one table column. The caller owns the query
@@ -999,7 +1089,13 @@ pub const Engine = struct {
         var it = self.tables.iterator();
         while (it.next()) |entry| refs.appendAssumeCapacity(entry.value_ptr);
 
-        return checkpoint_mod.run(&self.wal, refs.items, self.observations.items, self.publishedSeq());
+        var doc_refs: std.ArrayList(*const document_mod.Collection) = .empty;
+        defer doc_refs.deinit(self.gpa);
+        try doc_refs.ensureTotalCapacity(self.gpa, self.documents.count());
+        var doc_it = self.documents.iterator();
+        while (doc_it.next()) |entry| doc_refs.appendAssumeCapacity(entry.value_ptr);
+
+        return checkpoint_mod.run(&self.wal, refs.items, doc_refs.items, self.observations.items, self.publishedSeq());
     }
 };
 
@@ -1669,5 +1765,47 @@ test "vector columns survive checkpoint and restart, and rank deterministically"
         try std.testing.expectEqual(@as(usize, 2), ranked.len);
         try std.testing.expectEqual(@as(usize, 1), ranked[0].row_index);
         try std.testing.expectEqual(@as(usize, 0), ranked[1].row_index);
+    }
+}
+
+test "document collections survive restart and checkpoint" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-engine-documents";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        try eng.createDocument("books");
+
+        var fields = [_]document_mod.Field{
+            .{ .path = try gpa.dupe(u8, "title"), .item = .{ .text = try gpa.dupe(u8, "Dune") } },
+            .{ .path = try gpa.dupe(u8, "author.name"), .item = .{ .text = try gpa.dupe(u8, "Herbert") } },
+        };
+        defer for (&fields) |*f| f.deinit(gpa);
+        try eng.insertDocument("books", "1", &fields);
+        // A duplicate id is rejected before any WAL record is written.
+        try std.testing.expectError(error.DuplicateDocumentId, eng.insertDocument("books", "1", &fields));
+        // A name cannot be both a table and a document collection.
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int }};
+        defer cols[0].deinit(gpa);
+        try std.testing.expectError(error.TableExists, eng.createTable("books", &cols));
+
+        const stats = try eng.checkpoint();
+        try std.testing.expectEqual(@as(usize, 1), stats.collections);
+        try std.testing.expectEqual(@as(usize, 1), stats.documents);
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        const collection = eng.getDocumentCollection("books") orelse return error.NotFound;
+        try std.testing.expectEqual(@as(usize, 1), collection.order.items.len);
+        const doc = collection.order.items[0];
+        try std.testing.expectEqualStrings("1", doc.id);
+        try std.testing.expectEqualStrings("Dune", doc.pathValue("title").?.text);
+        try std.testing.expectEqualStrings("Herbert", doc.pathValue("author.name").?.text);
     }
 }

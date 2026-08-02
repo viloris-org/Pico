@@ -29,6 +29,8 @@ RunaDB Server is under active development. The current implementation provides:
 - An opt-in MCP stdio adapter for Agent use with the read-only Runa Flow slice
 - Single-instance operation with a local data directory
 - The read-only Runa Flow relation projection slice
+- Read-only document collections with dotted-path projection, predicates, and
+  `document_insert` ingestion through the official RunaDB Client
 - Canonical Runa Query IR format version `4`
 - Immutable Observation Evidence payload storage and verified recovery
 - WAL-backed persistence and crash recovery
@@ -52,9 +54,10 @@ operations remain long-horizon target designs. See
 [ADR-0016](docs/adr/0016-long-horizon-unified-database.md) and
 [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
-Mutations, transactions, document and graph operations, semantic-model
+Relation mutations and transactions, graph operations, semantic-model
 persistence, authorization, and World Continuum bindings are not implemented
-as public capabilities.
+as public capabilities. Document reads and `document_insert` ingestion are a
+development slice; document mutation beyond insertion is not.
 
 ## Build
 

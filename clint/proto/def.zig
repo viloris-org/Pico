@@ -135,3 +135,19 @@ pub const Modality = enum(u8) {
     sensor = 5,
     other = 6,
 };
+
+/// A scalar value for a document field in the official RunaDB Client. Text is
+/// borrowed by the caller and owned by it for the duration of the request.
+pub const DocumentValue = union(enum) {
+    null,
+    int: i64,
+    text: []const u8,
+    bool: bool,
+};
+
+/// One field of a `document_insert` request. `path` is a dotted path (for
+/// example `author.name`).
+pub const DocumentField = struct {
+    path: []const u8,
+    value: DocumentValue,
+};

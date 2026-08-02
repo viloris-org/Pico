@@ -196,6 +196,23 @@ pub const Connection = struct {
         return result;
     }
 
+    /// Ingest one document into a named document collection through canonical
+    /// Runa Query IR. `fields` values are borrowed and must outlive the call.
+    /// The Server rejects a duplicate document id; the result's single row
+    /// carries the inserted id.
+    pub fn insertDocument(self: *Connection, collection: []const u8, id: []const u8, fields: []const proto.DocumentField) !QueryResult {
+        self.ensureBound();
+        const ir_bytes = try buildInsertDocumentIr(self.allocator, collection, id, fields);
+        defer self.allocator.free(ir_bytes);
+        var wrapped = try self.allocator.alloc(u8, 2 + ir_bytes.len);
+        defer self.allocator.free(wrapped);
+        std.mem.writeInt(u16, wrapped[0..2], proto.IR_FORMAT_VERSION, .big);
+        @memcpy(wrapped[2..], ir_bytes);
+        try codec.writeMessage(&self.writer.interface, .flow_ir, wrapped);
+        try self.writer.interface.flush();
+        return .{ .allocator = self.allocator, .reader = &self.reader.interface, .done = false };
+    }
+
     /// Request cooperative cancellation of the statement currently executing
     /// on this Connection. Fire-and-forget: the Server never replies, and an
     /// unknown or already-revoked credential is a protocol no-op. A cancellation
@@ -254,6 +271,44 @@ fn buildReadPayloadIr(gpa: Allocator, evidence_id: u64) ![]u8 {
     try output.append(gpa, 3);
     try appendInt(&output, gpa, u64, evidence_id);
     return output.toOwnedSlice(gpa);
+}
+
+fn buildInsertDocumentIr(gpa: Allocator, collection: []const u8, id: []const u8, fields: []const proto.DocumentField) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(gpa);
+    try appendInt(&output, gpa, u16, proto.IR_FORMAT_VERSION);
+    try appendInt(&output, gpa, u64, 0);
+    try output.append(gpa, 4); // document_insert operation
+    try appendIrString(&output, gpa, collection);
+    try appendIrString(&output, gpa, id);
+    if (fields.len > std.math.maxInt(u16)) return error.StringTooLarge;
+    try appendInt(&output, gpa, u16, @intCast(fields.len));
+    for (fields) |field| {
+        try appendIrString(&output, gpa, field.path);
+        try appendIrValue(&output, gpa, field.value);
+    }
+    return output.toOwnedSlice(gpa);
+}
+
+/// Canonical scalar encoding for document values, matching the Server's
+/// `readIrValue` in src/flow/ir.zig. Vectors are not part of the document
+/// slice, so there is no vector tag on the wire.
+fn appendIrValue(output: *std.ArrayList(u8), gpa: Allocator, item: proto.DocumentValue) !void {
+    switch (item) {
+        .null => try output.append(gpa, 0),
+        .int => |integer| {
+            try output.append(gpa, 1);
+            try appendInt(output, gpa, i64, integer);
+        },
+        .text => |text| {
+            try output.append(gpa, 2);
+            try appendIrString(output, gpa, text);
+        },
+        .bool => |boolean| {
+            try output.append(gpa, 3);
+            try output.append(gpa, if (boolean) 1 else 0);
+        },
+    }
 }
 
 fn appendInt(output: *std.ArrayList(u8), gpa: Allocator, comptime T: type, value: T) !void {

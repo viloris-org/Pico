@@ -3,6 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
+const value_mod = @import("../storage/value.zig");
 
 pub const FORMAT_VERSION: u16 = 4;
 pub const DEVELOPMENT_MODEL_REVISION: u64 = 0;
@@ -17,12 +18,15 @@ pub const IrError = error{
     InvalidIdentifier,
     InvalidOperation,
     InvalidModality,
+    UnsupportedValue,
 } || Allocator.Error;
 
 pub const Operation = enum(u8) {
     emit = 1,
     observe = 2,
     read_evidence_payload = 3,
+    /// Ingest one document into a named document collection (roadmap Phase 2).
+    document_insert = 4,
 };
 
 pub const Observe = struct {
@@ -41,6 +45,33 @@ pub const Observe = struct {
     }
 };
 
+/// One typed field of a document insert. `item` is a scalar value owned by the
+/// request; the engine clones it into the collection.
+pub const DocumentField = struct {
+    path: []u8,
+    item: value_mod.Value,
+
+    fn deinit(self: *DocumentField, gpa: Allocator) void {
+        gpa.free(self.path);
+        self.item.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentInsert = struct {
+    collection: []u8,
+    id: []u8,
+    fields: []DocumentField,
+
+    fn deinit(self: *DocumentInsert, gpa: Allocator) void {
+        gpa.free(self.collection);
+        gpa.free(self.id);
+        for (self.fields) |*field| field.deinit(gpa);
+        gpa.free(self.fields);
+        self.* = undefined;
+    }
+};
+
 pub const Request = struct {
     model_revision: u64,
     operation: Operation = .emit,
@@ -50,6 +81,7 @@ pub const Request = struct {
     limit: ?u32 = null,
     observe: ?Observe = null,
     evidence_id: u64 = 0,
+    document_insert: ?DocumentInsert = null,
 
     pub fn deinit(self: *Request, gpa: Allocator) void {
         gpa.free(self.relation);
@@ -58,6 +90,7 @@ pub const Request = struct {
         for (self.fields) |field| gpa.free(field);
         gpa.free(self.fields);
         if (self.observe) |*request| request.deinit(gpa);
+        if (self.document_insert) |*insert| insert.deinit(gpa);
     }
 };
 
@@ -106,6 +139,17 @@ pub fn encode(gpa: Allocator, request: *const Request) ![]u8 {
             try appendString(&output, gpa, observation.origin);
         },
         .read_evidence_payload => try appendInt(&output, gpa, u64, request.evidence_id),
+        .document_insert => {
+            const insert = request.document_insert.?;
+            try appendString(&output, gpa, insert.collection);
+            try appendString(&output, gpa, insert.id);
+            if (insert.fields.len > std.math.maxInt(u16)) return error.StringTooLarge;
+            try appendInt(&output, gpa, u16, @intCast(insert.fields.len));
+            for (insert.fields) |*field| {
+                try appendString(&output, gpa, field.path);
+                try appendIrValue(&output, gpa, field.item);
+            }
+        },
     }
     return output.toOwnedSlice(gpa);
 }
@@ -123,6 +167,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
     var observation: ?Observe = null;
     var evidence_id: u64 = 0;
     var limit: ?u32 = null;
+    var document_insert: ?DocumentInsert = null;
     var transferred = false;
     errdefer {
         if (!transferred) {
@@ -132,6 +177,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
             for (fields) |field| gpa.free(field);
             gpa.free(fields);
             if (observation) |*item| item.deinit(gpa);
+            if (document_insert) |*insert| insert.deinit(gpa);
         }
     }
     switch (operation) {
@@ -169,6 +215,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
         },
         .observe => observation = try decodeObserve(gpa, bytes, &pos),
         .read_evidence_payload => evidence_id = try readInt(u64, bytes, &pos),
+        .document_insert => document_insert = try decodeDocumentInsert(gpa, bytes, &pos),
     }
     if (pos != bytes.len) return error.InvalidFormat;
     var request = Request{
@@ -180,6 +227,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
         .limit = limit,
         .observe = observation,
         .evidence_id = evidence_id,
+        .document_insert = document_insert,
     };
     transferred = true;
     errdefer request.deinit(gpa);
@@ -200,6 +248,26 @@ fn decodeObserve(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!Observe
     errdefer gpa.free(observed_at);
     const origin = try readString(gpa, bytes, pos);
     return .{ .upload_id = upload_id, .object_id = object_id, .modality = modality, .media_type = media_type, .observed_at = observed_at, .origin = origin };
+}
+
+fn decodeDocumentInsert(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!DocumentInsert {
+    const collection = try readString(gpa, bytes, pos);
+    errdefer gpa.free(collection);
+    const id = try readString(gpa, bytes, pos);
+    errdefer gpa.free(id);
+    const count = try readInt(u16, bytes, pos);
+    var fields: std.ArrayList(DocumentField) = .empty;
+    errdefer {
+        for (fields.items) |*field| field.deinit(gpa);
+        fields.deinit(gpa);
+    }
+    try fields.ensureTotalCapacity(gpa, count);
+    for (0..count) |_| {
+        const path = try readString(gpa, bytes, pos);
+        const item = try readIrValue(gpa, bytes, pos);
+        fields.appendAssumeCapacity(.{ .path = path, .item = item });
+    }
+    return .{ .collection = collection, .id = id, .fields = try fields.toOwnedSlice(gpa) };
 }
 
 fn decodePredicate(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!ast.Predicate {
@@ -251,7 +319,7 @@ fn decodeLiteral(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!ast.Lit
 pub fn validate(request: *const Request) IrError!void {
     switch (request.operation) {
         .emit => {
-            if (request.observe != null or request.evidence_id != 0) return error.InvalidOperation;
+            if (request.observe != null or request.evidence_id != 0 or request.document_insert != null) return error.InvalidOperation;
             if (!ast.isIdentifier(request.relation)) return error.InvalidIdentifier;
             for (request.where) |predicate| {
                 // A relation column is a path of length one; a dotted path
@@ -286,12 +354,22 @@ pub fn validate(request: *const Request) IrError!void {
         },
         .observe => {
             const observation = request.observe orelse return error.InvalidOperation;
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.evidence_id != 0 or request.limit != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.evidence_id != 0 or request.limit != null or request.document_insert != null) return error.InvalidOperation;
             if (observation.upload_id == 0 or observation.object_id.len == 0 or observation.media_type.len == 0 or observation.observed_at.len == 0 or observation.origin.len == 0) return error.ExpectedField;
             if (observation.modality < 1 or observation.modality > 6) return error.InvalidModality;
         },
         .read_evidence_payload => {
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id == 0 or request.limit != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id == 0 or request.limit != null or request.document_insert != null) return error.InvalidOperation;
+        },
+        .document_insert => {
+            const insert = request.document_insert orelse return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null) return error.InvalidOperation;
+            if (insert.collection.len == 0 or insert.id.len == 0) return error.ExpectedField;
+            if (!ast.isIdentifier(insert.collection)) return error.InvalidIdentifier;
+            for (insert.fields) |*field| {
+                if (!ast.isPath(field.path)) return error.InvalidIdentifier;
+                if (field.item == .vector) return error.UnsupportedValue;
+            }
         },
     }
 }
@@ -395,6 +473,46 @@ fn appendLiteral(output: *std.ArrayList(u8), gpa: Allocator, literal: *const ast
             try output.append(gpa, if (boolean) 1 else 0);
         },
     }
+}
+
+/// Canonical scalar encoding for document values. Documents are scalar-only in
+/// this slice, so a vector value is rejected rather than silently stored.
+fn appendIrValue(output: *std.ArrayList(u8), gpa: Allocator, item: value_mod.Value) IrError!void {
+    switch (item) {
+        .null => try output.append(gpa, 0),
+        .int => |integer| {
+            try output.append(gpa, 1);
+            try appendInt(output, gpa, i64, integer);
+        },
+        .text => |text| {
+            try output.append(gpa, 2);
+            try appendString(output, gpa, text);
+        },
+        .bool => |boolean| {
+            try output.append(gpa, 3);
+            try output.append(gpa, if (boolean) 1 else 0);
+        },
+        .vector => return error.UnsupportedValue,
+    }
+}
+
+fn readIrValue(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!value_mod.Value {
+    if (pos.* >= bytes.len) return error.InvalidFormat;
+    const tag = bytes[pos.*];
+    pos.* += 1;
+    return switch (tag) {
+        0 => .null,
+        1 => .{ .int = try readInt(i64, bytes, pos) },
+        2 => .{ .text = try readString(gpa, bytes, pos) },
+        3 => blk: {
+            if (pos.* >= bytes.len) return error.InvalidFormat;
+            const boolean = bytes[pos.*];
+            pos.* += 1;
+            if (boolean > 1) return error.InvalidFormat;
+            break :blk .{ .bool = boolean == 1 };
+        },
+        else => return error.InvalidFormat,
+    };
 }
 
 fn readInt(comptime T: type, bytes: []const u8, pos: *usize) IrError!T {
@@ -586,4 +704,36 @@ test "IR decodes a canonical observe request" {
     try std.testing.expectEqual(Operation.observe, request.operation);
     try std.testing.expectEqual(@as(u64, 7), request.observe.?.upload_id);
     try std.testing.expectEqualStrings("image/png", request.observe.?.media_type);
+}
+
+test "document_insert IR round trips exactly" {
+    const gpa = std.testing.allocator;
+    const fields = try gpa.alloc(DocumentField, 3);
+    fields[0] = .{ .path = try gpa.dupe(u8, "title"), .item = .{ .text = try gpa.dupe(u8, "Dune") } };
+    fields[1] = .{ .path = try gpa.dupe(u8, "pages"), .item = .{ .int = 412 } };
+    fields[2] = .{ .path = try gpa.dupe(u8, "featured"), .item = .{ .bool = true } };
+    // The Request owns the collection, id, fields slice, and each field.
+    var request = Request{
+        .model_revision = DEVELOPMENT_MODEL_REVISION,
+        .operation = .document_insert,
+        .relation = @constCast(""),
+        .fields = &.{},
+        .document_insert = .{
+            .collection = try gpa.dupe(u8, "books"),
+            .id = try gpa.dupe(u8, "1"),
+            .fields = fields,
+        },
+    };
+    defer request.deinit(gpa);
+    const bytes = try encode(gpa, &request);
+    defer gpa.free(bytes);
+    var decoded = try decode(gpa, bytes);
+    defer decoded.deinit(gpa);
+    try std.testing.expectEqual(Operation.document_insert, decoded.operation);
+    try std.testing.expectEqualStrings("books", decoded.document_insert.?.collection);
+    try std.testing.expectEqualStrings("1", decoded.document_insert.?.id);
+    try std.testing.expectEqual(@as(usize, 3), decoded.document_insert.?.fields.len);
+    try std.testing.expectEqualStrings("title", decoded.document_insert.?.fields[0].path);
+    try std.testing.expectEqual(@as(i64, 412), decoded.document_insert.?.fields[1].item.int);
+    try std.testing.expectEqual(true, decoded.document_insert.?.fields[2].item.bool);
 }

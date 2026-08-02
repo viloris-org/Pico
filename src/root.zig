@@ -6,6 +6,7 @@ pub const vfs = @import("storage/vfs.zig");
 pub const pager = @import("storage/pager.zig");
 pub const wal = @import("storage/wal.zig");
 pub const table = @import("storage/table.zig");
+pub const document = @import("storage/document.zig");
 pub const checkpoint = @import("storage/checkpoint.zig");
 pub const evidence = @import("storage/evidence.zig");
 pub const vector = @import("vector.zig");
@@ -34,6 +35,7 @@ test {
     _ = pager;
     _ = wal;
     _ = table;
+    _ = document;
     _ = checkpoint;
     _ = evidence;
     _ = vector;
