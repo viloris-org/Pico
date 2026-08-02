@@ -747,3 +747,300 @@ test "a staged update followed by delete hides the row from the transaction" {
     defer committed.deinit();
     try std.testing.expectEqual(@as(usize, 0), committed.rows.len);
 }
+
+// ── Phase 3 exit-criteria verification ──
+//
+// The roadmap's Phase 3 exit criteria (ROADMAP.md:207-210) require deterministic
+// coverage of the failed-transaction state, primary-key and unique-key commit
+// conflicts, per-transaction write-set limits, and failure injection at every
+// WAL and publication boundary showing that restart exposes only the confirmed
+// commit prefix. The tests below close those gaps.
+
+test "a failed commit marks the transaction failed and rejects further operations" {
+    const dir = "zig-cache/runadb-txn-failed-commit";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{col("v", .int)});
+    try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 10 } });
+
+    // Connection A stages a lost update based on the original version; B
+    // commits the same row first, so A's commit conflicts.
+    var a = eng.beginTransaction();
+    defer a.deinit();
+    var b = eng.beginTransaction();
+    defer b.deinit();
+    try eng.stageUpdate(&a, "t", .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 20 } });
+    try eng.stageUpdate(&b, "t", .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 30 } });
+    try eng.commitTransaction(&b);
+    try std.testing.expectError(error.WriteWriteConflict, eng.commitTransaction(&a));
+
+    // A commit conflict leaves the transaction `failed`, not `idle`: further
+    // mutation is rejected with TransactionFailed until the connection rolls
+    // back, so a partial write set can never be committed silently later.
+    try std.testing.expect(a.isFailed());
+    try std.testing.expectError(error.TransactionFailed, eng.stageInsert(&a, "t", &.{ .{ .int = 2 }, .{ .int = 40 } }));
+    try std.testing.expectError(error.TransactionFailed, eng.stageDelete(&a, "t", .{ .int = 1 }));
+
+    // Rollback is the only operation a failed transaction accepts; it resets
+    // the transaction to idle, after which a fresh transaction may begin.
+    try eng.rollbackTransaction(&a);
+    try std.testing.expect(!a.isActive());
+    try std.testing.expectError(error.InvalidState, eng.stageInsert(&a, "t", &.{ .{ .int = 2 }, .{ .int = 40 } }));
+
+    var row = try eng.selectByPk("t", .{ .int = 1 });
+    defer row.deinit();
+    try std.testing.expectEqual(@as(i64, 30), row.rows[0].values[1].int);
+}
+
+test "WAL append failure rejects the whole group and publishes nothing" {
+    const dir = "zig-cache/runadb-txn-wal-append-fault";
+    cleanDir(dir);
+    var seq_before: u64 = 0;
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, true);
+        defer eng.deinit();
+        try makeTable(&eng, "t", "id", &.{col("v", .int)});
+        try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 10 } });
+        seq_before = eng.publishedSeq();
+
+        // Two accepted requests share one drain round whose WAL append fails
+        // before any byte is written. Neither may appear committed.
+        var tx_a = eng.beginTransaction();
+        defer tx_a.deinit();
+        try eng.stageInsert(&tx_a, "t", &.{ .{ .int = 2 }, .{ .int = 20 } });
+        var tx_b = eng.beginTransaction();
+        defer tx_b.deinit();
+        try eng.stageInsert(&tx_b, "t", &.{ .{ .int = 3 }, .{ .int = 30 } });
+        var req_a = try buildRequest(&tx_a);
+        defer req_a.deinit();
+        var req_b = try buildRequest(&tx_b);
+        defer req_b.deinit();
+
+        eng.wal.test_fail_next_group_append = true;
+        try eng.coordinator.submit(&eng, &req_a);
+        try eng.coordinator.submit(&eng, &req_b);
+        try eng.coordinator.drain(&eng);
+
+        try std.testing.expectEqual(error.WalAppendFailed, req_a.result.?);
+        try std.testing.expectEqual(error.WalAppendFailed, req_b.result.?);
+        try std.testing.expectEqual(seq_before, eng.publishedSeq());
+        var live = try eng.selectAll("t");
+        defer live.deinit();
+        try std.testing.expectEqual(@as(usize, 1), live.rows.len);
+    }
+    {
+        // Restart exposes only the prior confirmed prefix: the failed round
+        // wrote no WAL record, so nothing from it is replayed.
+        var eng = try engine_mod.Engine.open(gpa, io, dir, true);
+        defer eng.deinit();
+        try std.testing.expectEqual(seq_before, eng.publishedSeq());
+        var all = try eng.selectAll("t");
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+    }
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+}
+
+test "publication failure never advances the watermark and recovery converges to the durable prefix" {
+    const dir = "zig-cache/runadb-txn-apply-fault";
+    cleanDir(dir);
+    var seq_before: u64 = 0;
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, true);
+        defer eng.deinit();
+        try makeTable(&eng, "t", "id", &.{col("v", .int)});
+        try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 10 } });
+        seq_before = eng.publishedSeq();
+
+        var tx = eng.beginTransaction();
+        defer tx.deinit();
+        try eng.stageInsert(&tx, "t", &.{ .{ .int = 2 }, .{ .int = 20 } });
+
+        // Fail the publication (apply) of the next commit. The WAL record is
+        // already durable; only the in-memory publication is blocked.
+        eng.test_fail_next_apply = true;
+        try std.testing.expectError(error.PrimaryKeyNotFound, eng.commitTransaction(&tx));
+
+        // In-memory: the watermark does not advance and the row is not visible.
+        try std.testing.expectEqual(seq_before, eng.publishedSeq());
+        var live = try eng.selectAll("t");
+        defer live.deinit();
+        try std.testing.expectEqual(@as(usize, 1), live.rows.len);
+    }
+    {
+        // Restart converges to the WAL-confirmed prefix: the durable commit is
+        // replayed, so the row exists and the watermark includes its sequence.
+        var eng = try engine_mod.Engine.open(gpa, io, dir, true);
+        defer eng.deinit();
+        try std.testing.expectEqual(seq_before + 1, eng.publishedSeq());
+        var all = try eng.selectAll("t");
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 2), all.rows.len);
+    }
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+}
+
+test "same-key concurrent inserts conflict at commit" {
+    const dir = "zig-cache/runadb-txn-pk-conflict";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{});
+
+    // Two transactions stage the same primary key. The first to commit wins;
+    // the second fails at the coordinator's primary-key validation.
+    var a = eng.beginTransaction();
+    defer a.deinit();
+    var b = eng.beginTransaction();
+    defer b.deinit();
+    try eng.stageInsert(&a, "t", &.{.{ .int = 1 }});
+    try eng.stageInsert(&b, "t", &.{.{ .int = 1 }});
+
+    try eng.commitTransaction(&a);
+    try std.testing.expectError(error.DuplicatePrimaryKey, eng.commitTransaction(&b));
+    try std.testing.expect(b.isFailed());
+    try eng.rollbackTransaction(&b);
+
+    var all = try eng.selectAll("t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+}
+
+test "same-round primary-key conflicts reject the later request" {
+    const dir = "zig-cache/runadb-txn-pk-conflict-round";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{});
+
+    // Both requests reach the same drain round; the shadow exposes the earlier
+    // accepted request's insert so the later one is rejected before the WAL.
+    var tx_a = eng.beginTransaction();
+    defer tx_a.deinit();
+    try eng.stageInsert(&tx_a, "t", &.{.{ .int = 1 }});
+    var tx_b = eng.beginTransaction();
+    defer tx_b.deinit();
+    try eng.stageInsert(&tx_b, "t", &.{.{ .int = 1 }});
+    var req_a = try buildRequest(&tx_a);
+    defer req_a.deinit();
+    var req_b = try buildRequest(&tx_b);
+    defer req_b.deinit();
+
+    try eng.coordinator.submit(&eng, &req_a);
+    try eng.coordinator.submit(&eng, &req_b);
+    try eng.coordinator.drain(&eng);
+
+    try std.testing.expectEqual(@as(?commit_mod.CoordError, null), req_a.result);
+    try std.testing.expectEqual(error.DuplicatePrimaryKey, req_b.result.?);
+
+    var all = try eng.selectAll("t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+}
+
+test "same-round secondary unique conflicts are rejected at validation" {
+    const dir = "zig-cache/runadb-txn-unique-round";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    var columns = [_]value.Column{
+        .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+        .{ .name = try gpa.dupe(u8, "email"), .type_tag = .text, .unique = true },
+    };
+    defer for (&columns) |*c| c.deinit(gpa);
+    try eng.createTable("t", &columns);
+
+    // Two requests in one drain round insert distinct primary keys but the same
+    // unique email. The live table does not yet contain either row, so the
+    // conflict must be caught against the round shadow, not at apply time.
+    var tx_a = eng.beginTransaction();
+    defer tx_a.deinit();
+    var tx_b = eng.beginTransaction();
+    defer tx_b.deinit();
+    var email_a: value.Value = .{ .text = try gpa.dupe(u8, "a@x") };
+    defer email_a.deinit(gpa);
+    var email_b: value.Value = .{ .text = try gpa.dupe(u8, "a@x") };
+    defer email_b.deinit(gpa);
+    try eng.stageInsert(&tx_a, "t", &.{ .{ .int = 1 }, email_a });
+    try eng.stageInsert(&tx_b, "t", &.{ .{ .int = 2 }, email_b });
+    var req_a = try buildRequest(&tx_a);
+    defer req_a.deinit();
+    var req_b = try buildRequest(&tx_b);
+    defer req_b.deinit();
+
+    try eng.coordinator.submit(&eng, &req_a);
+    try eng.coordinator.submit(&eng, &req_b);
+    try eng.coordinator.drain(&eng);
+
+    try std.testing.expectEqual(@as(?commit_mod.CoordError, null), req_a.result);
+    try std.testing.expectEqual(error.UniqueViolation, req_b.result.?);
+
+    var all = try eng.selectAll("t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+}
+
+test "a secondary unique insert conflicts with a prior committed row" {
+    const dir = "zig-cache/runadb-txn-unique-committed";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    var columns = [_]value.Column{
+        .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+        .{ .name = try gpa.dupe(u8, "email"), .type_tag = .text, .unique = true },
+    };
+    defer for (&columns) |*c| c.deinit(gpa);
+    try eng.createTable("t", &columns);
+    var email_a: value.Value = .{ .text = try gpa.dupe(u8, "a@x") };
+    defer email_a.deinit(gpa);
+    var email_b: value.Value = .{ .text = try gpa.dupe(u8, "a@x") };
+    defer email_b.deinit(gpa);
+    try eng.insert("t", &.{ .{ .int = 1 }, email_a });
+    try std.testing.expectError(error.UniqueViolation, eng.insert("t", &.{ .{ .int = 2 }, email_b }));
+
+    var all = try eng.selectAll("t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+}
+
+test "per-transaction write-set limits reject oversized transactions" {
+    const dir = "zig-cache/runadb-txn-limits";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{});
+
+    // Operation-count bound: exceeding max_ops rejects the staging call.
+    var tx = eng.beginTransaction();
+    defer tx.deinit();
+    tx.limits.max_ops = 2;
+    try eng.stageInsert(&tx, "t", &.{.{ .int = 1 }});
+    try eng.stageInsert(&tx, "t", &.{.{ .int = 2 }});
+    try std.testing.expectError(error.OperationCountExceeded, eng.stageInsert(&tx, "t", &.{.{ .int = 3 }}));
+    try eng.rollbackTransaction(&tx);
+
+    // Staged-byte bound: a transaction whose staged weight would exceed the
+    // limit is rejected before it reaches the commit queue.
+    var tx2 = eng.beginTransaction();
+    defer tx2.deinit();
+    tx2.limits.max_staged_bytes = 1;
+    try std.testing.expectError(error.StagedBytesExceeded, eng.stageInsert(&tx2, "t", &.{.{ .int = 1 }}));
+    try eng.rollbackTransaction(&tx2);
+
+    var all = try eng.selectAll("t");
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 0), all.rows.len);
+}

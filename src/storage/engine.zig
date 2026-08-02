@@ -48,6 +48,10 @@ fn enginePkOf(eng: *Engine, table_name: []const u8, values: []const value.Value)
 }
 
 fn engineApplyOp(eng: *Engine, op: *const wal_mod.TxnOp) anyerror!void {
+    if (eng.test_fail_next_apply) {
+        eng.test_fail_next_apply = false;
+        return error.PrimaryKeyNotFound;
+    }
     return eng.applyTxnOp(op);
 }
 
@@ -151,6 +155,13 @@ pub const Engine = struct {
     /// unsynchronized against writers — see the concurrency note in
     /// `docs/architecture/wal-and-recovery.md`.
     writer_mutex: Io.Mutex = .init,
+    /// Test-only fault injection at the publication boundary: when true, the
+    /// next coordinator apply fails (as `PrimaryKeyNotFound`) before touching
+    /// the table. The WAL record is already durable at that point, so the test
+    /// asserts that an in-memory publication failure never loses a durable
+    /// commit and that restart converges to the WAL-confirmed prefix. Never set
+    /// outside tests.
+    test_fail_next_apply: bool = false,
 
     pub fn open(gpa: Allocator, io: Io, data_dir: []const u8, sync_wal: bool) !Engine {
         var wal = try wal_mod.Wal.open(gpa, io, data_dir, sync_wal);
@@ -358,6 +369,13 @@ pub const Engine = struct {
                     const pk = ins.values[pki];
                     if (findShadowRow(shadow, ins.table, pk) != null) return error.DuplicatePrimaryKey;
                 }
+                // Reject a secondary unique value that an earlier accepted
+                // request in this round already inserted. The live table does
+                // not yet contain that row, so this must be checked against the
+                // shadow or the conflict would surface only at apply time, after
+                // the WAL is durable, and break recovery on replay.
+                const pk: value.Value = if (table.pk_index) |pki| ins.values[pki] else .null;
+                if (shadowUniqueViolation(shadow, ins.table, pk, ins.values, table)) return error.UniqueViolation;
             },
             .update => |upd| {
                 const table = self.tables.getPtr(upd.table) orelse return error.PrimaryKeyNotFound;
@@ -377,6 +395,10 @@ pub const Engine = struct {
                     if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
                     table.validateUpdateAt(idx, upd.values) catch |err| return mapCoordError(err);
                 }
+                // Same-round secondary unique conflicts for updates: the live
+                // table is validated above, but an earlier accepted request in
+                // this round may hold the unique value without it being live.
+                if (shadowUniqueViolation(shadow, upd.table, upd.pk, upd.values, table)) return error.UniqueViolation;
             },
             .delete => |del| {
                 const table = self.tables.getPtr(del.table) orelse return error.PrimaryKeyNotFound;
@@ -646,7 +668,15 @@ pub const Engine = struct {
         transferred = true;
         const result = request.result;
         request.deinit();
-        if (result) |err| return err;
+        if (result) |err| {
+            // A commit that reaches the coordinator and fails — conflict,
+            // duplicate key, uniqueness, WAL append, or cancellation — leaves
+            // the transaction `failed`, not `idle`: the write set is gone but
+            // the connection must not silently continue as if it had committed.
+            // A failed transaction rejects every operation except rollback.
+            tx.state = .failed;
+            return err;
+        }
     }
 
     /// Rollback discards the transaction's private write set.
@@ -1017,6 +1047,33 @@ fn findShadowRow(shadow: []const commit_mod.ShadowEntry, table: []const u8, pk: 
         if (std.mem.eql(u8, entry.table, table) and entry.pk.eql(pk)) return entry;
     }
     return null;
+}
+
+/// Reject a secondary unique-column value already held by an earlier accepted
+/// request in the same round. `pk` is the target row's primary key (or null);
+/// shadow entries for that same row are the transaction's own prior writes and
+/// must not conflict with themselves.
+fn shadowUniqueViolation(
+    shadow: []const commit_mod.ShadowEntry,
+    table_name: []const u8,
+    pk: value.Value,
+    values: []const value.Value,
+    table: *const Table,
+) bool {
+    for (table.columns, 0..) |col, ci| {
+        // A single-column primary key is checked through `by_pk_*`; rechecking
+        // it here would make each insert O(round size).
+        if (!col.unique or (table.pk_index != null and ci == table.pk_index.?)) continue;
+        const v = values[ci];
+        if (v == .null) continue;
+        for (shadow) |*entry| {
+            if (!entry.present or !std.mem.eql(u8, entry.table, table_name)) continue;
+            if (pk != .null and entry.pk.eql(pk)) continue;
+            if (ci >= entry.values.len) continue;
+            if (value.Value.eql(entry.values[ci], v)) return true;
+        }
+    }
+    return false;
 }
 
 fn mapCoordError(err: table_mod.Error) commit_mod.CoordError {

@@ -174,6 +174,7 @@ pub const Transaction = struct {
     }
 
     fn expectWritable(self: *const Transaction) TxnError!void {
+        if (self.state == .failed) return error.TransactionFailed;
         if (self.state != .active) return error.InvalidState;
     }
 

@@ -179,9 +179,25 @@ unit, and official-client integration coverage. In the sequential listener a
 mid-statement delivery, including the delivered `CANCELED` outcome, is the Phase
 6 guarantee. Deterministic tests now cover
 autocommit, multi-statement commit, rollback, failed transactions, visibility,
-conflicts, cancellation, and bounded contention. The remaining items below are
-production support verification and the concurrent mid-statement cancellation
-delivery that the Phase 6 runtime enables.
+conflicts, cancellation, and bounded contention.
+
+The Phase 3 exit criteria are verified. A commit that reaches the coordinator
+and fails — conflict, duplicate key, uniqueness, WAL append, or cancellation —
+marks the transaction `failed`; a failed transaction rejects every operation
+except rollback, and the state transition is tested. Failure injection at the
+WAL-append boundary (a group-commit append that fails before any byte is
+written rejects every accepted request, publishes nothing, and leaves restart
+with the prior confirmed prefix) and at the publication boundary (a durable
+commit whose in-memory apply fails never advances the live watermark, and
+restart converges to the WAL-confirmed prefix) is covered deterministically.
+Same-round primary-key and secondary unique-column conflicts are validated
+against the round shadow before the WAL record, so a same-round uniqueness
+violation is rejected at validation rather than surfacing at apply time after
+the record is durable, and both paths are tested with restart evidence.
+Per-transaction write-set staging limits (`OperationCountExceeded` and
+`StagedBytesExceeded`) are tested. The remaining items are the concurrent
+mid-statement cancellation delivery and wire exposure of the Read Committed
+read path that the Phase 6 runtime enables.
 
 **Goal:** Replace compatibility transaction labels with verified transaction
 semantics while retaining one commit order.

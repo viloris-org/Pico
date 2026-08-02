@@ -133,6 +133,11 @@ pub const Wal = struct {
     /// Number of `syncData` calls performed by group-commit leaders. Useful for
     /// tests that assert concurrent appenders share durability rounds.
     sync_rounds: u64 = 0,
+    /// Test-only fault injection at the WAL-append boundary: when true, the
+    /// next `appendTxnBatchGroup` call fails before any byte is written, so no
+    /// WAL record becomes durable and every accepted request in the round is
+    /// rejected with `WalAppendFailed`. Never set outside tests.
+    test_fail_next_group_append: bool = false,
 
     pub const OpenError = Allocator.Error || Io.Dir.OpenError || Io.Dir.CreateDirPathOpenError || Io.File.OpenError || Io.File.StatError || Io.File.LengthError || error{
         InvalidWal,
@@ -333,6 +338,13 @@ pub const Wal = struct {
     pub fn appendTxnBatchGroup(self: *Wal, batches: []const TxnBatchGroup) !void {
         if (batches.len == 0) return error.InvalidWal;
         if (self.unusable) return error.WalUnusable;
+        if (self.test_fail_next_group_append) {
+            // Fail before any byte is written: no frame becomes durable, so no
+            // accepted request may appear committed and restart exposes only
+            // the prior confirmed prefix.
+            self.test_fail_next_group_append = false;
+            return error.WalUnusable;
+        }
 
         const end_offset = blk: {
             try self.append_mutex.lock(self.io);
