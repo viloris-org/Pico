@@ -171,6 +171,17 @@ pub const Engine = struct {
     /// unsynchronized against writers — see the concurrency note in
     /// `docs/architecture/wal-and-recovery.md`.
     writer_mutex: Io.Mutex = .init,
+    /// Statement-boundary serialization (roadmap Phase 6). A connection thread
+    /// holds `engine_lock` for the whole execution of one request (compile +
+    /// bind + execute and any mutation) and releases it before sending the
+    /// fully-owned result over the wire, so concurrent connections never observe
+    /// the engine mid-statement. The engine's `writer_mutex` and the commit
+    /// coordinator's own mutex nest under it: the lock order is always
+    /// `engine_lock -> (writer_mutex | coordinator.mutex)`, and no path acquires
+    /// `engine_lock` while holding another engine lock, so there is no cycle.
+    /// `coordinator.cancel` takes only the coordinator mutex and never touches
+    /// this lock, so cancellation cannot deadlock against a running statement.
+    engine_lock: Io.Mutex = .init,
     /// Test-only fault injection at the publication boundary: when true, the
     /// next coordinator apply fails (as `PrimaryKeyNotFound`) before touching
     /// the table. The WAL record is already durable at that point, so the test
@@ -229,6 +240,25 @@ pub const Engine = struct {
         self.snapshot_registry.deinit();
         self.wal.deinit();
         self.* = undefined;
+    }
+
+    /// Acquire the instance-wide statement-execution lock (roadmap Phase 6).
+    /// The net layer holds it around the whole execution of one request and
+    /// releases it before sending the result over the wire.
+    pub fn lock(self: *Engine, io: Io) Io.Cancelable!void {
+        try self.engine_lock.lock(io);
+    }
+
+    /// Release the instance-wide statement-execution lock.
+    pub fn unlock(self: *Engine, io: Io) void {
+        self.engine_lock.unlock(io);
+    }
+
+    /// Acquire the instance-wide statement-execution lock without a
+    /// cancellation point. Used by cleanup paths that must release accounting
+    /// exactly once (a connection dropping mid-upload).
+    pub fn lockUncancelable(self: *Engine, io: Io) void {
+        self.engine_lock.lockUncancelable(io);
     }
 
     fn recover(self: *Engine) !void {

@@ -42,6 +42,35 @@ const Attachment = struct {
     }
 };
 
+/// RAII guard over the engine's statement-execution lock (roadmap Phase 6). A
+/// connection thread holds the lock for the whole execution of one request —
+/// compile + bind + execute and any mutation — and releases it before the
+/// fully-owned result is sent over the wire. Because only one statement runs at
+/// a time, concurrent connections never observe the engine mid-statement, and a
+/// DDL that frees engine column state can never race a result being sent. The
+/// engine's `writer_mutex` and the coordinator's mutex nest under this lock.
+const EngineGuard = struct {
+    eng: *engine_mod.Engine,
+    io: Io,
+    held: bool = true,
+
+    fn acquire(eng: *engine_mod.Engine, io: Io) (Io.Cancelable)!EngineGuard {
+        try eng.lock(io);
+        return .{ .eng = eng, .io = io };
+    }
+
+    fn release(self: *EngineGuard) void {
+        if (self.held) {
+            self.held = false;
+            self.eng.unlock(self.io);
+        }
+    }
+
+    fn deinit(self: *EngineGuard) void {
+        self.release();
+    }
+};
+
 /// Handle one RunaDB protocol connection until terminate or error. The
 /// connection registers with the instance registry after accept and revokes
 /// its credential on every exit path, so a disconnected connection can never
@@ -104,8 +133,15 @@ pub fn handleConnection(
     var attachment: ?Attachment = null;
     defer if (attachment) |*item| {
         // A connection that drops mid-upload must release its staging
-        // reservation so the instance-wide quota cannot leak.
-        if (item.staging_reserved) eng.abortStage(item.expected_length);
+        // reservation so the instance-wide quota cannot leak. The staging
+        // counters are shared engine state, so the release runs under the
+        // uncancelable statement lock: it must complete exactly once on every
+        // exit path.
+        if (item.staging_reserved) {
+            eng.lockUncancelable(io);
+            eng.abortStage(item.expected_length);
+            eng.unlock(io);
+        }
         item.deinit(gpa);
     };
 
@@ -142,6 +178,8 @@ pub fn handleConnection(
                     try w.flush();
                     continue;
                 }
+                var guard = try EngineGuard.acquire(eng, io);
+                defer guard.deinit();
                 var request = flow.compile(gpa, source) catch |err| {
                     try sendError(w, 2, "RF1001", @errorName(err));
                     try w.flush();
@@ -155,6 +193,8 @@ pub fn handleConnection(
                 };
                 defer result.deinit();
 
+                // The result is fully owned; release the engine before sending.
+                guard.release();
                 try sendRowDescription(w, result.columns);
                 for (result.cells) |cell_row| {
                     try sendRowData(w, cell_row);
@@ -190,12 +230,15 @@ pub fn handleConnection(
                 defer request.deinit(gpa);
                 switch (request.operation) {
                     .emit => {
+                        var guard = try EngineGuard.acquire(eng, io);
+                        defer guard.deinit();
                         var result = flow.execute(gpa, eng, &request) catch |err| {
                             try sendError(w, 2, "RF1002", @errorName(err));
                             try w.flush();
                             continue;
                         };
                         defer result.deinit();
+                        guard.release();
                         try sendRowDescription(w, result.columns);
                         for (result.cells) |cell_row| try sendRowData(w, cell_row);
                         try sendCommandComplete(w, "EMIT", result.cells.len);
@@ -218,11 +261,14 @@ pub fn handleConnection(
                             continue;
                         };
                         const observation = request.observe.?;
+                        var guard = try EngineGuard.acquire(eng, io);
+                        defer guard.deinit();
                         const evidence_id = eng.observe(observation.object_id, modality, observation.media_type, observation.observed_at, observation.origin, "development", staged.bytes.items) catch |err| {
                             try sendError(w, 2, "EV1003", @errorName(err));
                             try w.flush();
                             continue;
                         };
+                        guard.release();
                         staged.deinit(gpa);
                         attachment = null;
                         var id_buf: [32]u8 = undefined;
@@ -235,11 +281,14 @@ pub fn handleConnection(
                         try w.flush();
                     },
                     .read_evidence_payload => {
+                        var guard = try EngineGuard.acquire(eng, io);
+                        defer guard.deinit();
                         const payload_bytes = eng.readEvidencePayload(request.evidence_id) catch |err| {
                             try sendError(w, 2, "EV1004", @errorName(err));
                             try w.flush();
                             continue;
                         };
+                        guard.release();
                         defer gpa.free(payload_bytes);
                         try sendPayload(w, request.evidence_id, payload_bytes);
                         try sendCommandComplete(w, "READ EVIDENCE PAYLOAD", 1);
@@ -255,11 +304,14 @@ pub fn handleConnection(
                         for (insert.fields) |*field| {
                             fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
                         }
+                        var guard = try EngineGuard.acquire(eng, io);
+                        defer guard.deinit();
                         eng.insertDocument(insert.collection, insert.id, fields.items) catch |err| {
                             try sendError(w, 2, "DF1001", @errorName(err));
                             try w.flush();
                             continue;
                         };
+                        guard.release();
                         var columns = [_][]const u8{"document_id"};
                         var cells = [_]?[]const u8{insert.id};
                         try sendRowDescription(w, &columns);
@@ -275,11 +327,14 @@ pub fn handleConnection(
                         for (insert.fields) |*field| {
                             fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
                         }
+                        var guard = try EngineGuard.acquire(eng, io);
+                        defer guard.deinit();
                         eng.addNode(insert.graph, insert.id, fields.items) catch |err| {
                             try sendError(w, 2, "GF1001", @errorName(err));
                             try w.flush();
                             continue;
                         };
+                        guard.release();
                         var node_columns = [_][]const u8{"node_id"};
                         var node_cells = [_]?[]const u8{insert.id};
                         try sendRowDescription(w, &node_columns);
@@ -289,11 +344,14 @@ pub fn handleConnection(
                     },
                     .graph_add_edge => {
                         const edge = request.graph_add_edge.?;
+                        var guard = try EngineGuard.acquire(eng, io);
+                        defer guard.deinit();
                         eng.addEdge(edge.graph, edge.from, edge.label, edge.to) catch |err| {
                             try sendError(w, 2, "GF1002", @errorName(err));
                             try w.flush();
                             continue;
                         };
+                        guard.release();
                         var edge_columns = [_][]const u8{"from", "label", "to"};
                         var edge_cells = [_]?[]const u8{ edge.from, edge.label, edge.to };
                         try sendRowDescription(w, &edge_columns);
@@ -318,11 +376,14 @@ pub fn handleConnection(
                 }
                 var expected_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
                 @memcpy(&expected_digest, payload[16..]);
+                var guard = try EngineGuard.acquire(eng, io);
+                defer guard.deinit();
                 eng.beginStage(expected_length) catch {
                     try sendError(w, 2, "EV1001", "staging quota exceeded");
                     try w.flush();
                     continue;
                 };
+                guard.release();
                 attachment = .{ .upload_id = upload_id, .expected_length = expected_length, .expected_digest = expected_digest, .staging_reserved = true };
             },
             .attachment_chunk => {
@@ -349,15 +410,26 @@ pub fn handleConnection(
                 const upload_id = std.mem.readInt(u64, payload[0..8], .big);
                 const staged = &attachment.?;
                 if (staged.upload_id != upload_id or staged.bytes.items.len != staged.expected_length or !std.mem.eql(u8, &evidence_mod.digest(staged.bytes.items), &staged.expected_digest)) {
-                    if (staged.staging_reserved) eng.abortStage(staged.expected_length);
+                    // The reservation is shared engine state: releasing it runs
+                    // under the statement lock so it cannot race another
+                    // connection's staging accounting.
+                    if (staged.staging_reserved) {
+                        var guard = try EngineGuard.acquire(eng, io);
+                        defer guard.deinit();
+                        eng.abortStage(staged.expected_length);
+                        guard.release();
+                    }
                     staged.deinit(gpa);
                     attachment = null;
                     try sendError(w, 2, "EV1001", "attachment length or digest mismatch");
                     try w.flush();
                     continue;
                 }
-                staged.finished = true;
+                var guard = try EngineGuard.acquire(eng, io);
+                defer guard.deinit();
                 eng.finishStage(staged.expected_length);
+                guard.release();
+                staged.finished = true;
                 staged.staging_reserved = false;
             },
             .attachment_abort => {
@@ -367,7 +439,10 @@ pub fn handleConnection(
                     continue;
                 }
                 const item = &attachment.?;
+                var guard = try EngineGuard.acquire(eng, io);
+                defer guard.deinit();
                 if (item.staging_reserved) eng.abortStage(item.expected_length);
+                guard.release();
                 item.deinit(gpa);
                 attachment = null;
             },
@@ -574,7 +649,7 @@ fn validGoodbyePayload(payload: []const u8) bool {
 test "row data encoding supports values larger than the old fixed buffer" {
     var value: [5_000]u8 = undefined;
     @memset(&value, 'x');
-    const cells = [_]?[]const u8{value[0..]};
+    var cells = [_]?[]const u8{value[0..]};
     var output: [5_012]u8 = undefined;
     var writer: Io.Writer = .fixed(&output);
 

@@ -111,6 +111,16 @@ pub const Server = struct {
             try writeToolError(w, id, "Runa Flow source exceeds the MCP message limit");
             return;
         }
+        // Phase 6 statement boundary: the whole compile + execute runs with the
+        // engine's statement-execution lock held, so a tool call never observes
+        // the engine mid-statement. The MCP stdio path is sequential, so the
+        // lock is uncontended here; it only guarantees safety if an MCP adapter
+        // ever shares an instance with a threaded network listener.
+        self.eng.lock(self.eng.io) catch |err| {
+            try writeToolError(w, id, @errorName(err));
+            return;
+        };
+        defer self.eng.unlock(self.eng.io);
         var request = flow.compile(self.gpa, source) catch |err| {
             try writeToolError(w, id, @errorName(err));
             return;

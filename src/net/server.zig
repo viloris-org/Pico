@@ -43,6 +43,54 @@ const RunaListenerConfig = struct {
     eng: *engine_mod.Engine,
 };
 
+/// One accepted connection, owned by a detached handler thread. The thread
+/// closes the stream on every exit path; the accept loop never touches it
+/// after `dispatchConnection` returns.
+const ConnectionWorker = struct {
+    gpa: Allocator,
+    io: Io,
+    stream: Io.net.Stream,
+    eng: *engine_mod.Engine,
+    registry: *registry_mod.Registry,
+    credential: connection_mod.Credential,
+
+    fn run(self: ConnectionWorker) void {
+        defer self.stream.close(self.io);
+        runadb.handleConnection(self.gpa, self.io, self.stream, self.eng, self.registry, self.credential) catch |err| {
+            std.log.warn("RunaDB connection closed with error: {s}", .{@errorName(err)});
+        };
+    }
+};
+
+/// Accept one connection and dispatch it onto a detached handler thread so
+/// multiple clients make progress concurrently (roadmap Phase 6). All logical
+/// mutation still routes through the single-writer commit coordinator, and each
+/// statement's engine access is serialized by the engine's statement-execution
+/// lock, so the bounded registry (capacity 1024) is the only concurrency bound.
+/// On a spawn failure the stream is closed here and the connection is dropped.
+pub fn dispatchConnection(
+    gpa: Allocator,
+    io: Io,
+    stream: Io.net.Stream,
+    eng: *engine_mod.Engine,
+    registry: *registry_mod.Registry,
+) void {
+    const worker = ConnectionWorker{
+        .gpa = gpa,
+        .io = io,
+        .stream = stream,
+        .eng = eng,
+        .registry = registry,
+        .credential = connection_mod.randomCredential(io),
+    };
+    if (std.Thread.spawn(.{}, ConnectionWorker.run, .{worker})) |thread| {
+        thread.detach();
+    } else |err| {
+        stream.close(io);
+        std.log.warn("runa listener: failed to spawn connection thread: {s}", .{@errorName(err)});
+    }
+}
+
 fn runRunaListener(cfg: RunaListenerConfig) !void {
     const gpa = cfg.gpa;
     const io = cfg.io;
@@ -59,12 +107,6 @@ fn runRunaListener(cfg: RunaListenerConfig) !void {
             std.log.err("runa listener: accept failed: {s}", .{@errorName(err)});
             continue;
         };
-        defer stream.close(io);
-        // A fresh unpredictable credential per Connection; it is delivered in
-        // HELLO_OK and revoked when the Connection closes.
-        const credential = connection_mod.randomCredential(io);
-        runadb.handleConnection(gpa, io, stream, cfg.eng, &registry, credential) catch |err| {
-            std.log.warn("RunaDB connection closed with error: {s}", .{@errorName(err)});
-        };
+        dispatchConnection(gpa, io, stream, cfg.eng, &registry);
     }
 }

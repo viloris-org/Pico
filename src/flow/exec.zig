@@ -36,6 +36,18 @@ pub const Result = struct {
     }
 };
 
+/// Duplicate a column name into `owned` and return the owned slice. Result
+/// column metadata is fully owned (Phase 6): a DDL that frees engine column
+/// state cannot race a result still being sent, because no borrowed engine
+/// memory escapes the statement-execution lock. Behavior is byte-identical to
+/// borrowing the name.
+fn ownColumn(gpa: Allocator, owned: *std.ArrayList([]u8), name: []const u8) ![]const u8 {
+    const copy = try gpa.dupe(u8, name);
+    errdefer gpa.free(copy);
+    try owned.append(gpa, copy);
+    return copy;
+}
+
 pub fn compile(gpa: Allocator, source: []const u8) !ir.Request {
     var parsed = try ast.parse(gpa, source);
     defer parsed.deinit(gpa);
@@ -59,14 +71,15 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
     const projection = try bindProjection(gpa, table, request.fields);
     defer gpa.free(projection);
 
-    const columns = try gpa.alloc([]const u8, projection.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |index, output_index| columns[output_index] = table.columns[index].name;
-
     var owned_text: std.ArrayList([]u8) = .empty;
     errdefer {
         for (owned_text.items) |text| gpa.free(text);
         owned_text.deinit(gpa);
+    }
+    const columns = try gpa.alloc([]const u8, projection.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |index, output_index| {
+        columns[output_index] = try ownColumn(gpa, &owned_text, table.columns[index].name);
     }
     var cells: std.ArrayList([]?[]const u8) = .empty;
     errdefer {
@@ -109,18 +122,20 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
 fn executeDocument(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
     const collection = eng.getDocumentCollection(request.relation) orelse return error.SemanticNameNotFound;
     const projection = request.fields;
-    const columns = try gpa.alloc([]const u8, projection.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |path, index| columns[index] = path;
-
-    var bound = try bindDocumentWhere(gpa, request.where);
-    defer bound.deinit();
-
     var owned_text: std.ArrayList([]u8) = .empty;
     errdefer {
         for (owned_text.items) |text| gpa.free(text);
         owned_text.deinit(gpa);
     }
+    const columns = try gpa.alloc([]const u8, projection.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |path, index| {
+        columns[index] = try ownColumn(gpa, &owned_text, path);
+    }
+
+    var bound = try bindDocumentWhere(gpa, request.where);
+    defer bound.deinit();
+
     var cells: std.ArrayList([]?[]const u8) = .empty;
     errdefer {
         for (cells.items) |row| gpa.free(row);
@@ -171,14 +186,15 @@ pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Req
     const projection = try bindProjection(gpa, table, request.fields);
     defer gpa.free(projection);
 
-    const columns = try gpa.alloc([]const u8, projection.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |index, output_index| columns[output_index] = table.columns[index].name;
-
     var owned_text: std.ArrayList([]u8) = .empty;
     errdefer {
         for (owned_text.items) |text| gpa.free(text);
         owned_text.deinit(gpa);
+    }
+    const columns = try gpa.alloc([]const u8, projection.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |index, output_index| {
+        columns[output_index] = try ownColumn(gpa, &owned_text, table.columns[index].name);
     }
     var cells: std.ArrayList([]?[]const u8) = .empty;
     errdefer {
@@ -246,14 +262,15 @@ fn executeEvidence(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.R
     for (request.fields, 0..) |field, output_index| {
         projection[output_index] = evidenceFieldIndex(field) orelse return error.FieldNotFound;
     }
-    const columns = try gpa.alloc([]const u8, request.fields.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |field_index, index| columns[index] = evidence_fields[field_index].name;
-
     var owned_text: std.ArrayList([]u8) = .empty;
     errdefer {
         for (owned_text.items) |text| gpa.free(text);
         owned_text.deinit(gpa);
+    }
+    const columns = try gpa.alloc([]const u8, request.fields.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |field_index, index| {
+        columns[index] = try ownColumn(gpa, &owned_text, evidence_fields[field_index].name);
     }
     var cells: std.ArrayList([]?[]const u8) = .empty;
     errdefer {
@@ -404,18 +421,20 @@ fn executeGraph(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Requ
     const navigate = request.navigate;
 
     const projection = request.fields;
-    const columns = try gpa.alloc([]const u8, projection.len);
-    errdefer gpa.free(columns);
-    for (projection, 0..) |path, index| columns[index] = path;
-
-    var bound = try bindDocumentWhere(gpa, request.where);
-    defer bound.deinit();
-
     var owned_text: std.ArrayList([]u8) = .empty;
     errdefer {
         for (owned_text.items) |text| gpa.free(text);
         owned_text.deinit(gpa);
     }
+    const columns = try gpa.alloc([]const u8, projection.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |path, index| {
+        columns[index] = try ownColumn(gpa, &owned_text, path);
+    }
+
+    var bound = try bindDocumentWhere(gpa, request.where);
+    defer bound.deinit();
+
     var cells: std.ArrayList([]?[]const u8) = .empty;
     errdefer {
         for (cells.items) |row| gpa.free(row);
