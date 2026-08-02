@@ -126,10 +126,18 @@ because its source syntax or IR shape exists.
 
 ### Phase 2: Read-Only Semantic-Model Vertical Slices
 
+**Status:** Complete. The relation, Observation Evidence (ADR-0019), document,
+and graph read-only slices are implemented through the official RunaDB Client
+as protocol v3 development capabilities. Each slice is supported and tested
+only for its published semantics; source and equivalent canonical Runa Query IR
+produce the same result or error, verified end to end over the wire protocol;
+and no slice claims a World Continuum capability beyond what it publishes. The
+delivery bullets below record the definitional work each slice satisfied.
+
 **Goal:** Prove the new public boundary through narrow, end-to-end read paths
 before adding mutations or declaring multiple data models supported.
 
-**Status:** The relation slice and the Observation Evidence slice (ADR-0019) are
+The relation slice and the Observation Evidence slice (ADR-0019) are
 implemented through the official RunaDB Client as a protocol v3 development
 capability, including immutable evidence ingestion, metadata inspection, bounded
 payload retrieval, checkpoint retention, restart recovery, orphan reclamation,
