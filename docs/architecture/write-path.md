@@ -217,11 +217,14 @@ write set over committed state instead of reading the live tables alone.
   same projection, `where`, and `limit` pipeline as a committed read. Text cell
   values are copied so a result survives the merged read being released.
 
-Because the tables hold one committed version per row and the single writer
-publishes only after WAL durability, a statement read observes the latest
-committed state at its start; Read Committed does not retain row history, so
-two statements in one transaction may observe intervening commits. Version
-retention for reads over older snapshots arrives with LSM storage (Phase 5).
+Because the single writer publishes only after WAL durability, a statement
+read observes the latest committed state at its start; Read Committed does not
+retain row history for the transaction, so two statements in one transaction
+may observe intervening commits. Version retention for reads over older
+snapshots is implemented (roadmap Phase 5): row versions carry a creation
+commit sequence, superseded versions are retained with a deletion interval,
+and a snapshot read interprets only versions committed at or before its
+starting watermark. On-disk LSM storage remains Phase 5 target work.
 
 ## Single Writer and Group Commit
 

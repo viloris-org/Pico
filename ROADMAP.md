@@ -282,6 +282,17 @@ VFS or without a versioned validation path.
 
 ### Phase 5: LSM Storage and MVCC Retention
 
+**Status:** The MVCC retention half is implemented as a development slice. Row
+versions carry a creation commit sequence, superseded versions are retained
+with a deletion interval, the engine tracks `oldest_active_snapshot_seq`
+through a bounded snapshot registry, reads interpret only versions committed at
+or before their starting watermark (a snapshot read stays stable across later
+commits and never waits on the write path), and reclamation frees only versions
+invisible to every active snapshot — with deterministic restart, recovery,
+point/range, and snapshot-safety coverage. The remaining work below is the
+on-disk LSM: ordered MemTables, sorted-string tables, flush, compaction, the
+LSM version-set manifest, and secondary indexes.
+
 **Goal:** Move table and index storage from the in-memory baseline to ordered,
 recoverable LSM structures while preserving snapshot visibility.
 
