@@ -11,15 +11,31 @@ pub const ParseError = error{
     ExpectedField,
     ExpectedOperator,
     ExpectedLiteral,
+    ExpectedAlias,
     InvalidIdentifier,
     InvalidLiteral,
     InvalidLimit,
     UnsupportedStage,
 } || Allocator.Error;
 
+/// A single `| navigate <edge> as <alias>` stage: for each current node, follow
+/// outgoing edges labeled `edge`; the destination node is addressable through
+/// `<alias>.<path>` in the following emit.
+pub const Navigate = struct {
+    edge: []u8,
+    alias: []u8,
+
+    pub fn deinit(self: *Navigate, gpa: Allocator) void {
+        gpa.free(self.edge);
+        gpa.free(self.alias);
+        self.* = undefined;
+    }
+};
+
 pub const Source = struct {
     relation: []u8,
     where: []Predicate = &.{},
+    navigate: ?Navigate = null,
     fields: [][]u8,
     limit: ?u32 = null,
 
@@ -27,6 +43,7 @@ pub const Source = struct {
         gpa.free(self.relation);
         for (self.where) |*predicate| predicate.deinit(gpa);
         gpa.free(self.where);
+        if (self.navigate) |*navigate| navigate.deinit(gpa);
         for (self.fields) |field| gpa.free(field);
         gpa.free(self.fields);
     }
@@ -102,12 +119,19 @@ pub fn parse(gpa: Allocator, source: []const u8) ParseError!Source {
         for (predicates.items) |*predicate| predicate.deinit(gpa);
         predicates.deinit(gpa);
     }
+    var navigate: ?Navigate = null;
+    errdefer if (navigate) |*navigate_stage| navigate_stage.deinit(gpa);
     var fields: [][]u8 = undefined;
     var fields_allocated = false;
     while (!fields_allocated) {
         const line = nextMeaningfulLine(&lines) orelse break;
         if (std.mem.startsWith(u8, line, "| where ")) {
             try predicates.append(gpa, try parseWhere(gpa, line));
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "| navigate ")) {
+            if (navigate != null) return error.UnsupportedStage;
+            navigate = try parseNavigate(gpa, line);
             continue;
         }
         if (std.mem.startsWith(u8, line, "| emit {")) {
@@ -129,6 +153,7 @@ pub fn parse(gpa: Allocator, source: []const u8) ParseError!Source {
     return .{
         .relation = relation,
         .where = try predicates.toOwnedSlice(gpa),
+        .navigate = navigate,
         .fields = fields,
         .limit = limit,
     };
@@ -170,6 +195,20 @@ fn parseEmit(gpa: Allocator, line: []const u8) ParseError![][]u8 {
         try fields.append(gpa, try gpa.dupe(u8, field));
     }
     return fields.toOwnedSlice(gpa);
+}
+
+/// Parse one `| navigate <edge> as <alias>` stage. `edge` and `alias` are
+/// single identifiers in the initial graph slice.
+fn parseNavigate(gpa: Allocator, line: []const u8) ParseError!Navigate {
+    const prefix = "| navigate ";
+    if (!std.mem.startsWith(u8, line, prefix)) return error.UnsupportedStage;
+    const body = std.mem.trim(u8, line[prefix.len..], " \t");
+    const as_index = std.mem.indexOf(u8, body, " as ") orelse return error.ExpectedAlias;
+    const edge = std.mem.trim(u8, body[0..as_index], " \t");
+    const alias = std.mem.trim(u8, body[as_index + " as ".len ..], " \t");
+    if (edge.len == 0 or alias.len == 0) return error.ExpectedAlias;
+    if (!isIdentifier(edge) or !isIdentifier(alias)) return error.InvalidIdentifier;
+    return .{ .edge = try gpa.dupe(u8, edge), .alias = try gpa.dupe(u8, alias) };
 }
 
 fn parseLimit(line: []const u8) ParseError!u32 {

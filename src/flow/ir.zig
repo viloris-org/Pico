@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const value_mod = @import("../storage/value.zig");
 
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
 pub const DEVELOPMENT_MODEL_REVISION: u64 = 0;
 
 pub const IrError = error{
@@ -27,6 +27,10 @@ pub const Operation = enum(u8) {
     read_evidence_payload = 3,
     /// Ingest one document into a named document collection (roadmap Phase 2).
     document_insert = 4,
+    /// Add one node to a named graph (roadmap Phase 2).
+    graph_add_node = 5,
+    /// Add one directed labeled edge to a named graph (roadmap Phase 2).
+    graph_add_edge = 6,
 };
 
 pub const Observe = struct {
@@ -72,6 +76,48 @@ pub const DocumentInsert = struct {
     }
 };
 
+/// A `navigate` stage on a graph: follow outgoing edges labeled `edge`; the
+/// destination node is addressable through `alias.<path>` in the emit.
+pub const Navigate = struct {
+    edge: []u8,
+    alias: []u8,
+
+    fn deinit(self: *Navigate, gpa: Allocator) void {
+        gpa.free(self.edge);
+        gpa.free(self.alias);
+        self.* = undefined;
+    }
+};
+
+pub const GraphAddNode = struct {
+    graph: []u8,
+    id: []u8,
+    fields: []DocumentField,
+
+    fn deinit(self: *GraphAddNode, gpa: Allocator) void {
+        gpa.free(self.graph);
+        gpa.free(self.id);
+        for (self.fields) |*field| field.deinit(gpa);
+        gpa.free(self.fields);
+        self.* = undefined;
+    }
+};
+
+pub const GraphAddEdge = struct {
+    graph: []u8,
+    from: []u8,
+    label: []u8,
+    to: []u8,
+
+    fn deinit(self: *GraphAddEdge, gpa: Allocator) void {
+        gpa.free(self.graph);
+        gpa.free(self.from);
+        gpa.free(self.label);
+        gpa.free(self.to);
+        self.* = undefined;
+    }
+};
+
 pub const Request = struct {
     model_revision: u64,
     operation: Operation = .emit,
@@ -82,15 +128,21 @@ pub const Request = struct {
     observe: ?Observe = null,
     evidence_id: u64 = 0,
     document_insert: ?DocumentInsert = null,
+    navigate: ?Navigate = null,
+    graph_add_node: ?GraphAddNode = null,
+    graph_add_edge: ?GraphAddEdge = null,
 
     pub fn deinit(self: *Request, gpa: Allocator) void {
         gpa.free(self.relation);
         for (self.where) |*predicate| predicate.deinit(gpa);
         gpa.free(self.where);
+        if (self.navigate) |*navigate| navigate.deinit(gpa);
         for (self.fields) |field| gpa.free(field);
         gpa.free(self.fields);
         if (self.observe) |*request| request.deinit(gpa);
         if (self.document_insert) |*insert| insert.deinit(gpa);
+        if (self.graph_add_node) |*insert| insert.deinit(gpa);
+        if (self.graph_add_edge) |*edge| edge.deinit(gpa);
     }
 };
 
@@ -102,8 +154,14 @@ pub fn bind(gpa: Allocator, source: ast.Source) !Request {
         for (predicates) |*predicate| predicate.deinit(gpa);
         gpa.free(predicates);
     }
+    var navigate = if (source.navigate) |*navigate_stage| blk: {
+        var copied = try duplicateNavigate(gpa, navigate_stage);
+        errdefer copied.deinit(gpa);
+        break :blk copied;
+    } else null;
+    errdefer if (navigate) |*navigate_stage| navigate_stage.deinit(gpa);
     const fields = try duplicateFields(gpa, source.fields);
-    const request = Request{ .model_revision = DEVELOPMENT_MODEL_REVISION, .relation = relation, .where = predicates, .fields = fields, .limit = source.limit };
+    const request = Request{ .model_revision = DEVELOPMENT_MODEL_REVISION, .relation = relation, .where = predicates, .navigate = navigate, .fields = fields, .limit = source.limit };
     try validate(&request);
     return request;
 }
@@ -128,6 +186,11 @@ pub fn encode(gpa: Allocator, request: *const Request) ![]u8 {
             for (request.fields) |field| try appendString(&output, gpa, field);
             try output.append(gpa, if (request.limit != null) 1 else 0);
             if (request.limit) |limit| try appendInt(&output, gpa, u32, limit);
+            try output.append(gpa, if (request.navigate != null) 1 else 0);
+            if (request.navigate) |*navigate| {
+                try appendString(&output, gpa, navigate.edge);
+                try appendString(&output, gpa, navigate.alias);
+            }
         },
         .observe => {
             const observation = request.observe.?;
@@ -150,6 +213,24 @@ pub fn encode(gpa: Allocator, request: *const Request) ![]u8 {
                 try appendIrValue(&output, gpa, field.item);
             }
         },
+        .graph_add_node => {
+            const insert = request.graph_add_node.?;
+            try appendString(&output, gpa, insert.graph);
+            try appendString(&output, gpa, insert.id);
+            if (insert.fields.len > std.math.maxInt(u16)) return error.StringTooLarge;
+            try appendInt(&output, gpa, u16, @intCast(insert.fields.len));
+            for (insert.fields) |*field| {
+                try appendString(&output, gpa, field.path);
+                try appendIrValue(&output, gpa, field.item);
+            }
+        },
+        .graph_add_edge => {
+            const edge = request.graph_add_edge.?;
+            try appendString(&output, gpa, edge.graph);
+            try appendString(&output, gpa, edge.from);
+            try appendString(&output, gpa, edge.label);
+            try appendString(&output, gpa, edge.to);
+        },
     }
     return output.toOwnedSlice(gpa);
 }
@@ -168,16 +249,22 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
     var evidence_id: u64 = 0;
     var limit: ?u32 = null;
     var document_insert: ?DocumentInsert = null;
+    var navigate_stage: ?Navigate = null;
+    var graph_add_node: ?GraphAddNode = null;
+    var graph_add_edge: ?GraphAddEdge = null;
     var transferred = false;
     errdefer {
         if (!transferred) {
             gpa.free(relation);
             for (predicates) |*predicate| predicate.deinit(gpa);
             gpa.free(predicates);
+            if (navigate_stage) |*navigate| navigate.deinit(gpa);
             for (fields) |field| gpa.free(field);
             gpa.free(fields);
             if (observation) |*item| item.deinit(gpa);
             if (document_insert) |*insert| insert.deinit(gpa);
+            if (graph_add_node) |*insert| insert.deinit(gpa);
+            if (graph_add_edge) |*edge| edge.deinit(gpa);
         }
     }
     switch (operation) {
@@ -212,10 +299,23 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
             pos += 1;
             if (has_limit > 1) return error.InvalidFormat;
             if (has_limit == 1) limit = try readInt(u32, bytes, &pos);
+            if (pos >= bytes.len) return error.InvalidFormat;
+            const has_navigate = bytes[pos];
+            pos += 1;
+            if (has_navigate > 1) return error.InvalidFormat;
+            if (has_navigate == 1) {
+                const edge = try readString(gpa, bytes, &pos);
+                errdefer gpa.free(edge);
+                const alias = try readString(gpa, bytes, &pos);
+                errdefer gpa.free(alias);
+                navigate_stage = .{ .edge = edge, .alias = alias };
+            }
         },
         .observe => observation = try decodeObserve(gpa, bytes, &pos),
         .read_evidence_payload => evidence_id = try readInt(u64, bytes, &pos),
         .document_insert => document_insert = try decodeDocumentInsert(gpa, bytes, &pos),
+        .graph_add_node => graph_add_node = try decodeGraphAddNode(gpa, bytes, &pos),
+        .graph_add_edge => graph_add_edge = try decodeGraphAddEdge(gpa, bytes, &pos),
     }
     if (pos != bytes.len) return error.InvalidFormat;
     var request = Request{
@@ -228,6 +328,9 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
         .observe = observation,
         .evidence_id = evidence_id,
         .document_insert = document_insert,
+        .navigate = navigate_stage,
+        .graph_add_node = graph_add_node,
+        .graph_add_edge = graph_add_edge,
     };
     transferred = true;
     errdefer request.deinit(gpa);
@@ -268,6 +371,37 @@ fn decodeDocumentInsert(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!
         fields.appendAssumeCapacity(.{ .path = path, .item = item });
     }
     return .{ .collection = collection, .id = id, .fields = try fields.toOwnedSlice(gpa) };
+}
+
+fn decodeGraphAddNode(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!GraphAddNode {
+    const graph = try readString(gpa, bytes, pos);
+    errdefer gpa.free(graph);
+    const id = try readString(gpa, bytes, pos);
+    errdefer gpa.free(id);
+    const count = try readInt(u16, bytes, pos);
+    var fields: std.ArrayList(DocumentField) = .empty;
+    errdefer {
+        for (fields.items) |*field| field.deinit(gpa);
+        fields.deinit(gpa);
+    }
+    try fields.ensureTotalCapacity(gpa, count);
+    for (0..count) |_| {
+        const path = try readString(gpa, bytes, pos);
+        const item = try readIrValue(gpa, bytes, pos);
+        fields.appendAssumeCapacity(.{ .path = path, .item = item });
+    }
+    return .{ .graph = graph, .id = id, .fields = try fields.toOwnedSlice(gpa) };
+}
+
+fn decodeGraphAddEdge(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!GraphAddEdge {
+    const graph = try readString(gpa, bytes, pos);
+    errdefer gpa.free(graph);
+    const from = try readString(gpa, bytes, pos);
+    errdefer gpa.free(from);
+    const label = try readString(gpa, bytes, pos);
+    errdefer gpa.free(label);
+    const to = try readString(gpa, bytes, pos);
+    return .{ .graph = graph, .from = from, .label = label, .to = to };
 }
 
 fn decodePredicate(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!ast.Predicate {
@@ -319,7 +453,7 @@ fn decodeLiteral(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!ast.Lit
 pub fn validate(request: *const Request) IrError!void {
     switch (request.operation) {
         .emit => {
-            if (request.observe != null or request.evidence_id != 0 or request.document_insert != null) return error.InvalidOperation;
+            if (request.observe != null or request.evidence_id != 0 or request.document_insert != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
             if (!ast.isIdentifier(request.relation)) return error.InvalidIdentifier;
             for (request.where) |predicate| {
                 // A relation column is a path of length one; a dotted path
@@ -351,25 +485,44 @@ pub fn validate(request: *const Request) IrError!void {
             }
             if (request.fields.len == 0) return error.ExpectedField;
             for (request.fields) |field| if (!ast.isPath(field)) return error.InvalidIdentifier;
+            if (request.navigate) |*navigate| {
+                if (!ast.isIdentifier(navigate.edge) or !ast.isIdentifier(navigate.alias)) return error.InvalidIdentifier;
+            }
         },
         .observe => {
             const observation = request.observe orelse return error.InvalidOperation;
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.evidence_id != 0 or request.limit != null or request.document_insert != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
             if (observation.upload_id == 0 or observation.object_id.len == 0 or observation.media_type.len == 0 or observation.observed_at.len == 0 or observation.origin.len == 0) return error.ExpectedField;
             if (observation.modality < 1 or observation.modality > 6) return error.InvalidModality;
         },
         .read_evidence_payload => {
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id == 0 or request.limit != null or request.document_insert != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id == 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
         },
         .document_insert => {
             const insert = request.document_insert orelse return error.InvalidOperation;
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
             if (insert.collection.len == 0 or insert.id.len == 0) return error.ExpectedField;
             if (!ast.isIdentifier(insert.collection)) return error.InvalidIdentifier;
             for (insert.fields) |*field| {
                 if (!ast.isPath(field.path)) return error.InvalidIdentifier;
                 if (field.item == .vector) return error.UnsupportedValue;
             }
+        },
+        .graph_add_node => {
+            const insert = request.graph_add_node orelse return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_edge != null) return error.InvalidOperation;
+            if (insert.graph.len == 0 or insert.id.len == 0) return error.ExpectedField;
+            if (!ast.isIdentifier(insert.graph)) return error.InvalidIdentifier;
+            for (insert.fields) |*field| {
+                if (!ast.isPath(field.path)) return error.InvalidIdentifier;
+                if (field.item == .vector) return error.UnsupportedValue;
+            }
+        },
+        .graph_add_edge => {
+            const edge = request.graph_add_edge orelse return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null) return error.InvalidOperation;
+            if (edge.graph.len == 0 or edge.from.len == 0 or edge.label.len == 0 or edge.to.len == 0) return error.ExpectedField;
+            if (!ast.isIdentifier(edge.graph) or !ast.isIdentifier(edge.label)) return error.InvalidIdentifier;
         },
     }
 }
@@ -415,6 +568,13 @@ fn duplicateLiteral(gpa: Allocator, source: *const ast.Literal) !ast.Literal {
         .int => |integer| .{ .int = integer },
         .bool => |boolean| .{ .bool = boolean },
         .text => |text| .{ .text = try gpa.dupe(u8, text) },
+    };
+}
+
+fn duplicateNavigate(gpa: Allocator, source: *const ast.Navigate) !Navigate {
+    return .{
+        .edge = try gpa.dupe(u8, source.edge),
+        .alias = try gpa.dupe(u8, source.alias),
     };
 }
 
@@ -551,13 +711,14 @@ test "IR encoding round trips exactly" {
 
 test "IR decode rejects an empty projection" {
     const bytes = [_]u8{
-        0, 4, // format version
+        0, 5, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
         0, // where predicate count
         0, 0, // field count
         0, // no limit
+        0, // no navigate
     };
     try std.testing.expectError(error.ExpectedField, decode(std.testing.allocator, &bytes));
 }
@@ -574,7 +735,7 @@ test "IR encode rejects identifiers outside the source grammar" {
 
 test "IR decode rejects an invalid limit presence flag" {
     const bytes = [_]u8{
-        0, 4, // format version
+        0, 5, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
@@ -589,7 +750,7 @@ test "IR decode rejects an invalid limit presence flag" {
 
 test "IR decode rejects an invalid predicate op" {
     const bytes = [_]u8{
-        0, 4, // format version
+        0, 5, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
@@ -602,7 +763,7 @@ test "IR decode rejects an invalid predicate op" {
 
 test "IR decode rejects an invalid in-list literal tag" {
     const bytes = [_]u8{
-        0, 4, // format version
+        0, 5, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
@@ -675,7 +836,7 @@ test "IR encode rejects an is null predicate with a literal" {
 
 test "IR decodes a canonical observe request" {
     const bytes = [_]u8{
-        0, 4, // format version
+        0, 5, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         2, // observe operation
         0, 0, 0,   0,   0,   0, 0, 7, // upload id

@@ -267,6 +267,40 @@ pub fn handleConnection(
                         try sendCommandComplete(w, "INSERT DOCUMENT", 1);
                         try w.flush();
                     },
+                    .graph_add_node => {
+                        const insert = request.graph_add_node.?;
+                        var fields: std.ArrayList(document_mod.Field) = .empty;
+                        defer fields.deinit(gpa);
+                        try fields.ensureTotalCapacity(gpa, insert.fields.len);
+                        for (insert.fields) |*field| {
+                            fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
+                        }
+                        eng.addNode(insert.graph, insert.id, fields.items) catch |err| {
+                            try sendError(w, 2, "GF1001", @errorName(err));
+                            try w.flush();
+                            continue;
+                        };
+                        var node_columns = [_][]const u8{"node_id"};
+                        var node_cells = [_]?[]const u8{insert.id};
+                        try sendRowDescription(w, &node_columns);
+                        try sendRowData(w, &node_cells);
+                        try sendCommandComplete(w, "ADD NODE", 1);
+                        try w.flush();
+                    },
+                    .graph_add_edge => {
+                        const edge = request.graph_add_edge.?;
+                        eng.addEdge(edge.graph, edge.from, edge.label, edge.to) catch |err| {
+                            try sendError(w, 2, "GF1002", @errorName(err));
+                            try w.flush();
+                            continue;
+                        };
+                        var edge_columns = [_][]const u8{"from", "label", "to"};
+                        var edge_cells = [_]?[]const u8{ edge.from, edge.label, edge.to };
+                        try sendRowDescription(w, &edge_columns);
+                        try sendRowData(w, &edge_cells);
+                        try sendCommandComplete(w, "ADD EDGE", 1);
+                        try w.flush();
+                    },
                 }
             },
             .attachment_begin => {

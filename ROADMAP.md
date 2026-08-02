@@ -144,8 +144,12 @@ variable-shape documents from durable, recoverable collections; the
 `document_insert` canonical IR operation ingests documents and creates the
 collection on its first insert; source and equivalent canonical IR produce the
 same result or error, verified end to end over the wire protocol; and
-collections survive checkpoint and restart. The graph slice and the remaining
-World Continuum inspection forms remain outstanding below.
+collections survive checkpoint and restart. The graph slice is implemented
+through the official RunaDB Client: labeled directed edges between
+document-like nodes, a `navigate <edge> as <alias>` traversal stage, and
+`graph_add_node`/`graph_add_edge` ingestion, with source-vs-IR equivalence,
+checkpoint/restart recovery, and official-client round-trip coverage. The
+remaining World Continuum inspection forms remain outstanding below.
 
 - Build relation, document, and graph read-only vertical slices through the
   official RunaDB Client, from Runa Flow source through binding and canonical

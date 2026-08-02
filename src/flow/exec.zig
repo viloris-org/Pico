@@ -18,6 +18,7 @@ pub const ExecError = ast.ParseError || ir.IrError || error{
     TypeMismatch,
     NonComparableColumn,
     ModelRevisionMismatch,
+    UnsupportedNavigate,
 } || Allocator.Error;
 
 pub const Result = struct {
@@ -50,11 +51,16 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
     // for reads over older snapshots arrives with LSM storage (Phase 5).
     _ = eng.publishedSeq();
     if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
-    // Revision 0 is an explicit development binding of relation and document
-    // collection names to the existing catalog. It is read-only and is not
-    // persisted as a model.
-    if (eng.getDocumentCollection(request.relation) != null) return executeDocument(gpa, eng, request);
+    // Revision 0 is an explicit development binding of relation, document, and
+    // graph names to the existing catalog. It is read-only and is not persisted
+    // as a model.
+    if (eng.getDocumentCollection(request.relation)) |_| {
+        if (request.navigate != null) return error.UnsupportedNavigate;
+        return executeDocument(gpa, eng, request);
+    }
+    if (eng.getGraph(request.relation) != null) return executeGraph(gpa, eng, request);
     const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
+    if (request.navigate != null) return error.UnsupportedNavigate;
     const projection = try bindProjection(gpa, table, request.fields);
     defer gpa.free(projection);
 
@@ -146,10 +152,15 @@ pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Req
     if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
     if (request.operation != .emit) return error.InvalidOperation;
     if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
-    // Document collections have no private write set in this slice; they are
-    // read from committed state exactly as outside a transaction.
-    if (eng.getDocumentCollection(request.relation) != null) return executeDocument(gpa, eng, request);
+    // Document and graph collections have no private write set in this slice;
+    // they are read from committed state exactly as outside a transaction.
+    if (eng.getDocumentCollection(request.relation)) |_| {
+        if (request.navigate != null) return error.UnsupportedNavigate;
+        return executeDocument(gpa, eng, request);
+    }
+    if (eng.getGraph(request.relation) != null) return executeGraph(gpa, eng, request);
     const table = eng.getTable(request.relation) orelse return error.SemanticNameNotFound;
+    if (request.navigate != null) return error.UnsupportedNavigate;
     const projection = try bindProjection(gpa, table, request.fields);
     defer gpa.free(projection);
 
@@ -369,6 +380,85 @@ fn bindEvidenceWhere(gpa: Allocator, predicates: []const ast.Predicate) !BoundWh
         preds[index] = try buildPred(gpa, field_index, evidence_fields[field_index].type_tag, predicate, &owned);
     }
     return .{ .gpa = gpa, .preds = preds, .owned = owned };
+}
+
+/// Execute a read-only Request over a graph. Without `navigate`, nodes read
+/// like documents. With `navigate`, every surviving source node is expanded
+/// into one row per outgoing edge carrying `edge.label`; the destination node
+/// is addressable through `alias.<path>` in the emit, while unqualified paths
+/// resolve against the source node. A node with no matching outgoing edge
+/// produces no row.
+fn executeGraph(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
+    const graph = eng.getGraph(request.relation) orelse return error.SemanticNameNotFound;
+    const navigate = request.navigate;
+
+    const projection = request.fields;
+    const columns = try gpa.alloc([]const u8, projection.len);
+    errdefer gpa.free(columns);
+    for (projection, 0..) |path, index| columns[index] = path;
+
+    var bound = try bindDocumentWhere(gpa, request.where);
+    defer bound.deinit();
+
+    var owned_text: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (owned_text.items) |text| gpa.free(text);
+        owned_text.deinit(gpa);
+    }
+    var cells: std.ArrayList([]?[]const u8) = .empty;
+    errdefer {
+        for (cells.items) |row| gpa.free(row);
+        cells.deinit(gpa);
+    }
+
+    const pred_values = try gpa.alloc(value.Value, request.where.len);
+    defer gpa.free(pred_values);
+    const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
+    var emitted: usize = 0;
+
+    if (navigate) |nav| {
+        for (graph.nodes.order.items) |source| {
+            if (emitted >= max_rows) break;
+            for (request.where, 0..) |*predicate, index| pred_values[index] = source.pathValue(predicate.column) orelse .null;
+            if (!table_mod.valuesMatch(pred_values, bound.preds)) continue;
+            for (graph.edges.items) |*edge_item| {
+                if (emitted >= max_rows) break;
+                if (!std.mem.eql(u8, edge_item.from, source.id) or !std.mem.eql(u8, edge_item.label, nav.edge)) continue;
+                const dest = graph.nodes.by_id.get(edge_item.to) orelse continue;
+                const row = try gpa.alloc(?[]const u8, projection.len);
+                errdefer gpa.free(row);
+                for (projection, 0..) |path, index| {
+                    const item = graphPathValue(nav.alias, source, dest, path);
+                    row[index] = try valueToText(gpa, &owned_text, item orelse .null);
+                }
+                try cells.append(gpa, row);
+                emitted += 1;
+            }
+        }
+    } else {
+        for (graph.nodes.order.items) |node| {
+            if (emitted >= max_rows) break;
+            for (request.where, 0..) |*predicate, index| pred_values[index] = node.pathValue(predicate.column) orelse .null;
+            if (!table_mod.valuesMatch(pred_values, bound.preds)) continue;
+            const row = try gpa.alloc(?[]const u8, projection.len);
+            errdefer gpa.free(row);
+            for (projection, 0..) |path, index| {
+                row[index] = try valueToText(gpa, &owned_text, node.pathValue(path) orelse .null);
+            }
+            try cells.append(gpa, row);
+            emitted += 1;
+        }
+    }
+    return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
+}
+
+/// Resolve an emit path against a navigate row: `alias.<path>` reads the
+/// destination node, any other path reads the source node.
+fn graphPathValue(alias: []const u8, source: *const document_mod.Document, dest: *const document_mod.Document, path: []const u8) ?value.Value {
+    if (std.mem.startsWith(u8, path, alias) and path.len > alias.len and path[alias.len] == '.') {
+        return dest.pathValue(path[alias.len + 1 ..]);
+    }
+    return source.pathValue(path);
 }
 
 /// Bound predicates for a document collection. Predicate `col_index` is the
@@ -1064,4 +1154,109 @@ test "reading an unknown name still fails when a document collection exists" {
     var request = try compile(gpa, "from nothing\n| emit { title }");
     defer request.deinit(gpa);
     try std.testing.expectError(error.SemanticNameNotFound, execute(gpa, &eng, &request));
+}
+
+fn insertTestGraph(gpa: Allocator, eng: *engine_mod.Engine) !void {
+    var ada: [1]document_mod.Field = undefined;
+    ada[0] = .{ .path = try gpa.dupe(u8, "name"), .item = .{ .text = try gpa.dupe(u8, "Ada") } };
+    defer for (&ada) |*f| f.deinit(gpa);
+    var grace: [1]document_mod.Field = undefined;
+    grace[0] = .{ .path = try gpa.dupe(u8, "name"), .item = .{ .text = try gpa.dupe(u8, "Grace") } };
+    defer for (&grace) |*f| f.deinit(gpa);
+    var lin: [1]document_mod.Field = undefined;
+    lin[0] = .{ .path = try gpa.dupe(u8, "name"), .item = .{ .text = try gpa.dupe(u8, "Lin") } };
+    defer for (&lin) |*f| f.deinit(gpa);
+
+    try eng.addNode("social", "1", &ada);
+    try eng.addNode("social", "2", &grace);
+    try eng.addNode("social", "3", &lin);
+    try eng.addEdge("social", "1", "mentors", "2");
+    try eng.addEdge("social", "1", "mentors", "3");
+    try eng.addEdge("social", "2", "collaborates", "3");
+}
+
+test "navigate follows labeled edges and projects source and destination fields" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-graph";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try insertTestGraph(gpa, &eng);
+
+    // Ada mentors Grace and Lin: navigate returns one row per matching edge,
+    // with the source node's name and the destination under the alias.
+    var request = try compile(gpa, "from social\n| navigate mentors as mentee\n| emit { name, mentee.name }\n| limit 5");
+    defer request.deinit(gpa);
+    var result = try execute(gpa, &eng, &request);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.cells.len);
+    try std.testing.expectEqualStrings("Ada", result.cells[0][0].?);
+    try std.testing.expectEqualStrings("Grace", result.cells[0][1].?);
+    try std.testing.expectEqualStrings("Ada", result.cells[1][0].?);
+    try std.testing.expectEqualStrings("Lin", result.cells[1][1].?);
+
+    // A node with no matching outgoing edge produces no row.
+    var none = try compile(gpa, "from social\n| navigate collaborates as peer\n| where name = 'Ada'\n| emit { name, peer.name }");
+    defer none.deinit(gpa);
+    var none_result = try execute(gpa, &eng, &none);
+    defer none_result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none_result.cells.len);
+
+    // Without navigate, nodes read like documents.
+    var plain = try compile(gpa, "from social\n| emit { name }\n| limit 2");
+    defer plain.deinit(gpa);
+    var plain_result = try execute(gpa, &eng, &plain);
+    defer plain_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plain_result.cells.len);
+    try std.testing.expectEqualStrings("Ada", plain_result.cells[0][0].?);
+}
+
+test "graph source and equivalent IR produce the same navigate result" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-graph-ir";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try insertTestGraph(gpa, &eng);
+
+    const source = "from social\n| navigate mentors as mentee\n| emit { name, mentee.name }\n| limit 5";
+    var request_a = try compile(gpa, source);
+    defer request_a.deinit(gpa);
+    var result_a = try execute(gpa, &eng, &request_a);
+    defer result_a.deinit();
+
+    const bytes = try ir.encode(gpa, &request_a);
+    defer gpa.free(bytes);
+    var request_b = try ir.decode(gpa, bytes);
+    defer request_b.deinit(gpa);
+    var result_b = try execute(gpa, &eng, &request_b);
+    defer result_b.deinit();
+
+    try std.testing.expectEqual(result_a.cells.len, result_b.cells.len);
+    try std.testing.expectEqual(@as(usize, 2), result_a.cells.len);
+    for (result_a.cells, 0..) |row, i| {
+        try std.testing.expectEqualStrings(row[0].?, result_b.cells[i][0].?);
+        try std.testing.expectEqualStrings(row[1].?, result_b.cells[i][1].?);
+    }
+}
+
+test "navigate on a relation is rejected" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-graph-reject";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    var columns = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+    defer columns[0].deinit(gpa);
+    try eng.createTable("customer", &columns);
+
+    var request = try compile(gpa, "from customer\n| navigate orders as order\n| emit { id }");
+    defer request.deinit(gpa);
+    try std.testing.expectError(error.UnsupportedNavigate, execute(gpa, &eng, &request));
 }

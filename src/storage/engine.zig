@@ -5,6 +5,7 @@ const value = @import("value.zig");
 const wal_mod = @import("wal.zig");
 const table_mod = @import("table.zig");
 const document_mod = @import("document.zig");
+const graph_mod = @import("graph.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const evidence_mod = @import("evidence.zig");
 const vector_mod = @import("../vector.zig");
@@ -123,6 +124,9 @@ pub const Engine = struct {
     /// Document collections (roadmap Phase 2). A name is exclusive between
     /// tables and document collections; recovery rebuilds both from the WAL.
     documents: std.StringHashMap(document_mod.Collection),
+    /// Graph collections (roadmap Phase 2). A name is exclusive with tables
+    /// and document collections.
+    graphs: std.StringHashMap(graph_mod.Graph),
     observations: std.ArrayList(evidence_mod.Record),
     next_evidence_id: u64 = 1,
     evidence_stats: EvidenceStats = .{},
@@ -180,6 +184,7 @@ pub const Engine = struct {
             .payloads = payloads,
             .tables = std.StringHashMap(Table).init(gpa),
             .documents = std.StringHashMap(document_mod.Collection).init(gpa),
+            .graphs = std.StringHashMap(graph_mod.Graph).init(gpa),
             .observations = .empty,
             .coordinator = Coordinator.init(gpa, io),
         };
@@ -203,6 +208,11 @@ pub const Engine = struct {
             entry.value_ptr.deinit();
         }
         self.documents.deinit();
+        var graph_it = self.graphs.iterator();
+        while (graph_it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.graphs.deinit();
         for (self.observations.items) |*record| record.deinit(self.gpa);
         self.observations.deinit(self.gpa);
         self.payloads.deinit();
@@ -337,6 +347,31 @@ pub const Engine = struct {
                     fields.appendAssumeCapacity(.{ .path = path, .item = item });
                 }
                 try collection.insert(ins.id, fields.items);
+            },
+            .create_graph => |create| {
+                if (self.graphs.contains(create.name) or self.tables.contains(create.name) or self.documents.contains(create.name)) return error.TableExists;
+                var graph = try graph_mod.Graph.create(self.gpa, create.name);
+                errdefer graph.deinit();
+                try self.graphs.put(graph.name, graph);
+            },
+            .add_node => |rec| {
+                const graph = self.graphs.getPtr(rec.graph) orelse return error.TableNotFound;
+                var fields: std.ArrayList(document_mod.Field) = .empty;
+                defer {
+                    for (fields.items) |*field| field.deinit(self.gpa);
+                    fields.deinit(self.gpa);
+                }
+                try fields.ensureTotalCapacity(self.gpa, rec.fields.len);
+                for (rec.fields) |*field| {
+                    const path = try self.gpa.dupe(u8, field.path);
+                    const item = try field.item.clone(self.gpa);
+                    fields.appendAssumeCapacity(.{ .path = path, .item = item });
+                }
+                try graph.addNode(rec.id, fields.items);
+            },
+            .add_edge => |rec| {
+                const graph = self.graphs.getPtr(rec.graph) orelse return error.TableNotFound;
+                try graph.addEdge(rec.from, rec.label, rec.to);
             },
         }
     }
@@ -567,6 +602,62 @@ pub const Engine = struct {
     /// that name exists. Used by the semantic binding to route Flow requests.
     pub fn getDocumentCollection(self: *Engine, name: []const u8) ?*document_mod.Collection {
         return self.documents.getPtr(name);
+    }
+
+    // ── Graph collections (roadmap Phase 2) ──
+
+    /// Create an empty graph. The name is exclusive with tables and document
+    /// collections.
+    pub fn createGraph(self: *Engine, name: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        try self.createGraphLocked(name);
+    }
+
+    fn createGraphLocked(self: *Engine, name: []const u8) !void {
+        if (self.graphs.contains(name) or self.tables.contains(name) or self.documents.contains(name)) return error.TableExists;
+
+        try self.wal.appendCreateGraph(.{ .name = name });
+
+        var graph = try graph_mod.Graph.create(self.gpa, name);
+        errdefer graph.deinit();
+        try self.graphs.put(graph.name, graph);
+    }
+
+    /// Add a node, creating the graph on its first node (mirroring the document
+    /// slice's self-contained ingest).
+    pub fn addNode(self: *Engine, graph_name: []const u8, id: []const u8, fields: []const document_mod.Field) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (id.len == 0) return error.MissingDocumentId;
+        for (fields) |*field| if (field.path.len == 0) return error.EmptyFieldPath;
+
+        if (self.graphs.getPtr(graph_name) == null) {
+            try self.createGraphLocked(graph_name);
+        }
+        const graph = self.graphs.getPtr(graph_name) orelse return error.TableNotFound;
+        if (graph.containsNode(id)) return error.DuplicateDocumentId;
+
+        const records = try self.gpa.alloc(wal_mod.DocumentFieldRecord, fields.len);
+        defer self.gpa.free(records);
+        for (fields, 0..) |*field, index| records[index] = .{ .path = field.path, .item = field.item };
+        try self.wal.appendAddNode(.{ .graph = graph_name, .id = id, .fields = records });
+        try graph.addNode(id, fields);
+    }
+
+    /// Add a directed labeled edge between two existing nodes.
+    pub fn addEdge(self: *Engine, graph_name: []const u8, from: []const u8, label: []const u8, to: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        const graph = self.graphs.getPtr(graph_name) orelse return error.TableNotFound;
+        if (!graph.containsNode(from) or !graph.containsNode(to)) return error.UnknownNode;
+        try self.wal.appendAddEdge(.{ .graph = graph_name, .from = from, .label = label, .to = to });
+        try graph.addEdge(from, label, to);
+    }
+
+    /// Look up a graph, or null when no graph with that name exists.
+    pub fn getGraph(self: *Engine, name: []const u8) ?*graph_mod.Graph {
+        return self.graphs.getPtr(name);
     }
 
     /// Rank non-null embeddings in one table column. The caller owns the query
@@ -1095,7 +1186,13 @@ pub const Engine = struct {
         var doc_it = self.documents.iterator();
         while (doc_it.next()) |entry| doc_refs.appendAssumeCapacity(entry.value_ptr);
 
-        return checkpoint_mod.run(&self.wal, refs.items, doc_refs.items, self.observations.items, self.publishedSeq());
+        var graph_refs: std.ArrayList(*const graph_mod.Graph) = .empty;
+        defer graph_refs.deinit(self.gpa);
+        try graph_refs.ensureTotalCapacity(self.gpa, self.graphs.count());
+        var graph_it = self.graphs.iterator();
+        while (graph_it.next()) |entry| graph_refs.appendAssumeCapacity(entry.value_ptr);
+
+        return checkpoint_mod.run(&self.wal, refs.items, doc_refs.items, graph_refs.items, self.observations.items, self.publishedSeq());
     }
 };
 
@@ -1807,5 +1904,42 @@ test "document collections survive restart and checkpoint" {
         try std.testing.expectEqualStrings("1", doc.id);
         try std.testing.expectEqualStrings("Dune", doc.pathValue("title").?.text);
         try std.testing.expectEqualStrings("Herbert", doc.pathValue("author.name").?.text);
+    }
+}
+
+test "graph collections survive restart and checkpoint" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-engine-graphs";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        try eng.createGraph("social");
+        var fields = [_]document_mod.Field{.{ .path = try gpa.dupe(u8, "name"), .item = .{ .text = try gpa.dupe(u8, "Ada") } }};
+        defer fields[0].deinit(gpa);
+        try eng.addNode("social", "1", &fields);
+        try eng.addNode("social", "2", &fields);
+        try eng.addEdge("social", "1", "mentors", "2");
+        // An edge to an unknown node is rejected before any WAL record.
+        try std.testing.expectError(error.UnknownNode, eng.addEdge("social", "1", "mentors", "99"));
+
+        const stats = try eng.checkpoint();
+        try std.testing.expectEqual(@as(usize, 1), stats.graphs);
+        try std.testing.expectEqual(@as(usize, 2), stats.graph_nodes);
+        try std.testing.expectEqual(@as(usize, 1), stats.graph_edges);
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        const graph = eng.getGraph("social") orelse return error.NotFound;
+        try std.testing.expectEqual(@as(usize, 2), graph.nodes.order.items.len);
+        try std.testing.expectEqual(@as(usize, 1), graph.edges.items.len);
+        try std.testing.expectEqualStrings("1", graph.edges.items[0].from);
+        try std.testing.expectEqualStrings("mentors", graph.edges.items[0].label);
+        try std.testing.expectEqualStrings("2", graph.edges.items[0].to);
     }
 }

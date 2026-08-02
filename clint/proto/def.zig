@@ -7,7 +7,7 @@
 /// peer can never misparse the trailing credential that v3 HELLO_OK appends.
 pub const PROTOCOL_VERSION_MAJOR: u16 = 3;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
-pub const IR_FORMAT_VERSION: u16 = 4;
+pub const IR_FORMAT_VERSION: u16 = 5;
 
 /// HELLO_OK (server -> client) layout — the shared parsing contract. The body
 /// is a length-prefixed server version string, then exactly

@@ -204,13 +204,25 @@ pub const Connection = struct {
         self.ensureBound();
         const ir_bytes = try buildInsertDocumentIr(self.allocator, collection, id, fields);
         defer self.allocator.free(ir_bytes);
-        var wrapped = try self.allocator.alloc(u8, 2 + ir_bytes.len);
-        defer self.allocator.free(wrapped);
-        std.mem.writeInt(u16, wrapped[0..2], proto.IR_FORMAT_VERSION, .big);
-        @memcpy(wrapped[2..], ir_bytes);
-        try codec.writeMessage(&self.writer.interface, .flow_ir, wrapped);
-        try self.writer.interface.flush();
-        return .{ .allocator = self.allocator, .reader = &self.reader.interface, .done = false };
+        return sendFlowIr(self, ir_bytes);
+    }
+
+    /// Add one node to a graph, creating the graph on its first node. `fields`
+    /// values are borrowed and must outlive the call.
+    pub fn addNode(self: *Connection, graph: []const u8, id: []const u8, fields: []const proto.DocumentField) !QueryResult {
+        self.ensureBound();
+        const ir_bytes = try buildGraphAddNodeIr(self.allocator, graph, id, fields);
+        defer self.allocator.free(ir_bytes);
+        return sendFlowIr(self, ir_bytes);
+    }
+
+    /// Add one directed labeled edge between two existing nodes. The Server
+    /// rejects an edge whose endpoints do not exist.
+    pub fn addEdge(self: *Connection, graph: []const u8, from: []const u8, label: []const u8, to: []const u8) !QueryResult {
+        self.ensureBound();
+        const ir_bytes = try buildGraphAddEdgeIr(self.allocator, graph, from, label, to);
+        defer self.allocator.free(ir_bytes);
+        return sendFlowIr(self, ir_bytes);
     }
 
     /// Request cooperative cancellation of the statement currently executing
@@ -273,6 +285,18 @@ fn buildReadPayloadIr(gpa: Allocator, evidence_id: u64) ![]u8 {
     return output.toOwnedSlice(gpa);
 }
 
+/// Wrap canonical IR bytes with the negotiated format version and send them as
+/// a FLOW_IR request. The caller owns `ir_bytes` and frees it after this call.
+fn sendFlowIr(self: *Connection, ir_bytes: []const u8) !QueryResult {
+    var wrapped = try self.allocator.alloc(u8, 2 + ir_bytes.len);
+    defer self.allocator.free(wrapped);
+    std.mem.writeInt(u16, wrapped[0..2], proto.IR_FORMAT_VERSION, .big);
+    @memcpy(wrapped[2..], ir_bytes);
+    try codec.writeMessage(&self.writer.interface, .flow_ir, wrapped);
+    try self.writer.interface.flush();
+    return .{ .allocator = self.allocator, .reader = &self.reader.interface, .done = false };
+}
+
 fn buildInsertDocumentIr(gpa: Allocator, collection: []const u8, id: []const u8, fields: []const proto.DocumentField) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(gpa);
@@ -287,6 +311,36 @@ fn buildInsertDocumentIr(gpa: Allocator, collection: []const u8, id: []const u8,
         try appendIrString(&output, gpa, field.path);
         try appendIrValue(&output, gpa, field.value);
     }
+    return output.toOwnedSlice(gpa);
+}
+
+fn buildGraphAddNodeIr(gpa: Allocator, graph: []const u8, id: []const u8, fields: []const proto.DocumentField) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(gpa);
+    try appendInt(&output, gpa, u16, proto.IR_FORMAT_VERSION);
+    try appendInt(&output, gpa, u64, 0);
+    try output.append(gpa, 5); // graph_add_node operation
+    try appendIrString(&output, gpa, graph);
+    try appendIrString(&output, gpa, id);
+    if (fields.len > std.math.maxInt(u16)) return error.StringTooLarge;
+    try appendInt(&output, gpa, u16, @intCast(fields.len));
+    for (fields) |field| {
+        try appendIrString(&output, gpa, field.path);
+        try appendIrValue(&output, gpa, field.value);
+    }
+    return output.toOwnedSlice(gpa);
+}
+
+fn buildGraphAddEdgeIr(gpa: Allocator, graph: []const u8, from: []const u8, label: []const u8, to: []const u8) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(gpa);
+    try appendInt(&output, gpa, u16, proto.IR_FORMAT_VERSION);
+    try appendInt(&output, gpa, u64, 0);
+    try output.append(gpa, 6); // graph_add_edge operation
+    try appendIrString(&output, gpa, graph);
+    try appendIrString(&output, gpa, from);
+    try appendIrString(&output, gpa, label);
+    try appendIrString(&output, gpa, to);
     return output.toOwnedSlice(gpa);
 }
 

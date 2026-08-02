@@ -31,7 +31,9 @@ RunaDB Server is under active development. The current implementation provides:
 - The read-only Runa Flow relation projection slice
 - Read-only document collections with dotted-path projection, predicates, and
   `document_insert` ingestion through the official RunaDB Client
-- Canonical Runa Query IR format version `4`
+- Read-only graphs with labeled edges, `navigate` traversal, and
+  `graph_add_node`/`graph_add_edge` ingestion through the official RunaDB Client
+- Canonical Runa Query IR format version `5`
 - Immutable Observation Evidence payload storage and verified recovery
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
@@ -54,10 +56,10 @@ operations remain long-horizon target designs. See
 [ADR-0016](docs/adr/0016-long-horizon-unified-database.md) and
 [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
-Relation mutations and transactions, graph operations, semantic-model
-persistence, authorization, and World Continuum bindings are not implemented
-as public capabilities. Document reads and `document_insert` ingestion are a
-development slice; document mutation beyond insertion is not.
+Relation mutations and transactions, graph traversal beyond one labeled hop,
+semantic-model persistence, authorization, and World Continuum bindings are
+not implemented as public capabilities. Document and graph reads and their
+ingest operations are development slices; mutation beyond insertion is not.
 
 ## Build
 

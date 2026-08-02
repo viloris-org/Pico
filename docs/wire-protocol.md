@@ -33,7 +33,7 @@ without changing shared state. A framed Request with an invalid payload returns
    unique within the Connection lifetime and must not be logged.
 3. Client sends `FLOW_SOURCE` (`0x10`), one length-prefixed Runa Flow source
    request, or `FLOW_IR` (`0x15`), a big-endian `u16` IR format version plus
-   canonical Runa Query IR bytes. The implemented IR format version is `4`.
+   canonical Runa Query IR bytes. The implemented IR format version is `5`.
 4. Server responds with `ROW_DESCRIPTION` (`0x11`), zero or more `ROW_DATA`
    (`0x12`) messages, and `COMMAND_COMPLETE` (`0x13`), or with `SERVER_ERROR`
    (`0x14`). The initial Flow slice's successful completion tag is `EMIT`.
@@ -116,6 +116,17 @@ text, boolean); a vector value is rejected as malformed. Reads use the ordinary
 `emit` Flow request over the collection, with dotted-path projection and
 `where` predicates.
 
+## Graph Collections
+
+Canonical `graph_add_node` and `graph_add_edge` IR requests ingest into a graph
+collection. `graph_add_node` carries the graph name, a node id, and an ordered
+list of scalar fields; the Server creates the graph on its first node and
+returns one `node_id` row with `COMMAND_COMPLETE(ADD NODE, 1)`.
+`graph_add_edge` carries the graph name and a `(from, label, to)` triple; both
+endpoints must already exist and the triple must be unique. Reads use the
+`navigate` Flow stage over the graph: `from <graph> | navigate <edge> as
+<alias> | emit { ... }`, where `alias.<path>` projects the destination node.
+
 ## Result And Errors
 
 `ROW_DESCRIPTION` begins with a `u16` column count and names. `ROW_DATA` begins
@@ -137,6 +148,8 @@ length-prefixed text representation. `COMMAND_COMPLETE` contains a big-endian
 | `EV1003` | Observation Evidence validation or commit failure |
 | `EV1004` | Evidence payload not found or unreadable |
 | `DF1001` | Document collection insert failure (unknown collection, duplicate id, or invalid field) |
+| `GF1001` | Graph node add failure (duplicate node id or invalid field) |
+| `GF1002` | Graph edge add failure (unknown endpoint or duplicate edge) |
 
 These errors and the relation binding are development-only. Protocol v3
 implements durable Observation Evidence writes, metadata reads, and payload
