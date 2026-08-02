@@ -43,6 +43,11 @@ RunaDB Server is under active development. The current implementation provides:
 - A single-writer commit coordinator: transaction write sets with commit/rollback,
   group commit, observed-version write-write conflict detection, bounded commit
   admission, and a durable MVCC commit watermark recovered on restart
+- A bounded work-queue scheduler core (`src/runtime/scheduler.zig`): operation
+  states, fixed per-class capacity, a bounded completion queue, class-priority
+  tick submission, and backpressure hysteresis, validated deterministically
+  against a fake platform backend (engine-level development slice; socket-I/O
+  reactor and per-Connection backpressure are not yet wired)
 
 The storage format and execution architecture are still evolving. Persistent
 LSM tables, secondary indexes, MVCC snapshot reads over retained versions, and

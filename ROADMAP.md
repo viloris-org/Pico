@@ -327,10 +327,17 @@ stays usable — with deterministic engine-level, threaded-listener wire, and of
 integration coverage, plus registry hit counting. Slow-consumer and connection-loss fault
 regressions are implemented: a Connection that never reads leaves its own handler blocked in
 the result send without holding the engine statement lock, other Connections keep making
-progress, and closing the slow stream unblocks the handler and empties the registry. The
-remaining work below is execution
-programs with streaming/backpressure, the runtime I/O scheduler and bounded work queues, and
-the queue-saturation and compaction-pressure load regressions.
+progress, and closing the slow stream unblocks the handler and empties the registry. The bounded
+work-queue scheduler core is implemented as a development slice: `src/runtime/scheduler.zig`
+owns operation states, fixed per-class slot/byte capacity, the bounded completion queue, and the
+tick discipline from the I/O scheduling contract (completion extraction records only results,
+callbacks run within a budget and never drive the platform, and submission follows class priority
+— critical first, foreground round-robin at owner granularity, maintenance with the remaining
+per-tick budget) with high/low backpressure hysteresis, cancellation of queued cancellable work,
+and deterministic regressions against a fake platform backend. The remaining work below is execution
+programs with streaming/backpressure, socket-I/O reactor work and per-Connection backpressure on
+the scheduler, reserved WAL slots for commit, and the queue-saturation and compaction-pressure load
+regressions.
 
 **Goal:** Scale execution and connection handling without crossing ownership
 boundaries or weakening commit correctness.

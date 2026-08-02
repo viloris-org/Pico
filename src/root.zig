@@ -31,6 +31,7 @@ pub const server = @import("net/server.zig");
 pub const mcp = @import("net/mcp.zig");
 pub const connection = @import("net/connection.zig");
 pub const registry = @import("net/registry.zig");
+pub const runtime = @import("runtime/scheduler.zig");
 pub const runtime_test = @import("net/runtime_test.zig");
 
 test {
@@ -59,5 +60,6 @@ test {
     _ = mcp;
     _ = connection;
     _ = registry;
+    _ = runtime;
     _ = runtime_test;
 }

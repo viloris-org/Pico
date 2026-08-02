@@ -21,8 +21,13 @@ units, so a canceled scan stops at the next row boundary and the Server returns 
 Slow-consumer and connection-loss fault regressions verify that a Connection that never reads
 blocks only its own result send (the statement lock is released before sending, so other
 Connections keep making progress) and that closing the slow stream unblocks the handler and
-empties the registry. Streaming results with backpressure, the I/O scheduler, bounded work
-queues, and the queue-saturation and compaction-pressure load regressions remain target work.
+empties the registry. The bounded work-queue scheduler core is implemented as a development
+slice: `src/runtime/scheduler.zig` owns operation states, fixed per-class capacity, the bounded
+completion queue, and the tick discipline (extract-only completion recording, bounded callback
+processing, then class-priority submission), validated deterministically against a fake platform
+backend. Streaming results with backpressure, socket-I/O reactor work, the I/O scheduler's
+per-Connection backpressure, reserved WAL slots, and the queue-saturation and
+compaction-pressure load regressions remain target work.
 
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 
