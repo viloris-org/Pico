@@ -261,6 +261,14 @@ pub const Engine = struct {
         self.engine_lock.lockUncancelable(io);
     }
 
+    /// Try to acquire the statement-execution lock without blocking. Used by
+    /// the runtime fault regressions to observe that a slow consumer does not
+    /// hold the lock while its result is being sent; returns false when a
+    /// statement is currently executing under the lock.
+    pub fn tryLock(self: *Engine) bool {
+        return self.engine_lock.tryLock();
+    }
+
     fn recover(self: *Engine) !void {
         try wal_mod.replayWal(&self.wal, self, applyRecord);
         var committed = std.AutoHashMap(u64, usize).init(self.gpa);

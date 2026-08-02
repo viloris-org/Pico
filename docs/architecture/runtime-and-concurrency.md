@@ -18,8 +18,11 @@ mid-statement: the `emit` scan paths (`src/flow/exec.zig`) check the mark betwee
 units, so a canceled scan stops at the next row boundary and the Server returns `SERVER_ERROR`
 `RF1006` (the delivered `CANCELED` outcome) while keeping the Connection usable. A malformed
 `CANCEL_REQUEST` is a protocol error: the Server replies `CN1001` and closes the Connection.
-Streaming results with backpressure, the I/O scheduler, bounded work queues, and the Phase 6
-load and fault regressions remain target work.
+Slow-consumer and connection-loss fault regressions verify that a Connection that never reads
+blocks only its own result send (the statement lock is released before sending, so other
+Connections keep making progress) and that closing the slow stream unblocks the handler and
+empties the registry. Streaming results with backpressure, the I/O scheduler, bounded work
+queues, and the queue-saturation and compaction-pressure load regressions remain target work.
 
 This design refines ADR-0005, ADR-0006, and ADR-0009 and cannot change these constraints:
 

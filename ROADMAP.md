@@ -324,9 +324,13 @@ implemented: the `emit` scan paths check the Connection's cancellation mark betw
 work units, a `CANCEL_REQUEST` routed while a statement is scanning aborts it at the next row
 boundary with the delivered `CANCELED` outcome (`SERVER_ERROR` `RF1006`), and the Connection
 stays usable — with deterministic engine-level, threaded-listener wire, and official-client
-integration coverage, plus registry hit counting. The remaining work below is execution
+integration coverage, plus registry hit counting. Slow-consumer and connection-loss fault
+regressions are implemented: a Connection that never reads leaves its own handler blocked in
+the result send without holding the engine statement lock, other Connections keep making
+progress, and closing the slow stream unblocks the handler and empties the registry. The
+remaining work below is execution
 programs with streaming/backpressure, the runtime I/O scheduler and bounded work queues, and
-the Phase 6 load and fault regressions.
+the queue-saturation and compaction-pressure load regressions.
 
 **Goal:** Scale execution and connection handling without crossing ownership
 boundaries or weakening commit correctness.

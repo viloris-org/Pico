@@ -756,3 +756,113 @@ test "a CANCEL_REQUEST aborts a mid-statement scan and keeps the connection usab
     accept_thread.join();
     if (sentinel) |s| s.close(io);
 }
+
+// ── Slow-consumer and connection-loss fault tests (Phase 6) ──
+
+test "a slow reader does not hold the engine lock and closes cleanly" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-runtime-slow-consumer";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+
+    // Seed a collection whose full emit materializes ~30 MiB of rows: far more
+    // than any pair of socket buffers can hold, so a Connection that never
+    // reads provably keeps its handler blocked in the result send.
+    {
+        try eng.createDocument("bigdocs");
+        var text_buf: [3072]u8 = undefined;
+        @memset(&text_buf, 'x');
+        const text = try gpa.dupe(u8, &text_buf);
+        defer gpa.free(text);
+        var fields: [2]document_mod.Field = undefined;
+        fields[0] = .{ .path = try gpa.dupe(u8, "seq"), .item = .{ .int = 0 } };
+        defer gpa.free(fields[0].path);
+        fields[1] = .{ .path = try gpa.dupe(u8, "payload"), .item = .{ .text = text } };
+        defer gpa.free(fields[1].path);
+        var id_buf: [16]u8 = undefined;
+        for (0..10_000) |i| {
+            fields[0].item = .{ .int = @intCast(i) };
+            const id = std.fmt.bufPrint(&id_buf, "d{d}", .{i}) catch unreachable;
+            try eng.insertDocument("bigdocs", id, &fields);
+        }
+    }
+
+    const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var registry = registry_mod.Registry.init(gpa, io, .{});
+    defer registry.deinit();
+
+    var stop = std.atomic.Value(bool).init(false);
+    const accept_thread = try std.Thread.spawn(.{}, AcceptLoop.run, .{AcceptLoop{
+        .gpa = gpa,
+        .io = io,
+        .listener = &listener,
+        .eng = &eng,
+        .registry = &registry,
+        .stop = &stop,
+    }});
+
+    // The slow Connection submits the large emit and never reads, so its
+    // handler blocks in the result send once the socket buffers fill.
+    var slow: TestClient = undefined;
+    try slow.connect(gpa, io, port);
+    const source = "from bigdocs\n| emit { payload }";
+    var payload: [4 + 128]u8 = undefined;
+    std.mem.writeInt(u32, payload[0..4], @intCast(source.len), .big);
+    @memcpy(payload[4..][0..source.len], source);
+    try slow.sendFrame(.flow_source, payload[0 .. 4 + source.len]);
+    try slow.writer.interface.flush();
+
+    // Observe the statement lock go busy (the handler is materializing the
+    // ~30 MiB result under the lock) and then free (it released the lock to
+    // start sending). The send cannot finish because slow never reads, so at
+    // the free moment the handler is provably blocked in the send with the
+    // lock released: a slow reader does not hold the engine lock.
+    var observed_busy = false;
+    var acquired = false;
+    for (0..1000) |_| {
+        if (eng.tryLock()) {
+            if (observed_busy) {
+                acquired = true;
+                break;
+            }
+            eng.unlock(io);
+        } else {
+            observed_busy = true;
+        }
+        try Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(observed_busy);
+    try std.testing.expect(acquired);
+    eng.unlock(io);
+
+    // Another Connection still makes progress while slow's send is blocked.
+    var fast: TestClient = undefined;
+    try fast.connect(gpa, io, port);
+    const seqs = try execCollectInts(&fast, gpa, "from bigdocs\n| emit { seq }\n| limit 1");
+    defer gpa.free(seqs);
+    try std.testing.expectEqual(@as(usize, 1), seqs.len);
+    try std.testing.expectEqual(@as(u64, 0), seqs[0]);
+    try fast.goodbye();
+
+    // Connection loss: closing the slow stream unblocks its send, the handler
+    // cleans up (revoking the credential), and the registry empties.
+    slow.close();
+    for (0..2000) |_| {
+        if (registry.liveCount() == 0) break;
+        try Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 0), registry.liveCount());
+
+    stop.store(true, .release);
+    const sentinel = listener.socket.address.connect(io, .{ .mode = .stream }) catch null;
+    accept_thread.join();
+    if (sentinel) |s| s.close(io);
+}
