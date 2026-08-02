@@ -186,10 +186,10 @@ test "checkpoint emits current schema and rows, with set_serial after the insert
 
         var note: value_mod.Value = .{ .text = try gpa.dupe(u8, "hello") };
         defer note.deinit(gpa);
-        try table.insert(gpa, &.{ .{ .int = 1 }, note });
-        try table.insert(gpa, &.{ .{ .int = 7 }, note });
+        try table.insert(gpa, &.{ .{ .int = 1 }, note }, 1);
+        try table.insert(gpa, &.{ .{ .int = 7 }, note }, 2);
         // Delete the high row so next_serial (8) outlives max(pk) (1).
-        try table.delete(gpa, .{ .int = 7 });
+        try table.delete(gpa, .{ .int = 7 }, 3);
         try std.testing.expectEqual(@as(i64, 8), table.next_serial);
 
         stats = try run(&wal, &.{&table}, &.{}, &.{}, &.{}, 42);

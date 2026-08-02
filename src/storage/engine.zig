@@ -5,6 +5,7 @@ const value = @import("value.zig");
 const wal_mod = @import("wal.zig");
 const vfs_mod = @import("vfs.zig");
 const table_mod = @import("table.zig");
+const mvcc_mod = @import("mvcc.zig");
 const document_mod = @import("document.zig");
 const graph_mod = @import("graph.zig");
 const manifest_mod = @import("manifest.zig");
@@ -51,12 +52,12 @@ fn enginePkOf(eng: *Engine, table_name: []const u8, values: []const value.Value)
     return values[pki];
 }
 
-fn engineApplyOp(eng: *Engine, op: *const wal_mod.TxnOp) anyerror!void {
+fn engineApplyOp(eng: *Engine, op: *const wal_mod.TxnOp, commit_seq: u64) anyerror!void {
     if (eng.test_fail_next_apply) {
         eng.test_fail_next_apply = false;
         return error.PrimaryKeyNotFound;
     }
-    return eng.applyTxnOp(op);
+    return eng.applyTxnOp(op, commit_seq);
 }
 
 fn engineValidateOp(eng: *Engine, op: *const wal_mod.TxnOp, shadow: []const commit_mod.ShadowEntry) commit_mod.CoordError!void {
@@ -144,6 +145,11 @@ pub const Engine = struct {
     /// publication succeed. Rebuilt from `txn_batch`/`set_commit_seq` records
     /// during recovery. Row versions become visible through this watermark.
     published_commit_seq: u64 = 0,
+    /// Active snapshot watermarks (roadmap Phase 5 MVCC retention). Reads
+    /// register their watermark before reading and deregister afterwards, so
+    /// `oldest_active_snapshot_seq` protects retained versions from reclamation
+    /// while any snapshot can still see them.
+    snapshot_registry: mvcc_mod.SnapshotRegistry = undefined,
     /// Single-writer commit coordinator: assigns commit order, writes WAL
     /// records, validates conflicts, and publishes confirmed changes. All DML
     /// mutation enters through this boundary.
@@ -189,6 +195,7 @@ pub const Engine = struct {
             .graphs = std.StringHashMap(graph_mod.Graph).init(gpa),
             .observations = .empty,
             .coordinator = Coordinator.init(gpa, io),
+            .snapshot_registry = mvcc_mod.SnapshotRegistry.init(gpa),
         };
         transferred = true;
         errdefer eng.deinit();
@@ -219,6 +226,7 @@ pub const Engine = struct {
         self.observations.deinit(self.gpa);
         self.payloads.deinit();
         self.coordinator.deinit();
+        self.snapshot_registry.deinit();
         self.wal.deinit();
         self.* = undefined;
     }
@@ -276,32 +284,36 @@ pub const Engine = struct {
             .create_table => |ct| {
                 try self.registerTable(ct.name, ct.columns);
             },
+            // Recovery stamps version intervals from the watermark rebuilt by
+            // the enclosing `txn_batch`/`set_commit_seq` records: nested ops of
+            // a batch carry its commit_seq, standalone records use the current
+            // watermark as it advances during replay.
             .insert => |ins| {
                 const table = self.tables.getPtr(ins.table) orelse return error.TableNotFound;
-                try table.insert(self.gpa, ins.values);
+                try table.insert(self.gpa, ins.values, self.published_commit_seq);
             },
             .update => |upd| {
                 const table = self.tables.getPtr(upd.table) orelse return error.TableNotFound;
                 if (table.pk_index != null) {
-                    try table.update(self.gpa, upd.pk, upd.values);
+                    try table.update(self.gpa, upd.pk, upd.values, self.published_commit_seq);
                 } else {
                     const idx: usize = switch (upd.pk) {
                         .int => |i| @intCast(i),
                         else => return error.PrimaryKeyNotFound,
                     };
-                    try table.updateAt(self.gpa, idx, upd.values);
+                    try table.updateAt(self.gpa, idx, upd.values, self.published_commit_seq);
                 }
             },
             .delete => |del| {
                 const table = self.tables.getPtr(del.table) orelse return error.TableNotFound;
                 if (table.pk_index != null) {
-                    try table.delete(self.gpa, del.pk);
+                    try table.delete(self.gpa, del.pk, self.published_commit_seq);
                 } else {
                     const idx: usize = switch (del.pk) {
                         .int => |i| @intCast(i),
                         else => return error.PrimaryKeyNotFound,
                     };
-                    try table.deleteAt(self.gpa, idx);
+                    try table.deleteAt(self.gpa, idx, self.published_commit_seq);
                 }
             },
             .add_column => |add| {
@@ -410,34 +422,71 @@ pub const Engine = struct {
         return self.coordinator.publishedSeq();
     }
 
-    fn applyTxnOp(self: *Engine, op: *const wal_mod.TxnOp) anyerror!void {
+    // ── Snapshot registry and version reclamation (roadmap Phase 5) ──
+    //
+    // Reads register their watermark and deregister it when done, so
+    // `oldestActiveSnapshotSeq` reflects every in-flight snapshot. Reclamation
+    // consults it before freeing retained versions: only versions invisible to
+    // every active snapshot (`deleted_seq < oldest_active_snapshot_seq`) are
+    // reclaimed, and the newest live version is never reclaimed.
+
+    /// Register `s` as an active snapshot watermark.
+    pub fn registerSnapshot(self: *Engine, s: u64) (mvcc_mod.RegistryError || Allocator.Error)!void {
+        try self.snapshot_registry.register(s);
+    }
+
+    /// Release one registration of snapshot watermark `s`.
+    pub fn unregisterSnapshot(self: *Engine, s: u64) void {
+        self.snapshot_registry.unregister(s);
+    }
+
+    /// The lowest active snapshot watermark, or `published_commit_seq + 1` when
+    /// no snapshot is active.
+    pub fn oldestActiveSnapshotSeq(self: *Engine) u64 {
+        return self.snapshot_registry.oldestActive() orelse self.publishedSeq() + 1;
+    }
+
+    /// Reclaim retained versions invisible to every active snapshot across all
+    /// tables. Returns the total number of versions reclaimed. A future
+    /// compactor drives this; the live row set is never touched.
+    pub fn reclaimRetainedVersions(self: *Engine) usize {
+        const oldest = self.oldestActiveSnapshotSeq();
+        var total: usize = 0;
+        var it = self.tables.iterator();
+        while (it.next()) |entry| {
+            total += entry.value_ptr.reclaimRetained(self.gpa, oldest);
+        }
+        return total;
+    }
+
+    fn applyTxnOp(self: *Engine, op: *const wal_mod.TxnOp, commit_seq: u64) anyerror!void {
         switch (op.*) {
             .insert => |ins| {
                 const table = self.tables.getPtr(ins.table) orelse return error.TableNotFound;
-                try table.insert(self.gpa, ins.values);
+                try table.insert(self.gpa, ins.values, commit_seq);
             },
             .update => |upd| {
                 const table = self.tables.getPtr(upd.table) orelse return error.TableNotFound;
                 if (table.pk_index != null) {
-                    try table.update(self.gpa, upd.pk, upd.values);
+                    try table.update(self.gpa, upd.pk, upd.values, commit_seq);
                 } else {
                     const idx: usize = switch (upd.pk) {
                         .int => |i| @intCast(i),
                         else => return error.PrimaryKeyNotFound,
                     };
-                    try table.updateAt(self.gpa, idx, upd.values);
+                    try table.updateAt(self.gpa, idx, upd.values, commit_seq);
                 }
             },
             .delete => |del| {
                 const table = self.tables.getPtr(del.table) orelse return error.TableNotFound;
                 if (table.pk_index != null) {
-                    try table.delete(self.gpa, del.pk);
+                    try table.delete(self.gpa, del.pk, commit_seq);
                 } else {
                     const idx: usize = switch (del.pk) {
                         .int => |i| @intCast(i),
                         else => return error.PrimaryKeyNotFound,
                     };
-                    try table.deleteAt(self.gpa, idx);
+                    try table.deleteAt(self.gpa, idx, commit_seq);
                 }
             },
         }
@@ -905,7 +954,10 @@ pub const Engine = struct {
         defer self.writer_mutex.unlock(self.io);
         try table.validateUpdateAt(idx, values);
         try self.wal.appendUpdate(.{ .table = table_name, .pk = .{ .int = @intCast(idx) }, .values = values });
-        try table.updateAt(self.gpa, idx, values);
+        // Legacy index-addressed path: no coordinator commit sequence, so the
+        // version is stamped with the current published watermark, matching
+        // what recovery would rebuild when it replays this plain record.
+        try table.updateAt(self.gpa, idx, values, self.publishedSeq());
     }
 
     pub fn deleteAt(self: *Engine, table_name: []const u8, idx: usize) !void {
@@ -918,7 +970,7 @@ pub const Engine = struct {
         try self.writer_mutex.lock(self.io);
         defer self.writer_mutex.unlock(self.io);
         try self.wal.appendDelete(.{ .table = table_name, .pk = .{ .int = @intCast(idx) } });
-        try table.deleteAt(self.gpa, idx);
+        try table.deleteAt(self.gpa, idx, self.publishedSeq());
     }
 
     /// Reserve one instance-wide staging slot and expected-byte budget for a
@@ -1055,36 +1107,33 @@ pub const Engine = struct {
         }
     };
 
-    pub fn selectAll(self: *Engine, table_name: []const u8) !SelectResult {
+    /// Read Committed scan at snapshot watermark `s`: every version visible at
+    /// `s`, cloned into an owned result. Registers `s` with the snapshot
+    /// registry for the duration of the read so reclamation cannot free a
+    /// version the result still references (success, error, and limit paths all
+    /// deregister through the defer).
+    pub fn selectAll(self: *Engine, table_name: []const u8, snapshot_seq: u64) !SelectResult {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        return .{
-            .columns = table.columns,
-            .rows = table.rows.items,
-            .owned_rows = null,
-            .gpa = self.gpa,
-        };
+        self.snapshot_registry.register(snapshot_seq) catch return error.SnapshotLimitExceeded;
+        defer self.snapshot_registry.unregister(snapshot_seq);
+        const rows = try table.rowsVisibleAt(self.gpa, snapshot_seq);
+        return .{ .columns = table.columns, .rows = rows, .owned_rows = rows, .gpa = self.gpa };
     }
 
-    pub fn selectByPk(self: *Engine, table_name: []const u8, pk: value.Value) !SelectResult {
+    /// Read Committed point read at snapshot watermark `s`: the version of `pk`
+    /// visible at `s`, or no row. Registers `s` around the read.
+    pub fn selectByPk(self: *Engine, table_name: []const u8, pk: value.Value, snapshot_seq: u64) !SelectResult {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        if (table.pkLookup(pk)) |idx| {
+        self.snapshot_registry.register(snapshot_seq) catch return error.SnapshotLimitExceeded;
+        defer self.snapshot_registry.unregister(snapshot_seq);
+        if (try table.rowVisibleAt(self.gpa, pk, snapshot_seq)) |row| {
+            var owned = row;
+            errdefer owned.deinit(self.gpa);
             const one = try self.gpa.alloc(Row, 1);
-            errdefer self.gpa.free(one);
-            one[0] = try table.rows.items[idx].clone(self.gpa);
-            return .{
-                .columns = table.columns,
-                .rows = one,
-                .owned_rows = one,
-                .gpa = self.gpa,
-            };
+            one[0] = owned;
+            return .{ .columns = table.columns, .rows = one, .owned_rows = one, .gpa = self.gpa };
         }
-        const empty = try self.gpa.alloc(Row, 0);
-        return .{
-            .columns = table.columns,
-            .rows = empty,
-            .owned_rows = empty,
-            .gpa = self.gpa,
-        };
+        return emptyResult(self.gpa, table.columns);
     }
 
     /// Read Committed scan through `tx`'s private write set: committed rows the
@@ -1095,9 +1144,20 @@ pub const Engine = struct {
     /// write set is merged only for the owning transaction. This is the engine
     /// boundary that makes explicit-transaction reads read-your-writes while
     /// every other reader sees only committed state.
-    pub fn selectAllTx(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8) !SelectResult {
+    pub fn selectAllTx(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, snapshot_seq: u64) !SelectResult {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
         const gpa = self.gpa;
+        self.snapshot_registry.register(snapshot_seq) catch return error.SnapshotLimitExceeded;
+        defer self.snapshot_registry.unregister(snapshot_seq);
+
+        // Committed rows visible at the snapshot watermark (live rows created at
+        // or before it, plus retained versions visible at it), cloned by the
+        // table.
+        const committed = try table.rowsVisibleAt(gpa, snapshot_seq);
+        defer {
+            for (committed) |*row| row.deinit(gpa);
+            gpa.free(committed);
+        }
 
         var merged: std.ArrayList(Row) = .empty;
         errdefer {
@@ -1105,8 +1165,11 @@ pub const Engine = struct {
             merged.deinit(gpa);
         }
 
+        // Merge the transaction's private write set over the committed snapshot
+        // (read-your-writes): a staged insert/update substitutes its values and
+        // a staged delete hides the row.
         const pk_index = table.pk_index;
-        for (table.rows.items) |row| {
+        for (committed) |*row| {
             const staged = if (pk_index) |pki| tx.lastStaged(table_name, row.values[pki]) else null;
             if (staged) |op| switch (op.op) {
                 .delete => continue,
@@ -1120,15 +1183,18 @@ pub const Engine = struct {
             merged.appendAssumeCapacity(try row.clone(gpa));
         }
 
-        // Private rows that do not exist in committed state append new rows.
-        // Only the last write-set entry for a key is effective: an earlier
-        // insert is superseded by its own later update/delete.
+        // Private rows that do not exist in the committed snapshot append new
+        // rows. Only the last write-set entry for a key is effective: an
+        // earlier insert is superseded by its own later update/delete. The
+        // visibility check is at the snapshot, not the live state, so a key a
+        // peer inserted after `snapshot_seq` still reads as this transaction's
+        // insert.
         if (pk_index) |_| {
             for (tx.write_set.items) |*op| {
                 if (op.op == .delete or !std.mem.eql(u8, op.table, table_name)) continue;
                 const effective = tx.lastStaged(table_name, op.pk) orelse continue;
                 if (effective != op) continue;
-                if (table.pkContains(op.pk)) continue;
+                if (table.pkVisibleAt(op.pk, snapshot_seq)) continue;
                 try merged.ensureUnusedCapacity(gpa, 1);
                 merged.appendAssumeCapacity(try rowFromValues(gpa, op.values));
             }
@@ -1153,9 +1219,9 @@ pub const Engine = struct {
     /// otherwise the committed row is returned. Tables without a single-column
     /// primary key fall back to the committed point read because their write
     /// set cannot address rows by key.
-    pub fn selectByPkTx(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, pk: value.Value) !SelectResult {
+    pub fn selectByPkTx(self: *Engine, tx: *txn_mod.Transaction, table_name: []const u8, pk: value.Value, snapshot_seq: u64) !SelectResult {
         const table = self.tables.getPtr(table_name) orelse return error.TableNotFound;
-        if (table.pk_index == null) return self.selectByPk(table_name, pk);
+        if (table.pk_index == null) return self.selectByPk(table_name, pk, snapshot_seq);
         if (tx.lastStaged(table_name, pk)) |op| {
             switch (op.op) {
                 .delete => return emptyResult(self.gpa, table.columns),
@@ -1167,7 +1233,7 @@ pub const Engine = struct {
                 },
             }
         }
-        return self.selectByPk(table_name, pk);
+        return self.selectByPk(table_name, pk, snapshot_seq);
     }
 
     /// Collect row indices matching all predicates (AND). Caller owns the slice.
@@ -1348,7 +1414,7 @@ test "engine create insert select roundtrip with wal" {
         const vals = [_]value.Value{ .{ .int = 1 }, name_val };
         try eng.insert("users", &vals);
 
-        var res = try eng.selectByPk("users", .{ .int = 1 });
+        var res = try eng.selectByPk("users", .{ .int = 1 }, eng.publishedSeq());
         defer res.deinit();
         try std.testing.expectEqual(@as(usize, 1), res.rows.len);
         try std.testing.expectEqualStrings("alice", res.rows[0].values[1].text);
@@ -1357,7 +1423,7 @@ test "engine create insert select roundtrip with wal" {
     {
         var eng = try Engine.open(gpa, io, dir_name, false);
         defer eng.deinit();
-        var res = try eng.selectAll("users");
+        var res = try eng.selectAll("users", eng.publishedSeq());
         defer res.deinit();
         try std.testing.expectEqual(@as(usize, 1), res.rows.len);
     }
@@ -1398,12 +1464,12 @@ test "engine update delete with wal recovery" {
         try eng.update("users", .{ .int = 2 }, &[_]value.Value{ .{ .int = 2 }, bob2 });
         try eng.delete("users", .{ .int = 1 });
 
-        var res = try eng.selectByPk("users", .{ .int = 2 });
+        var res = try eng.selectByPk("users", .{ .int = 2 }, eng.publishedSeq());
         defer res.deinit();
         try std.testing.expectEqual(@as(usize, 1), res.rows.len);
         try std.testing.expectEqualStrings("bobby", res.rows[0].values[1].text);
 
-        var all = try eng.selectAll("users");
+        var all = try eng.selectAll("users", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 2), all.rows.len);
     }
@@ -1411,15 +1477,15 @@ test "engine update delete with wal recovery" {
     {
         var eng = try Engine.open(gpa, io, dir_name, false);
         defer eng.deinit();
-        var all = try eng.selectAll("users");
+        var all = try eng.selectAll("users", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 2), all.rows.len);
 
-        var r2 = try eng.selectByPk("users", .{ .int = 2 });
+        var r2 = try eng.selectByPk("users", .{ .int = 2 }, eng.publishedSeq());
         defer r2.deinit();
         try std.testing.expectEqualStrings("bobby", r2.rows[0].values[1].text);
 
-        var r1 = try eng.selectByPk("users", .{ .int = 1 });
+        var r1 = try eng.selectByPk("users", .{ .int = 1 }, eng.publishedSeq());
         defer r1.deinit();
         try std.testing.expectEqual(@as(usize, 0), r1.rows.len);
     }
@@ -1464,7 +1530,7 @@ test "engine rejects invalid writes before they enter the wal" {
     {
         var eng = try Engine.open(gpa, io, dir_name, false);
         defer eng.deinit();
-        var rows = try eng.selectAll("users");
+        var rows = try eng.selectAll("users", eng.publishedSeq());
         defer rows.deinit();
         try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
         try std.testing.expectEqualStrings("alice@example.com", rows.rows[0].values[1].text);
@@ -1561,7 +1627,7 @@ test "writes after a checkpoint survive restart" {
     {
         var eng = try Engine.open(gpa, io, dir_name, true);
         defer eng.deinit();
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 3), all.rows.len);
     }
@@ -1600,7 +1666,7 @@ test "an aborted checkpoint leaves the original wal intact" {
     {
         var eng = try Engine.open(gpa, io, dir_name, true);
         defer eng.deinit();
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 3), all.rows.len);
     }
@@ -1645,12 +1711,12 @@ test "engine recovers only the committed prefix after a torn wal tail" {
     {
         var eng = try Engine.open(gpa, io, dir_name, true);
         defer eng.deinit();
-        var all = try eng.selectAll("users");
+        var all = try eng.selectAll("users", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 2), all.rows.len);
         try std.testing.expectEqual(sealed_end, eng.wal.offset);
 
-        var ghost = try eng.selectByPk("users", .{ .int = 3 });
+        var ghost = try eng.selectByPk("users", .{ .int = 3 }, eng.publishedSeq());
         defer ghost.deinit();
         try std.testing.expectEqual(@as(usize, 0), ghost.rows.len);
 
@@ -1662,10 +1728,10 @@ test "engine recovers only the committed prefix after a torn wal tail" {
     {
         var eng = try Engine.open(gpa, io, dir_name, true);
         defer eng.deinit();
-        var all = try eng.selectAll("users");
+        var all = try eng.selectAll("users", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 3), all.rows.len);
-        var dave = try eng.selectByPk("users", .{ .int = 4 });
+        var dave = try eng.selectByPk("users", .{ .int = 4 }, eng.publishedSeq());
         defer dave.deinit();
         try std.testing.expectEqualStrings("dave", dave.rows[0].values[1].text);
     }

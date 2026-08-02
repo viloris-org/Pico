@@ -128,7 +128,10 @@ pub fn Hooks(comptime Ctx: type) type {
         /// Resolve the primary key of an insert's values from the table schema,
         /// or null when the table has no single-column primary key.
         pkOf: *const fn (Ctx, []const u8, []const value.Value) ?value.Value,
-        applyOp: *const fn (Ctx, *const wal_mod.TxnOp) anyerror!void,
+        /// Apply one already-validated op. `commit_seq` is the op's commit
+        /// sequence (the enclosing request's), so the storage layer can stamp
+        /// created/deleted version intervals from the single writer's order.
+        applyOp: *const fn (Ctx, *const wal_mod.TxnOp, u64) anyerror!void,
         /// Full row-shape validation (types, not-null, unique columns,
         /// primary-key existence) for `op`. `shadow` holds earlier accepted ops
         /// from this round, so the engine can validate a transaction's own
@@ -313,11 +316,13 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
 
             // Pass 4: apply in commit order and advance the watermark after
             // each, so readers never observe a later commit before an earlier
-            // one.
+            // one. The op's commit sequence is handed to the apply hook so row
+            // versions get created/deleted intervals from the single writer's
+            // order.
             for (accepted.items, 0..) |req, i| {
                 const seq = batches.items[i].commit_seq;
                 for (req.ops) |*op| {
-                    hooks.applyOp(ctx, op) catch |err| {
+                    hooks.applyOp(ctx, op, seq) catch |err| {
                         req.result = mapApplyError(err);
                         req.done = true;
                         self.conflicts += 1;

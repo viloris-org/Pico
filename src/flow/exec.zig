@@ -45,11 +45,6 @@ pub fn compile(gpa: Allocator, source: []const u8) !ir.Request {
 pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request) ExecError!Result {
     if (request.model_revision != ir.DEVELOPMENT_MODEL_REVISION) return error.ModelRevisionMismatch;
     if (request.operation != .emit) return error.InvalidOperation;
-    // Read Committed: a Request observes the committed state at the current
-    // published watermark. The in-memory tables hold one committed version per
-    // row, so the live state is the latest committed state; version retention
-    // for reads over older snapshots arrives with LSM storage (Phase 5).
-    _ = eng.publishedSeq();
     if (std.mem.eql(u8, request.relation, "observation_evidence")) return executeEvidence(gpa, eng, request);
     // Revision 0 is an explicit development binding of relation, document, and
     // graph names to the existing catalog. It is read-only and is not persisted
@@ -81,14 +76,26 @@ pub fn execute(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Reque
 
     var bound = try bindTableWhere(gpa, table, request.where);
     defer bound.deinit();
-    const indices = try table.matchIndices(gpa, bound.preds);
-    defer gpa.free(indices);
+
+    // Read Committed: the statement takes a fresh snapshot watermark at its
+    // start and interprets only complete commits at or before it. The engine's
+    // snapshot-aware scan registers the watermark for the read's duration and
+    // returns only versions visible at it; the Flow slice keeps reading them
+    // even as later commits land (reads do not wait for writes).
+    const snapshot_seq = eng.publishedSeq();
+    var visible = eng.selectAll(request.relation, snapshot_seq) catch |err| return switch (err) {
+        error.TableNotFound => error.SemanticNameNotFound,
+        error.SnapshotLimitExceeded => error.OutOfMemory,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+    defer visible.deinit();
 
     const max_rows: usize = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize);
     var emitted: usize = 0;
-    for (indices) |row_index| {
+    for (visible.rows) |row| {
         if (emitted >= max_rows) break;
-        try emitRow(gpa, &owned_text, &cells, projection, table.rows.items[row_index].values);
+        if (!table_mod.valuesMatch(row.values, bound.preds)) continue;
+        try emitRow(gpa, &owned_text, &cells, projection, row.values);
         emitted += 1;
     }
     return .{ .columns = columns, .cells = try cells.toOwnedSlice(gpa), .owned_text = owned_text, .gpa = gpa };
@@ -182,10 +189,14 @@ pub fn executeTx(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Req
     var bound = try bindTableWhere(gpa, table, request.where);
     defer bound.deinit();
 
-    // The table was resolved above; a defensive TableNotFound maps to the same
-    // semantic error as an unresolved relation name.
-    var merged = eng.selectAllTx(tx, request.relation) catch |err| return switch (err) {
+    // Read Committed: each statement in an explicit transaction takes a fresh
+    // published watermark, so it observes commits made by other transactions
+    // between statements while still merging its own private write set. The
+    // engine's snapshot-aware scan registers the watermark for the read.
+    const snapshot_seq = eng.publishedSeq();
+    var merged = eng.selectAllTx(tx, request.relation, snapshot_seq) catch |err| return switch (err) {
         error.TableNotFound => error.SemanticNameNotFound,
+        error.SnapshotLimitExceeded => error.OutOfMemory,
         error.OutOfMemory => error.OutOfMemory,
     };
     defer merged.deinit();

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const value = @import("value.zig");
+const mvcc = @import("mvcc.zig");
 
 /// Errors from in-memory 表 storage: constraints, PK index, and row shape.
 /// Engine maps the same set through for WAL-backed calls.
@@ -28,6 +29,9 @@ pub const Row = struct {
     /// records the version it observed, and commit fails if that version no
     /// longer matches the published row.
     version: u64 = 0,
+    /// Commit sequence at which this version was created. A version created
+    /// after a snapshot watermark is invisible to that snapshot.
+    created_seq: u64 = 0,
 
     pub fn deinit(self: *Row, gpa: Allocator) void {
         for (self.values) |*v| v.deinit(gpa);
@@ -45,7 +49,26 @@ pub const Row = struct {
         while (i < self.values.len) : (i += 1) {
             vals[i] = try self.values[i].clone(gpa);
         }
-        return .{ .values = vals };
+        return .{ .values = vals, .version = self.version, .created_seq = self.created_seq };
+    }
+};
+
+/// A superseded row version retained for snapshot reads. Owns a copy of the
+/// primary key and values; `created_seq`/`deleted_seq` delimit its visibility
+/// interval `[created_seq, deleted_seq)`. `version` is the superseded live
+/// row's coordinator version stamp, kept so historical reads expose the same
+/// stamp shape as live rows.
+pub const RetainedVersion = struct {
+    pk: value.Value,
+    values: []value.Value,
+    created_seq: u64,
+    deleted_seq: u64,
+    version: u64,
+
+    pub fn deinit(self: *RetainedVersion, gpa: Allocator) void {
+        self.pk.deinit(gpa);
+        for (self.values) |*v| v.deinit(gpa);
+        gpa.free(self.values);
     }
 };
 
@@ -72,6 +95,11 @@ pub const Table = struct {
     /// TEXT primary key → row index (keys owned by row storage).
     by_pk_text: std.StringHashMap(usize),
     rows: std.ArrayList(Row),
+    /// Superseded row versions retained for snapshot reads (single-column
+    /// primary-key tables only). Heap tables do not address versions by key and
+    /// never populate this. Reclaimed by `reclaimRetained` when no active
+    /// snapshot can still see them.
+    retained: std.ArrayList(RetainedVersion) = .empty,
     /// Next value for SERIAL/BIGSERIAL columns.
     next_serial: i64,
     /// Monotonic version stamp assigned to the next row version. Every
@@ -87,6 +115,8 @@ pub const Table = struct {
         self.rows.deinit(gpa);
         self.by_pk_int.deinit();
         self.by_pk_text.deinit();
+        for (self.retained.items) |*rv| rv.deinit(gpa);
+        self.retained.deinit(gpa);
     }
 
     pub fn pkIsText(self: *const Table) bool {
@@ -258,7 +288,7 @@ pub const Table = struct {
         }
     }
 
-    pub fn insert(self: *Table, gpa: Allocator, values: []const value.Value) (Error || Allocator.Error)!void {
+    pub fn insert(self: *Table, gpa: Allocator, values: []const value.Value, commit_seq: u64) (Error || Allocator.Error)!void {
         try self.validateInsert(values);
 
         const owned_vals = try gpa.alloc(value.Value, values.len);
@@ -273,7 +303,7 @@ pub const Table = struct {
         }
 
         const idx = self.rows.items.len;
-        try self.rows.append(gpa, .{ .values = owned_vals, .version = self.next_version });
+        try self.rows.append(gpa, .{ .values = owned_vals, .version = self.next_version, .created_seq = commit_seq });
         self.next_version += 1;
         errdefer {
             var row = self.rows.pop().?;
@@ -293,7 +323,7 @@ pub const Table = struct {
         }
     }
 
-    pub fn update(self: *Table, gpa: Allocator, pk: value.Value, values: []const value.Value) (Error || Allocator.Error)!void {
+    pub fn update(self: *Table, gpa: Allocator, pk: value.Value, values: []const value.Value, commit_seq: u64) (Error || Allocator.Error)!void {
         try self.validateUpdate(pk, values);
         const pki = self.pk_index.?;
         const idx = self.pkLookup(pk).?;
@@ -309,17 +339,25 @@ pub const Table = struct {
             owned_vals[n] = try values[n].clone(gpa);
         }
 
-        self.pkRemove(pk);
+        // UPDATE creates a new version and ends the old version's visibility
+        // interval at `commit_seq`: retain the superseded live row first (it
+        // owns independent copies, so freeing the live row cannot affect it).
+        const old = self.rows.items[idx];
+        try self.retainVersion(gpa, pk, old, commit_seq);
 
-        var old = self.rows.items[idx];
-        old.deinit(gpa);
-        self.rows.items[idx] = .{ .values = owned_vals, .version = self.next_version };
+        self.pkRemove(pk);
+        self.rows.items[idx].deinit(gpa);
+        self.rows.items[idx] = .{ .values = owned_vals, .version = self.next_version, .created_seq = commit_seq };
         self.next_version += 1;
         try self.pkPut(self.rows.items[idx].values[pki], idx);
     }
 
-    /// Replace row at stable index (tables without single-column PK, or by-index updates).
-    pub fn updateAt(self: *Table, gpa: Allocator, idx: usize, values: []const value.Value) (Error || Allocator.Error)!void {
+    /// Replace row at stable index (tables without single-column PK, or
+    /// by-index updates). Heap tables cannot address old versions by key, so
+    /// the superseded row is NOT retained: its version interval ends at the
+    /// replace and it is freed. Tables with a single-column PK route through
+    /// `update` and do retain.
+    pub fn updateAt(self: *Table, gpa: Allocator, idx: usize, values: []const value.Value, commit_seq: u64) (Error || Allocator.Error)!void {
         if (idx >= self.rows.items.len) return error.PrimaryKeyNotFound;
         try self.checkTypes(values);
         try self.checkUnique(values, idx);
@@ -342,25 +380,30 @@ pub const Table = struct {
             owned_vals[n] = try values[n].clone(gpa);
         }
 
-        var old = self.rows.items[idx];
-        old.deinit(gpa);
-        self.rows.items[idx] = .{ .values = owned_vals, .version = self.next_version };
+        self.rows.items[idx].deinit(gpa);
+        self.rows.items[idx] = .{ .values = owned_vals, .version = self.next_version, .created_seq = commit_seq };
         self.next_version += 1;
         if (self.pk_index) |pki| {
             try self.pkPut(self.rows.items[idx].values[pki], idx);
         }
     }
 
-    pub fn delete(self: *Table, gpa: Allocator, pk: value.Value) (Error || Allocator.Error)!void {
+    pub fn delete(self: *Table, gpa: Allocator, pk: value.Value, commit_seq: u64) (Error || Allocator.Error)!void {
         const idx = self.pkLookup(pk) orelse return error.PrimaryKeyNotFound;
-        try self.deleteAt(gpa, idx);
+        try self.deleteAt(gpa, idx, commit_seq);
     }
 
-    pub fn deleteAt(self: *Table, gpa: Allocator, idx: usize) (Error || Allocator.Error)!void {
+    pub fn deleteAt(self: *Table, gpa: Allocator, idx: usize, commit_seq: u64) (Error || Allocator.Error)!void {
         if (idx >= self.rows.items.len) return error.PrimaryKeyNotFound;
 
+        // DELETE only ends the old version's visibility interval at
+        // `commit_seq`. Single-column-PK tables retain the superseded version
+        // so snapshots older than the delete still see it; heap tables cannot
+        // address versions by key and free the row.
         if (self.pk_index) |pki| {
-            self.pkRemove(self.rows.items[idx].values[pki]);
+            const old = self.rows.items[idx];
+            try self.retainVersion(gpa, old.values[pki], old, commit_seq);
+            self.pkRemove(old.values[pki]);
         }
 
         const last = self.rows.items.len - 1;
@@ -475,7 +518,135 @@ pub const Table = struct {
         }
         return try out.toOwnedSlice(gpa);
     }
+
+    /// Clone the superseded live row `old` into the retention store, ending its
+    /// visibility interval at `deleted_seq`. The retained version owns copies,
+    /// so freeing the live row afterwards cannot affect it.
+    fn retainVersion(self: *Table, gpa: Allocator, pk: value.Value, old: Row, deleted_seq: u64) Allocator.Error!void {
+        var retained_pk = try pk.clone(gpa);
+        errdefer retained_pk.deinit(gpa);
+        const vals = try gpa.alloc(value.Value, old.values.len);
+        errdefer gpa.free(vals);
+        var cloned: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < cloned) : (i += 1) vals[i].deinit(gpa);
+        }
+        while (cloned < old.values.len) : (cloned += 1) {
+            vals[cloned] = try old.values[cloned].clone(gpa);
+        }
+        try self.retained.append(gpa, .{
+            .pk = retained_pk,
+            .values = vals,
+            .created_seq = old.created_seq,
+            .deleted_seq = deleted_seq,
+            .version = old.version,
+        });
+    }
+
+    /// The newest retained version of `pk` visible at snapshot `s`, or null.
+    /// Borrowed; a live row supersedes retained versions in the scan helpers,
+    /// so this is the fallback when no live row is visible at `s`.
+    pub fn retainedVersionAt(self: *const Table, pk: value.Value, s: u64) ?*const RetainedVersion {
+        var best: ?*const RetainedVersion = null;
+        for (self.retained.items) |*rv| {
+            if (!value.Value.eql(rv.pk, pk)) continue;
+            if (!mvcc.visible(rv.created_seq, rv.deleted_seq, s)) continue;
+            if (best) |b| {
+                if (rv.created_seq > b.created_seq) best = rv;
+            } else best = rv;
+        }
+        return best;
+    }
+
+    /// Whether `pk` has any committed version visible at snapshot `s` (a live
+    /// row created at or before `s`, or a retained version whose interval
+    /// contains `s`).
+    pub fn pkVisibleAt(self: *const Table, pk: value.Value, s: u64) bool {
+        if (self.pkLookup(pk)) |idx| {
+            if (self.rows.items[idx].created_seq <= s) return true;
+        }
+        return self.retainedVersionAt(pk, s) != null;
+    }
+
+    /// The owned row version of `pk` visible at snapshot `s`, or null when `pk`
+    /// has no version visible at `s`. Clones the visible version (a live row
+    /// created at or before `s`, else the newest retained version whose interval
+    /// contains `s`).
+    pub fn rowVisibleAt(self: *const Table, gpa: Allocator, pk: value.Value, s: u64) Allocator.Error!?Row {
+        if (self.pkLookup(pk)) |idx| {
+            const row = self.rows.items[idx];
+            if (row.created_seq <= s) return try row.clone(gpa);
+        }
+        if (self.retainedVersionAt(pk, s)) |rv| {
+            return try rowFromRetained(gpa, rv);
+        }
+        return null;
+    }
+
+    /// Collect owned clones of every version visible at snapshot `s`: live rows
+    /// created at or before `s`, plus retained versions visible at `s` not
+    /// superseded by a live row visible at `s`. One version per primary key, in
+    /// live-row order followed by retained order. The caller owns the result.
+    pub fn rowsVisibleAt(self: *const Table, gpa: Allocator, s: u64) Allocator.Error![]Row {
+        var out: std.ArrayList(Row) = .empty;
+        errdefer {
+            for (out.items) |*r| r.deinit(gpa);
+            out.deinit(gpa);
+        }
+        // Reserve capacity before cloning so a failed clone cannot leak the
+        // already-cloned row (appendAssumeCapacity is infallible).
+        for (self.rows.items) |row| {
+            if (row.created_seq > s) continue;
+            try out.ensureUnusedCapacity(gpa, 1);
+            out.appendAssumeCapacity(try row.clone(gpa));
+        }
+        for (self.retained.items) |*rv| {
+            if (!mvcc.visible(rv.created_seq, rv.deleted_seq, s)) continue;
+            if (self.pkLookup(rv.pk)) |idx| {
+                if (self.rows.items[idx].created_seq <= s) continue; // live row supersedes
+            }
+            try out.ensureUnusedCapacity(gpa, 1);
+            out.appendAssumeCapacity(try rowFromRetained(gpa, rv));
+        }
+        return try out.toOwnedSlice(gpa);
+    }
+
+    /// Free and remove every retained version invisible to every active
+    /// snapshot: versions with `deleted_seq < oldest_active_snapshot_seq`.
+    /// Never touches live rows. Returns the number of versions reclaimed.
+    pub fn reclaimRetained(self: *Table, gpa: Allocator, oldest_active_snapshot_seq: u64) usize {
+        var i: usize = 0;
+        var reclaimed: usize = 0;
+        while (i < self.retained.items.len) {
+            const v = self.retained.items[i];
+            if (v.deleted_seq < oldest_active_snapshot_seq) {
+                const last = self.retained.items.len - 1;
+                if (i != last) self.retained.items[i] = self.retained.items[last];
+                _ = self.retained.pop();
+                var removed = v;
+                removed.deinit(gpa);
+                reclaimed += 1;
+                // Don't advance `i`: the swapped-in element must be examined.
+            } else {
+                i += 1;
+            }
+        }
+        return reclaimed;
+    }
 };
+
+fn rowFromRetained(gpa: Allocator, rv: *const RetainedVersion) Allocator.Error!Row {
+    const vals = try gpa.alloc(value.Value, rv.values.len);
+    errdefer gpa.free(vals);
+    var i: usize = 0;
+    errdefer {
+        var j: usize = 0;
+        while (j < i) : (j += 1) vals[j].deinit(gpa);
+    }
+    while (i < rv.values.len) : (i += 1) vals[i] = try rv.values[i].clone(gpa);
+    return .{ .values = vals, .version = rv.version, .created_seq = rv.created_seq };
+}
 
 /// Execution-layer predicate bound to column indices.
 pub const Pred = union(enum) {
@@ -577,8 +748,8 @@ test "table insert rejects duplicate primary key" {
     var bob: value.Value = .{ .text = try gpa.dupe(u8, "bob@example.com") };
     defer bob.deinit(gpa);
 
-    try table.insert(gpa, &.{ .{ .int = 1 }, alice });
-    try std.testing.expectError(error.DuplicatePrimaryKey, table.insert(gpa, &.{ .{ .int = 1 }, bob }));
+    try table.insert(gpa, &.{ .{ .int = 1 }, alice }, 1);
+    try std.testing.expectError(error.DuplicatePrimaryKey, table.insert(gpa, &.{ .{ .int = 1 }, bob }, 2));
     try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
 }
 
@@ -595,11 +766,11 @@ test "table insert and update enforce unique" {
     var bob: value.Value = .{ .text = try gpa.dupe(u8, "bob@example.com") };
     defer bob.deinit(gpa);
 
-    try table.insert(gpa, &.{ .{ .int = 1 }, alice });
-    try table.insert(gpa, &.{ .{ .int = 2 }, bob });
+    try table.insert(gpa, &.{ .{ .int = 1 }, alice }, 1);
+    try table.insert(gpa, &.{ .{ .int = 2 }, bob }, 2);
     try std.testing.expectError(
         error.UniqueViolation,
-        table.update(gpa, .{ .int = 2 }, &.{ .{ .int = 2 }, alice }),
+        table.update(gpa, .{ .int = 2 }, &.{ .{ .int = 2 }, alice }, 3),
     );
 }
 
@@ -613,13 +784,13 @@ test "table primary key is immutable on update" {
 
     var name: value.Value = .{ .text = try gpa.dupe(u8, "alice") };
     defer name.deinit(gpa);
-    try table.insert(gpa, &.{ .{ .int = 1 }, name });
+    try table.insert(gpa, &.{ .{ .int = 1 }, name }, 1);
 
     var name2: value.Value = .{ .text = try gpa.dupe(u8, "bob") };
     defer name2.deinit(gpa);
     try std.testing.expectError(
         error.PrimaryKeyImmutable,
-        table.update(gpa, .{ .int = 1 }, &.{ .{ .int = 99 }, name2 }),
+        table.update(gpa, .{ .int = 1 }, &.{ .{ .int = 99 }, name2 }, 2),
     );
 }
 
@@ -635,8 +806,8 @@ test "table matchIndices eq on pk and scan" {
     defer a.deinit(gpa);
     var b: value.Value = .{ .text = try gpa.dupe(u8, "bob") };
     defer b.deinit(gpa);
-    try table.insert(gpa, &.{ .{ .int = 1 }, a });
-    try table.insert(gpa, &.{ .{ .int = 2 }, b });
+    try table.insert(gpa, &.{ .{ .int = 1 }, a }, 1);
+    try table.insert(gpa, &.{ .{ .int = 2 }, b }, 2);
 
     const pk_preds = [_]Pred{.{ .eq = .{ .col_index = 0, .value = .{ .int = 2 } } }};
     const by_pk = try table.matchIndices(gpa, &pk_preds);
@@ -665,13 +836,163 @@ test "table delete swaps last row and fixes pk index" {
     defer b.deinit(gpa);
     var c: value.Value = .{ .text = try gpa.dupe(u8, "c") };
     defer c.deinit(gpa);
-    try table.insert(gpa, &.{ .{ .int = 1 }, a });
-    try table.insert(gpa, &.{ .{ .int = 2 }, b });
-    try table.insert(gpa, &.{ .{ .int = 3 }, c });
+    try table.insert(gpa, &.{ .{ .int = 1 }, a }, 1);
+    try table.insert(gpa, &.{ .{ .int = 2 }, b }, 2);
+    try table.insert(gpa, &.{ .{ .int = 3 }, c }, 3);
 
-    try table.delete(gpa, .{ .int = 1 });
+    try table.delete(gpa, .{ .int = 1 }, 4);
     try std.testing.expectEqual(@as(usize, 2), table.rows.items.len);
     try std.testing.expect(table.pkLookup(.{ .int = 1 }) == null);
     try std.testing.expect(table.pkLookup(.{ .int = 3 }) != null);
     try std.testing.expect(table.pkLookup(.{ .int = 2 }) != null);
+}
+
+test "versioned update retains the superseded version and stamps created_seq" {
+    const gpa = std.testing.allocator;
+    var table = try Table.create(gpa, "users", &.{
+        .{ .name = "id", .type_tag = .int, .primary_key = true },
+        .{ .name = "v", .type_tag = .int },
+    });
+    defer table.deinit(gpa);
+
+    try table.insert(gpa, &.{ .{ .int = 1 }, .{ .int = 10 } }, 1);
+    try table.insert(gpa, &.{ .{ .int = 2 }, .{ .int = 20 } }, 2);
+
+    // Live rows carry their creating commit sequence.
+    try std.testing.expectEqual(@as(u64, 1), table.rows.items[0].created_seq);
+    try std.testing.expectEqual(@as(u64, 2), table.rows.items[1].created_seq);
+
+    try table.update(gpa, .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 11 } }, 3);
+
+    // The old version was retained with the update's commit sequence; the live
+    // row now carries the update's created sequence.
+    try std.testing.expectEqual(@as(usize, 1), table.retained.items.len);
+    try std.testing.expectEqual(@as(u64, 1), table.retained.items[0].created_seq);
+    try std.testing.expectEqual(@as(u64, 3), table.retained.items[0].deleted_seq);
+    try std.testing.expectEqual(@as(i64, 10), table.retained.items[0].values[1].int);
+    try std.testing.expectEqual(@as(u64, 3), table.rows.items[0].created_seq);
+    try std.testing.expectEqual(@as(i64, 11), table.rows.items[0].values[1].int);
+}
+
+test "versioned delete retains the superseded version and removes the live row" {
+    const gpa = std.testing.allocator;
+    var table = try Table.create(gpa, "users", &.{
+        .{ .name = "id", .type_tag = .int, .primary_key = true },
+        .{ .name = "v", .type_tag = .int },
+    });
+    defer table.deinit(gpa);
+
+    try table.insert(gpa, &.{ .{ .int = 1 }, .{ .int = 10 } }, 1);
+    try table.delete(gpa, .{ .int = 1 }, 2);
+
+    // Removed from the live index and row set; retained with the delete's seq.
+    try std.testing.expectEqual(@as(usize, 0), table.rows.items.len);
+    try std.testing.expect(table.pkLookup(.{ .int = 1 }) == null);
+    try std.testing.expectEqual(@as(usize, 1), table.retained.items.len);
+    try std.testing.expectEqual(@as(u64, 2), table.retained.items[0].deleted_seq);
+    try std.testing.expectEqual(@as(i64, 10), table.retained.items[0].values[1].int);
+
+    // Reinsert after delete works and creates a fresh live version.
+    try table.insert(gpa, &.{ .{ .int = 1 }, .{ .int = 100 } }, 3);
+    try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
+    try std.testing.expectEqual(@as(u64, 3), table.rows.items[0].created_seq);
+    try std.testing.expect(table.pkLookup(.{ .int = 1 }) != null);
+    // The reinsert does not retain; only the delete's retained version remains.
+    try std.testing.expectEqual(@as(usize, 1), table.retained.items.len);
+}
+
+test "reclaimRetained frees only reclaimable versions and never a live row" {
+    const gpa = std.testing.allocator;
+    var table = try Table.create(gpa, "users", &.{
+        .{ .name = "id", .type_tag = .int, .primary_key = true },
+        .{ .name = "v", .type_tag = .int },
+    });
+    defer table.deinit(gpa);
+
+    // Row 1: insert at 1, update at 2, delete at 3 → retained (1,2) and (2,3).
+    try table.insert(gpa, &.{ .{ .int = 1 }, .{ .int = 10 } }, 1);
+    try table.update(gpa, .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 11 } }, 2);
+    try table.delete(gpa, .{ .int = 1 }, 3);
+    // Row 2: insert at 4, update at 5 → retained (4,5).
+    try table.insert(gpa, &.{ .{ .int = 2 }, .{ .int = 20 } }, 4);
+    try table.update(gpa, .{ .int = 2 }, &.{ .{ .int = 2 }, .{ .int = 21 } }, 5);
+
+    try std.testing.expectEqual(@as(usize, 3), table.retained.items.len);
+    try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
+
+    // oldest active snapshot = 3: only deleted_seq < 3 is reclaimable → (1,2).
+    try std.testing.expectEqual(@as(usize, 1), table.reclaimRetained(gpa, 3));
+    try std.testing.expectEqual(@as(usize, 2), table.retained.items.len);
+    // Live rows are never reclaimed.
+    try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
+
+    // oldest active snapshot = 6: everything retained is reclaimable.
+    try std.testing.expectEqual(@as(usize, 2), table.reclaimRetained(gpa, 6));
+    try std.testing.expectEqual(@as(usize, 0), table.retained.items.len);
+    try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
+}
+
+test "table snapshot reads expose version history across update, delete, reinsert" {
+    const gpa = std.testing.allocator;
+    var table = try Table.create(gpa, "users", &.{
+        .{ .name = "id", .type_tag = .int, .primary_key = true },
+        .{ .name = "v", .type_tag = .int },
+    });
+    defer table.deinit(gpa);
+
+    try table.insert(gpa, &.{ .{ .int = 1 }, .{ .int = 10 } }, 1);
+    try table.update(gpa, .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 11 } }, 2);
+    try table.delete(gpa, .{ .int = 1 }, 3);
+    try table.insert(gpa, &.{ .{ .int = 1 }, .{ .int = 100 } }, 4);
+
+    // At s=1 the original version (v=10) is visible: the live row was created
+    // at 4, after the watermark.
+    var v1 = (try table.rowVisibleAt(gpa, .{ .int = 1 }, 1)).?;
+    defer v1.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 10), v1.values[1].int);
+    try std.testing.expectEqual(@as(u64, 1), v1.created_seq);
+
+    // At s=2 the updated version (v=11) is visible.
+    var v2 = (try table.rowVisibleAt(gpa, .{ .int = 1 }, 2)).?;
+    defer v2.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 11), v2.values[1].int);
+
+    // At s=3 the row is deleted: absent.
+    try std.testing.expect((try table.rowVisibleAt(gpa, .{ .int = 1 }, 3)) == null);
+
+    // At s=4 the reinserted row is visible.
+    var v4 = (try table.rowVisibleAt(gpa, .{ .int = 1 }, 4)).?;
+    defer v4.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 100), v4.values[1].int);
+
+    // rowsVisibleAt at s=2 yields one version per visible pk: the live row (pk
+    // 2 absent here) plus the retained v=11 version of pk 1.
+    const visible = try table.rowsVisibleAt(gpa, 2);
+    defer {
+        for (visible) |*r| r.deinit(gpa);
+        gpa.free(visible);
+    }
+    try std.testing.expectEqual(@as(usize, 1), visible.len);
+    try std.testing.expectEqual(@as(i64, 11), visible[0].values[1].int);
+}
+
+test "heap table assigns created_seq but does not retain superseded versions" {
+    const gpa = std.testing.allocator;
+    var table = try Table.create(gpa, "events", &.{
+        .{ .name = "payload", .type_tag = .text },
+    });
+    defer table.deinit(gpa);
+
+    var a: value.Value = .{ .text = try gpa.dupe(u8, "a") };
+    defer a.deinit(gpa);
+    var b: value.Value = .{ .text = try gpa.dupe(u8, "b") };
+    defer b.deinit(gpa);
+    try table.insert(gpa, &.{a}, 1);
+    try table.updateAt(gpa, 0, &.{b}, 2);
+    // Heap tables cannot address versions by key: nothing is retained.
+    try std.testing.expectEqual(@as(usize, 0), table.retained.items.len);
+    try std.testing.expectEqual(@as(u64, 2), table.rows.items[0].created_seq);
+    try table.deleteAt(gpa, 0, 3);
+    try std.testing.expectEqual(@as(usize, 0), table.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 0), table.retained.items.len);
 }

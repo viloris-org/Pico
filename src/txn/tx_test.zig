@@ -78,7 +78,7 @@ test "autocommit statements each commit and advance the watermark" {
     {
         var eng = try openEngine(dir);
         defer eng.deinit();
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 2), all.rows.len);
     }
@@ -103,20 +103,20 @@ test "multi-statement commit is atomic and read-your-writes" {
         try eng.stageInsert(&tx, "t", &.{ .{ .int = 2 }, two });
 
         // Before commit the rows are not visible to other connections.
-        var before = try eng.selectAll("t");
+        var before = try eng.selectAll("t", eng.publishedSeq());
         defer before.deinit();
         try std.testing.expectEqual(@as(usize, 0), before.rows.len);
 
         try eng.commitTransaction(&tx);
         // After commit both rows appear atomically.
-        var after = try eng.selectAll("t");
+        var after = try eng.selectAll("t", eng.publishedSeq());
         defer after.deinit();
         try std.testing.expectEqual(@as(usize, 2), after.rows.len);
     }
     {
         var eng = try openEngine(dir);
         defer eng.deinit();
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 2), all.rows.len);
     }
@@ -134,7 +134,7 @@ test "rollback discards the write set and leaves no trace" {    const dir = "zig
         try eng.stageInsert(&tx, "t", &.{.{ .int = 1 }});
         try eng.rollbackTransaction(&tx);
 
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 0), all.rows.len);
         // The transaction is idle and cannot commit anymore.
@@ -143,7 +143,7 @@ test "rollback discards the write set and leaves no trace" {    const dir = "zig
     {
         var eng = try openEngine(dir);
         defer eng.deinit();
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 0), all.rows.len);
     }
@@ -171,7 +171,7 @@ test "failed staging rejects a later commit and only rollback resets it" {
     // partial write set is rejected at the coordinator boundary; a malformed
     // commit must not surface. Rollback resets it.
     try eng.rollbackTransaction(&tx);
-    var after = try eng.selectAll("t");
+    var after = try eng.selectAll("t", eng.publishedSeq());
     defer after.deinit();
     try std.testing.expectEqual(@as(usize, 0), after.rows.len);
 }
@@ -192,12 +192,12 @@ test "uncommitted write set is invisible to other connections" {
     try eng.stageInsert(&tx, "t", &.{ .{ .int = 7 }, name });
 
     // A separate connection's read sees nothing.
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 0), all.rows.len);
 
     try eng.commitTransaction(&tx);
-    var after = try eng.selectAll("t");
+    var after = try eng.selectAll("t", eng.publishedSeq());
     defer after.deinit();
     try std.testing.expectEqual(@as(usize, 1), after.rows.len);
 }
@@ -228,7 +228,7 @@ test "write-write conflict rejects a lost update" {
     // B's write, so the coordinator rejects it.
     try std.testing.expectError(error.WriteWriteConflict, eng.commitTransaction(&a));
 
-    var row = try eng.selectByPk("t", .{ .int = 1 });
+    var row = try eng.selectByPk("t", .{ .int = 1 }, eng.publishedSeq());
     defer row.deinit();
     try std.testing.expectEqual(@as(usize, 1), row.rows.len);
     try std.testing.expectEqual(@as(i64, 30), row.rows[0].values[1].int);
@@ -252,7 +252,7 @@ test "two blind inserts to distinct keys both commit" {
     try eng.commitTransaction(&a);
     try eng.commitTransaction(&b);
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 2), all.rows.len);
 }
@@ -304,7 +304,7 @@ test "commit queue is bounded and rejects overflow" {
     for (requests[0..count]) |*req| req.deinit();
     for (txns[0..count]) |*tx| tx.deinit();
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(count, all.rows.len);
 }
@@ -350,7 +350,7 @@ test "a cancelled queued commit is withdrawn without a commit-sequence gap" {
     // round cancellation; it was already counted at withdrawal time.
     try std.testing.expectEqual(@as(u64, 1), eng.coordinator.cancelled);
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 1), all.rows.len);
     try std.testing.expectEqual(@as(i64, 2), all.rows[0].values[0].int);
@@ -396,7 +396,7 @@ test "a request marked at the drain boundary publishes nothing (white-box Phase 
     try std.testing.expectEqual(@as(u64, 1), eng.coordinator.cancelled);
     try std.testing.expectEqual(@as(u64, 1), eng.coordinator.publishedSeq());
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 1), all.rows.len);
     try std.testing.expectEqual(@as(i64, 2), all.rows[0].values[0].int);
@@ -429,7 +429,7 @@ test "cancelling a committed request is a no-op" {
     try std.testing.expect(!req.cancelled);
     try std.testing.expectEqual(@as(u64, 0), eng.coordinator.cancelled);
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 1), all.rows.len);
 }
@@ -466,7 +466,7 @@ test "coordinator group commit shares one durability round" {
     for (&requests) |*req| req.deinit();
     for (&txns) |*tx| tx.deinit();
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 8), all.rows.len);
 }
@@ -541,11 +541,11 @@ test "a torn wal tail after a transaction commit keeps only the confirmed prefix
     {
         var eng = try engine_mod.Engine.open(gpa, io, dir, true);
         defer eng.deinit();
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         // Only the two confirmed commits survive; the torn tail is discarded.
         try std.testing.expectEqual(@as(usize, 2), all.rows.len);
-        var ghost = try eng.selectByPk("t", .{ .int = 3 });
+        var ghost = try eng.selectByPk("t", .{ .int = 3 }, eng.publishedSeq());
         defer ghost.deinit();
         try std.testing.expectEqual(@as(usize, 0), ghost.rows.len);
     }
@@ -586,23 +586,23 @@ test "read-your-writes: a transaction reads its own staged writes" {
     try eng.stageDelete(&tx, "t", .{ .int = 3 });
 
     // Point reads see the transaction's own staged writes.
-    var updated = try eng.selectByPkTx(&tx, "t", .{ .int = 1 });
+    var updated = try eng.selectByPkTx(&tx, "t", .{ .int = 1 }, eng.publishedSeq());
     defer updated.deinit();
     try std.testing.expectEqual(@as(usize, 1), updated.rows.len);
     try std.testing.expectEqualStrings("alice-updated", updated.rows[0].values[1].text);
 
-    var inserted = try eng.selectByPkTx(&tx, "t", .{ .int = 2 });
+    var inserted = try eng.selectByPkTx(&tx, "t", .{ .int = 2 }, eng.publishedSeq());
     defer inserted.deinit();
     try std.testing.expectEqual(@as(usize, 1), inserted.rows.len);
     try std.testing.expectEqualStrings("bob", inserted.rows[0].values[1].text);
 
-    var deleted = try eng.selectByPkTx(&tx, "t", .{ .int = 3 });
+    var deleted = try eng.selectByPkTx(&tx, "t", .{ .int = 3 }, eng.publishedSeq());
     defer deleted.deinit();
     try std.testing.expectEqual(@as(usize, 0), deleted.rows.len);
 
     // The merged scan contains exactly the transaction's view: committed rows
     // in read order, staged delete removed, staged insert appended.
-    var all = try eng.selectAllTx(&tx, "t");
+    var all = try eng.selectAllTx(&tx, "t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 2), all.rows.len);
     try std.testing.expectEqualStrings("alice-updated", all.rows[0].values[1].text);
@@ -610,7 +610,7 @@ test "read-your-writes: a transaction reads its own staged writes" {
 
     // Committing publishes exactly that state.
     try eng.commitTransaction(&tx);
-    var committed = try eng.selectAll("t");
+    var committed = try eng.selectAll("t", eng.publishedSeq());
     defer committed.deinit();
     try std.testing.expectEqual(@as(usize, 2), committed.rows.len);
     try std.testing.expectEqualStrings("alice-updated", committed.rows[0].values[1].text);
@@ -637,7 +637,7 @@ test "an uncommitted write set is invisible to other readers and transactions" {
     try eng.stageUpdate(&tx, "t", .{ .int = 1 }, &.{ .{ .int = 1 }, secret });
 
     // A plain read (another connection) sees only committed rows.
-    var plain = try eng.selectAll("t");
+    var plain = try eng.selectAll("t", eng.publishedSeq());
     defer plain.deinit();
     try std.testing.expectEqual(@as(usize, 1), plain.rows.len);
     try std.testing.expectEqualStrings("alice", plain.rows[0].values[1].text);
@@ -645,12 +645,12 @@ test "an uncommitted write set is invisible to other readers and transactions" {
     // Another transaction's Read Committed scan sees only committed rows.
     var other = eng.beginTransaction();
     defer other.deinit();
-    var other_view = try eng.selectAllTx(&other, "t");
+    var other_view = try eng.selectAllTx(&other, "t", eng.publishedSeq());
     defer other_view.deinit();
     try std.testing.expectEqual(@as(usize, 1), other_view.rows.len);
     try std.testing.expectEqualStrings("alice", other_view.rows[0].values[1].text);
 
-    var other_pk = try eng.selectByPkTx(&other, "t", .{ .int = 2 });
+    var other_pk = try eng.selectByPkTx(&other, "t", .{ .int = 2 }, eng.publishedSeq());
     defer other_pk.deinit();
     try std.testing.expectEqual(@as(usize, 0), other_pk.rows.len);
 }
@@ -668,7 +668,7 @@ test "Read Committed re-reads the latest committed state between statements" {
     var tx = eng.beginTransaction();
     defer tx.deinit();
 
-    var first = try eng.selectByPkTx(&tx, "t", .{ .int = 1 });
+    var first = try eng.selectByPkTx(&tx, "t", .{ .int = 1 }, eng.publishedSeq());
     defer first.deinit();
     try std.testing.expectEqual(@as(i64, 10), first.rows[0].values[1].int);
 
@@ -676,13 +676,13 @@ test "Read Committed re-reads the latest committed state between statements" {
     try eng.update("t", .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 20 } });
 
     // Read Committed: the second statement observes that commit.
-    var second = try eng.selectByPkTx(&tx, "t", .{ .int = 1 });
+    var second = try eng.selectByPkTx(&tx, "t", .{ .int = 1 }, eng.publishedSeq());
     defer second.deinit();
     try std.testing.expectEqual(@as(i64, 20), second.rows[0].values[1].int);
 
     // The transaction still keeps its own staged writes on top of fresh state.
     try eng.stageInsert(&tx, "t", &.{ .{ .int = 2 }, .{ .int = 200 } });
-    var merged = try eng.selectAllTx(&tx, "t");
+    var merged = try eng.selectAllTx(&tx, "t", eng.publishedSeq());
     defer merged.deinit();
     try std.testing.expectEqual(@as(usize, 2), merged.rows.len);
     try std.testing.expectEqual(@as(i64, 20), merged.rows[0].values[1].int);
@@ -707,12 +707,12 @@ test "a staged insert followed by update emits the latest write-set values" {
     try eng.stageInsert(&tx, "t", &.{ .{ .int = 2 }, first });
     try eng.stageUpdate(&tx, "t", .{ .int = 2 }, &.{ .{ .int = 2 }, second });
 
-    var point = try eng.selectByPkTx(&tx, "t", .{ .int = 2 });
+    var point = try eng.selectByPkTx(&tx, "t", .{ .int = 2 }, eng.publishedSeq());
     defer point.deinit();
     try std.testing.expectEqual(@as(usize, 1), point.rows.len);
     try std.testing.expectEqualStrings("second", point.rows[0].values[1].text);
 
-    var all = try eng.selectAllTx(&tx, "t");
+    var all = try eng.selectAllTx(&tx, "t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 1), all.rows.len);
     try std.testing.expectEqualStrings("second", all.rows[0].values[1].text);
@@ -733,17 +733,17 @@ test "a staged update followed by delete hides the row from the transaction" {
     try eng.stageUpdate(&tx, "t", .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 99 } });
     try eng.stageDelete(&tx, "t", .{ .int = 1 });
 
-    var point = try eng.selectByPkTx(&tx, "t", .{ .int = 1 });
+    var point = try eng.selectByPkTx(&tx, "t", .{ .int = 1 }, eng.publishedSeq());
     defer point.deinit();
     try std.testing.expectEqual(@as(usize, 0), point.rows.len);
 
-    var all = try eng.selectAllTx(&tx, "t");
+    var all = try eng.selectAllTx(&tx, "t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 0), all.rows.len);
 
     // Committing publishes the deletion.
     try eng.commitTransaction(&tx);
-    var committed = try eng.selectAll("t");
+    var committed = try eng.selectAll("t", eng.publishedSeq());
     defer committed.deinit();
     try std.testing.expectEqual(@as(usize, 0), committed.rows.len);
 }
@@ -790,7 +790,7 @@ test "a failed commit marks the transaction failed and rejects further operation
     try std.testing.expect(!a.isActive());
     try std.testing.expectError(error.InvalidState, eng.stageInsert(&a, "t", &.{ .{ .int = 2 }, .{ .int = 40 } }));
 
-    var row = try eng.selectByPk("t", .{ .int = 1 });
+    var row = try eng.selectByPk("t", .{ .int = 1 }, eng.publishedSeq());
     defer row.deinit();
     try std.testing.expectEqual(@as(i64, 30), row.rows[0].values[1].int);
 }
@@ -827,7 +827,7 @@ test "WAL append failure rejects the whole group and publishes nothing" {
         try std.testing.expectEqual(error.WalAppendFailed, req_a.result.?);
         try std.testing.expectEqual(error.WalAppendFailed, req_b.result.?);
         try std.testing.expectEqual(seq_before, eng.publishedSeq());
-        var live = try eng.selectAll("t");
+        var live = try eng.selectAll("t", eng.publishedSeq());
         defer live.deinit();
         try std.testing.expectEqual(@as(usize, 1), live.rows.len);
     }
@@ -837,7 +837,7 @@ test "WAL append failure rejects the whole group and publishes nothing" {
         var eng = try engine_mod.Engine.open(gpa, io, dir, true);
         defer eng.deinit();
         try std.testing.expectEqual(seq_before, eng.publishedSeq());
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 1), all.rows.len);
     }
@@ -866,7 +866,7 @@ test "publication failure never advances the watermark and recovery converges to
 
         // In-memory: the watermark does not advance and the row is not visible.
         try std.testing.expectEqual(seq_before, eng.publishedSeq());
-        var live = try eng.selectAll("t");
+        var live = try eng.selectAll("t", eng.publishedSeq());
         defer live.deinit();
         try std.testing.expectEqual(@as(usize, 1), live.rows.len);
     }
@@ -876,7 +876,7 @@ test "publication failure never advances the watermark and recovery converges to
         var eng = try engine_mod.Engine.open(gpa, io, dir, true);
         defer eng.deinit();
         try std.testing.expectEqual(seq_before + 1, eng.publishedSeq());
-        var all = try eng.selectAll("t");
+        var all = try eng.selectAll("t", eng.publishedSeq());
         defer all.deinit();
         try std.testing.expectEqual(@as(usize, 2), all.rows.len);
     }
@@ -906,7 +906,7 @@ test "same-key concurrent inserts conflict at commit" {
     try std.testing.expect(b.isFailed());
     try eng.rollbackTransaction(&b);
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 1), all.rows.len);
 }
@@ -940,7 +940,7 @@ test "same-round primary-key conflicts reject the later request" {
     try std.testing.expectEqual(@as(?commit_mod.CoordError, null), req_a.result);
     try std.testing.expectEqual(error.DuplicatePrimaryKey, req_b.result.?);
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 1), all.rows.len);
 }
@@ -984,7 +984,7 @@ test "same-round secondary unique conflicts are rejected at validation" {
     try std.testing.expectEqual(@as(?commit_mod.CoordError, null), req_a.result);
     try std.testing.expectEqual(error.UniqueViolation, req_b.result.?);
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 1), all.rows.len);
 }
@@ -1009,7 +1009,7 @@ test "a secondary unique insert conflicts with a prior committed row" {
     try eng.insert("t", &.{ .{ .int = 1 }, email_a });
     try std.testing.expectError(error.UniqueViolation, eng.insert("t", &.{ .{ .int = 2 }, email_b }));
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 1), all.rows.len);
 }
@@ -1040,7 +1040,7 @@ test "per-transaction write-set limits reject oversized transactions" {
     try std.testing.expectError(error.StagedBytesExceeded, eng.stageInsert(&tx2, "t", &.{.{ .int = 1 }}));
     try eng.rollbackTransaction(&tx2);
 
-    var all = try eng.selectAll("t");
+    var all = try eng.selectAll("t", eng.publishedSeq());
     defer all.deinit();
     try std.testing.expectEqual(@as(usize, 0), all.rows.len);
 }

@@ -6,6 +6,8 @@ pub const vfs = @import("storage/vfs.zig");
 pub const pager = @import("storage/pager.zig");
 pub const wal = @import("storage/wal.zig");
 pub const table = @import("storage/table.zig");
+pub const mvcc = @import("storage/mvcc.zig");
+pub const mvcc_test = @import("storage/mvcc_test.zig");
 pub const document = @import("storage/document.zig");
 pub const graph = @import("storage/graph.zig");
 pub const manifest = @import("storage/manifest.zig");
@@ -37,6 +39,8 @@ test {
     _ = pager;
     _ = wal;
     _ = table;
+    _ = mvcc;
+    _ = mvcc_test;
     _ = document;
     _ = graph;
     _ = manifest;
