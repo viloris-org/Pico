@@ -254,7 +254,10 @@ pub fn validate(request: *const Request) IrError!void {
             if (request.observe != null or request.evidence_id != 0) return error.InvalidOperation;
             if (!ast.isIdentifier(request.relation)) return error.InvalidIdentifier;
             for (request.where) |predicate| {
-                if (!ast.isIdentifier(predicate.column)) return error.InvalidIdentifier;
+                // A relation column is a path of length one; a dotted path
+                // addresses a nested document field. Binding resolves the path
+                // against the named collection and rejects an unknown one.
+                if (!ast.isPath(predicate.column)) return error.InvalidIdentifier;
                 switch (predicate.op) {
                     .is_null, .not_null => {
                         if (predicate.scalar != null or predicate.list.items.len != 0) return error.InvalidOperation;
@@ -279,7 +282,7 @@ pub fn validate(request: *const Request) IrError!void {
                 }
             }
             if (request.fields.len == 0) return error.ExpectedField;
-            for (request.fields) |field| if (!ast.isIdentifier(field)) return error.InvalidIdentifier;
+            for (request.fields) |field| if (!ast.isPath(field)) return error.InvalidIdentifier;
         },
         .observe => {
             const observation = request.observe orelse return error.InvalidOperation;

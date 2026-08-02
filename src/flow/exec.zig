@@ -717,3 +717,118 @@ test "where binding rejects unknown columns and type mismatches" {
     defer pattern_type.deinit(std.testing.allocator);
     try std.testing.expectError(error.TypeMismatch, execute(std.testing.allocator, &eng, &pattern_type));
 }
+
+test "dotted paths parse and bind as identifier paths" {
+    const gpa = std.testing.allocator;
+    var parsed = try ast.parse(gpa, "from customer\n| where author.name = 'ada'\n| where title like 'a%'\n| emit { author.name, title }\n| limit 5");
+    defer parsed.deinit(gpa);
+    try std.testing.expectEqualStrings("author.name", parsed.where[0].column);
+    try std.testing.expectEqualStrings("title", parsed.where[1].column);
+    try std.testing.expectEqualStrings("author.name", parsed.fields[0]);
+    try std.testing.expectEqual(@as(?u32, 5), parsed.limit);
+
+    // The canonical IR accepts the dotted-path shape; a trailing dot or empty
+    // segment is rejected as an identifier.
+    var request = try ir.bind(gpa, parsed);
+    defer request.deinit(gpa);
+    try std.testing.expectEqualStrings("author.name", request.fields[0]);
+
+    try std.testing.expect(!ast.isPath("author."));
+    try std.testing.expect(!ast.isPath("author..name"));
+    try std.testing.expect(!ast.isPath(".name"));
+    try std.testing.expect(ast.isPath("author.name"));
+    try std.testing.expect(ast.isPath("id"));
+}
+
+test "source and equivalent canonical IR produce the same result" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-ir-equivalence";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    var columns = [_]value.Column{
+        .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+        .{ .name = try gpa.dupe(u8, "name"), .type_tag = .text },
+        .{ .name = try gpa.dupe(u8, "region"), .type_tag = .text },
+    };
+    defer for (&columns) |*column| column.deinit(gpa);
+    try eng.createTable("customer", &columns);
+    var ada: value.Value = .{ .text = try gpa.dupe(u8, "ada") };
+    defer ada.deinit(gpa);
+    var ann: value.Value = .{ .text = try gpa.dupe(u8, "ann") };
+    defer ann.deinit(gpa);
+    var north: value.Value = .{ .text = try gpa.dupe(u8, "north") };
+    defer north.deinit(gpa);
+    var south: value.Value = .{ .text = try gpa.dupe(u8, "south") };
+    defer south.deinit(gpa);
+    try eng.insert("customer", &.{ .{ .int = 1 }, ada, north });
+    try eng.insert("customer", &.{ .{ .int = 2 }, ann, north });
+    try eng.insert("customer", &.{ .{ .int = 3 }, ann, south });
+
+    const source = "from customer\n| where region = 'north'\n| emit { id, name }\n| limit 10";
+
+    // Execute the bound source request directly...
+    var request_a = try compile(gpa, source);
+    defer request_a.deinit(gpa);
+    var result_a = try execute(gpa, &eng, &request_a);
+    defer result_a.deinit();
+
+    // ...then execute the identical request recovered from its canonical IR
+    // bytes, exactly as the Wire Protocol's FLOW_IR path would.
+    const bytes = try ir.encode(gpa, &request_a);
+    defer gpa.free(bytes);
+    var request_b = try ir.decode(gpa, bytes);
+    defer request_b.deinit(gpa);
+    var result_b = try execute(gpa, &eng, &request_b);
+    defer result_b.deinit();
+
+    try std.testing.expectEqual(result_a.columns.len, result_b.columns.len);
+    try std.testing.expectEqual(result_a.cells.len, result_b.cells.len);
+    for (result_a.columns, 0..) |column, index| try std.testing.expectEqualStrings(column, result_b.columns[index]);
+    for (result_a.cells, 0..) |row, row_index| {
+        for (row, 0..) |cell, col_index| {
+            try std.testing.expectEqualStrings(cell.?, result_b.cells[row_index][col_index].?);
+        }
+    }
+}
+
+test "source and equivalent IR produce the same error" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-ir-error-equivalence";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    var columns = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+    defer columns[0].deinit(gpa);
+    try eng.createTable("customer", &columns);
+
+    // A source that names an unknown field fails binding; the equivalent IR
+    // (encoded from the bound request, which only differs in that the source
+    // already failed) must fail identically. Encoding a request whose field is
+    // unknown at execution still round-trips; the failure is at execution.
+    const source = "from customer\n| emit { missing }";
+    var request_a = try compile(gpa, source);
+    defer request_a.deinit(gpa);
+    try std.testing.expectError(error.FieldNotFound, execute(gpa, &eng, &request_a));
+
+    const bytes = try ir.encode(gpa, &request_a);
+    defer gpa.free(bytes);
+    var request_b = try ir.decode(gpa, bytes);
+    defer request_b.deinit(gpa);
+    try std.testing.expectError(error.FieldNotFound, execute(gpa, &eng, &request_b));
+
+    // An unresolvable relation produces the same error from source and IR.
+    const missing_rel = "from nobody\n| emit { id }";
+    var rel_a = try compile(gpa, missing_rel);
+    defer rel_a.deinit(gpa);
+    try std.testing.expectError(error.SemanticNameNotFound, execute(gpa, &eng, &rel_a));
+    const rel_bytes = try ir.encode(gpa, &rel_a);
+    defer gpa.free(rel_bytes);
+    var rel_b = try ir.decode(gpa, rel_bytes);
+    defer rel_b.deinit(gpa);
+    try std.testing.expectError(error.SemanticNameNotFound, execute(gpa, &eng, &rel_b));
+}

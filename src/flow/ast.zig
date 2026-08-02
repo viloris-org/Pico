@@ -166,7 +166,7 @@ fn parseEmit(gpa: Allocator, line: []const u8) ParseError![][]u8 {
     while (parts.next()) |part| {
         const field = std.mem.trim(u8, part, " \t");
         if (field.len == 0) return error.ExpectedField;
-        if (!isIdentifier(field)) return error.InvalidIdentifier;
+        if (!isPath(field)) return error.InvalidIdentifier;
         try fields.append(gpa, try gpa.dupe(u8, field));
     }
     return fields.toOwnedSlice(gpa);
@@ -187,7 +187,7 @@ fn parseWhere(gpa: Allocator, line: []const u8) ParseError!Predicate {
     const body = std.mem.trim(u8, line[prefix.len..], " \t");
     if (body.len == 0) return error.ExpectedOperator;
 
-    const column_len = identifierPrefixLength(body) orelse return error.InvalidIdentifier;
+    const column_len = pathPrefixLength(body) orelse return error.InvalidIdentifier;
     const column = try gpa.dupe(u8, body[0..column_len]);
     errdefer gpa.free(column);
     const rest = std.mem.trim(u8, body[column_len..], " \t");
@@ -261,14 +261,24 @@ fn parseQuoted(gpa: Allocator, text: []const u8) ParseError![]u8 {
     return gpa.dupe(u8, text[1 .. text.len - 1]);
 }
 
-/// Length of the identifier prefix of `text`, or null when `text` does not
-/// begin with an identifier.
-fn identifierPrefixLength(text: []const u8) ?usize {
+/// Length of the path prefix of `text`, or null when `text` does not begin
+/// with a path. A path is one or more identifiers joined by single dots
+/// (`a`, `a.b`, `a.b.c`); a trailing dot is rejected.
+fn pathPrefixLength(text: []const u8) ?usize {
     if (text.len == 0) return null;
-    if (!(std.ascii.isAlphabetic(text[0]) or text[0] == '_')) return null;
-    var index: usize = 1;
-    while (index < text.len and (std.ascii.isAlphanumeric(text[index]) or text[index] == '_')) index += 1;
-    return index;
+    var index: usize = 0;
+    while (true) {
+        // One identifier segment. After a dot a further segment is required.
+        if (index >= text.len) return null;
+        if (!(std.ascii.isAlphabetic(text[index]) or text[index] == '_')) return null;
+        index += 1;
+        while (index < text.len and (std.ascii.isAlphanumeric(text[index]) or text[index] == '_')) index += 1;
+        if (index < text.len and text[index] == '.') {
+            index += 1;
+            continue;
+        }
+        return index;
+    }
 }
 
 /// An identifier is deliberately ASCII-only in the initial development slice.
@@ -281,6 +291,24 @@ pub fn isIdentifier(name: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
     }
     return true;
+}
+
+/// A path is one or more identifiers joined by single dots (`a`, `a.b`). A
+/// dotted path addresses a nested document field; a relation column is a path
+/// of length one. The first and last byte must belong to an identifier segment
+/// and no segment may be empty, so `a.` and `a..b` are rejected.
+pub fn isPath(name: []const u8) bool {
+    if (name.len == 0) return false;
+    var segment_start: usize = 0;
+    var i: usize = 0;
+    while (i <= name.len) : (i += 1) {
+        if (i == name.len or name[i] == '.') {
+            if (!isIdentifier(name[segment_start..i])) return false;
+            if (i == name.len) return true;
+            segment_start = i + 1;
+        }
+    }
+    return false;
 }
 
 test "parses a relation projection pipeline" {
