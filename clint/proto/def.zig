@@ -7,7 +7,7 @@
 /// peer can never misparse the trailing credential that v3 HELLO_OK appends.
 pub const PROTOCOL_VERSION_MAJOR: u16 = 3;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
-pub const IR_FORMAT_VERSION: u16 = 4;
+pub const IR_FORMAT_VERSION: u16 = 5;
 
 /// HELLO_OK (server -> client) layout — the shared parsing contract. The body
 /// is a length-prefixed server version string, then exactly
@@ -134,4 +134,20 @@ pub const Modality = enum(u8) {
     video = 4,
     sensor = 5,
     other = 6,
+};
+
+/// A scalar value for a document field in the official RunaDB Client. Text is
+/// borrowed by the caller and owned by it for the duration of the request.
+pub const DocumentValue = union(enum) {
+    null,
+    int: i64,
+    text: []const u8,
+    bool: bool,
+};
+
+/// One field of a `document_insert` request. `path` is a dotted path (for
+/// example `author.name`).
+pub const DocumentField = struct {
+    path: []const u8,
+    value: DocumentValue,
 };

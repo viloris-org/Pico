@@ -126,10 +126,18 @@ because its source syntax or IR shape exists.
 
 ### Phase 2: Read-Only Semantic-Model Vertical Slices
 
+**Status:** Complete. The relation, Observation Evidence (ADR-0019), document,
+and graph read-only slices are implemented through the official RunaDB Client
+as protocol v3 development capabilities. Each slice is supported and tested
+only for its published semantics; source and equivalent canonical Runa Query IR
+produce the same result or error, verified end to end over the wire protocol;
+and no slice claims a World Continuum capability beyond what it publishes. The
+delivery bullets below record the definitional work each slice satisfied.
+
 **Goal:** Prove the new public boundary through narrow, end-to-end read paths
 before adding mutations or declaring multiple data models supported.
 
-**Status:** The relation slice and the Observation Evidence slice (ADR-0019) are
+The relation slice and the Observation Evidence slice (ADR-0019) are
 implemented through the official RunaDB Client as a protocol v3 development
 capability, including immutable evidence ingestion, metadata inspection, bounded
 payload retrieval, checkpoint retention, restart recovery, orphan reclamation,
@@ -138,8 +146,18 @@ adapter (ADR-0021) exposes the same read-only boundary through
 `runadb_flow_emit`. The evidence operator contract (metrics, instance-wide
 staging and retained-byte quotas, and staged-upload accounting) is implemented
 at the engine level; exposing it through an operator request surface is Phase 7
-administration work. The document and graph slices and the remaining World
-Continuum inspection forms remain outstanding below.
+administration work. The document collection slice is implemented through the
+official RunaDB Client: dotted-path `emit` fields and `where` predicates read
+variable-shape documents from durable, recoverable collections; the
+`document_insert` canonical IR operation ingests documents and creates the
+collection on its first insert; source and equivalent canonical IR produce the
+same result or error, verified end to end over the wire protocol; and
+collections survive checkpoint and restart. The graph slice is implemented
+through the official RunaDB Client: labeled directed edges between
+document-like nodes, a `navigate <edge> as <alias>` traversal stage, and
+`graph_add_node`/`graph_add_edge` ingestion, with source-vs-IR equivalence,
+checkpoint/restart recovery, and official-client round-trip coverage. The
+remaining World Continuum inspection forms remain outstanding below.
 
 - Build relation, document, and graph read-only vertical slices through the
   official RunaDB Client, from Runa Flow source through binding and canonical
@@ -179,9 +197,25 @@ unit, and official-client integration coverage. In the sequential listener a
 mid-statement delivery, including the delivered `CANCELED` outcome, is the Phase
 6 guarantee. Deterministic tests now cover
 autocommit, multi-statement commit, rollback, failed transactions, visibility,
-conflicts, cancellation, and bounded contention. The remaining items below are
-production support verification and the concurrent mid-statement cancellation
-delivery that the Phase 6 runtime enables.
+conflicts, cancellation, and bounded contention.
+
+The Phase 3 exit criteria are verified. A commit that reaches the coordinator
+and fails — conflict, duplicate key, uniqueness, WAL append, or cancellation —
+marks the transaction `failed`; a failed transaction rejects every operation
+except rollback, and the state transition is tested. Failure injection at the
+WAL-append boundary (a group-commit append that fails before any byte is
+written rejects every accepted request, publishes nothing, and leaves restart
+with the prior confirmed prefix) and at the publication boundary (a durable
+commit whose in-memory apply fails never advances the live watermark, and
+restart converges to the WAL-confirmed prefix) is covered deterministically.
+Same-round primary-key and secondary unique-column conflicts are validated
+against the round shadow before the WAL record, so a same-round uniqueness
+violation is rejected at validation rather than surfacing at apply time after
+the record is durable, and both paths are tested with restart evidence.
+Per-transaction write-set staging limits (`OperationCountExceeded` and
+`StagedBytesExceeded`) are tested. The remaining items are the concurrent
+mid-statement cancellation delivery and wire exposure of the Read Committed
+read path that the Phase 6 runtime enables.
 
 **Goal:** Replace compatibility transaction labels with verified transaction
 semantics while retaining one commit order.
@@ -210,6 +244,21 @@ contention. Failure injection at every WAL and publication boundary shows that
 restart exposes only the confirmed commit prefix.
 
 ### Phase 4: Durable Storage Foundation
+
+**Status:** Substantially implemented. The VFS data-directory fence, logical
+filename validation, instance locking, positional I/O, synchronization, and
+atomic artifact publication are complete and tested. The fixed-size Pager and
+static page cache with explicit pinning, dirty writeback, exhaustion, and
+truncation behavior are complete and tested. The WAL, evidence payload store,
+and the new manifest use self-identifying, versioned formats, and recovery
+rejects unknown or corrupt complete formats rather than replaying or ignoring
+them. A checkpoint rewrites the WAL atomically and then publishes a versioned
+manifest (`src/storage/manifest.zig`) recording the commit watermark and the
+covered catalog objects; recovery validates the manifest against the catalog
+rebuilt from the WAL and rejects an incompatible, corrupt, or inconsistent
+manifest. Catalog recovery is covered for tables, document collections, and
+graphs together. The remaining work below is wiring the Pager to an on-disk
+page-backed structure, which arrives with LSM storage (Phase 5).
 
 **Goal:** Establish the data-directory and file-management primitives required
 for durable LSM storage.

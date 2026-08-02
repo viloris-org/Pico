@@ -54,6 +54,8 @@ test "RunaDB Client v3 protocol lifecycle, evidence, and request errors" {
     }
 
     try expectEvidenceRoundTrip(gpa, io);
+    try expectDocumentRoundTrip(gpa, io);
+    try expectGraphRoundTrip(gpa, io);
     try expectVersionRejection(gpa, io);
     try expectMalformedRequestsKeepConnectionUsable(gpa, io);
     try expectCancellationNoOps(gpa, io);
@@ -195,6 +197,121 @@ fn expectEvidenceRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
     try std.testing.expect((try filtered.next(arena.allocator())) == null);
 }
 
+/// Documents ingest through canonical IR (document_insert) and read back
+/// through Flow source with dotted-path projection, predicates, and nulls.
+fn expectDocumentRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
+    var conn = try connectWhenReady(gpa, io);
+    defer conn.deinit(io);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const fields = [_]proto.DocumentField{
+        .{ .path = "title", .value = .{ .text = "Dune" } },
+        .{ .path = "author.name", .value = .{ .text = "Herbert" } },
+        .{ .path = "pages", .value = .{ .int = 412 } },
+    };
+    var inserted = try conn.insertDocument("books", "1", &fields);
+    try std.testing.expect((try inserted.next(arena.allocator())).? == .row_description);
+    const insert_row = (try inserted.next(arena.allocator())).?;
+    switch (insert_row) {
+        .row_data => |data| try std.testing.expectEqualStrings("1", data.values[0]),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try inserted.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try inserted.next(arena.allocator())) == null);
+
+    var read = try conn.executeFlow(arena.allocator(), "from books\n| where author.name = 'Herbert'\n| emit { title, author.name, pages }\n| limit 5");
+    try std.testing.expect((try read.next(arena.allocator())).? == .row_description);
+    const read_row = (try read.next(arena.allocator())).?;
+    switch (read_row) {
+        .row_data => |data| {
+            try std.testing.expectEqualStrings("Dune", data.values[0]);
+            try std.testing.expectEqualStrings("Herbert", data.values[1]);
+            try std.testing.expectEqualStrings("412", data.values[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try read.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try read.next(arena.allocator())) == null);
+
+    // A predicate on a path absent from every document matches nothing; the
+    // absent path itself emits as null.
+    var missing = try conn.executeFlow(arena.allocator(), "from books\n| where genre = 'scifi'\n| emit { title, genre }");
+    try std.testing.expect((try missing.next(arena.allocator())).? == .row_description);
+    try std.testing.expect((try missing.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try missing.next(arena.allocator())) == null);
+
+    var null_emit = try conn.executeFlow(arena.allocator(), "from books\n| emit { title, genre }\n| limit 1");
+    try std.testing.expect((try null_emit.next(arena.allocator())).? == .row_description);
+    const null_row = (try null_emit.next(arena.allocator())).?;
+    switch (null_row) {
+        .row_data => |data| {
+            try std.testing.expectEqualStrings("Dune", data.values[0]);
+            try std.testing.expect(data.nulls[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try null_emit.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try null_emit.next(arena.allocator())) == null);
+}
+
+/// Graphs ingest nodes and edges through canonical IR and traverse through the
+/// `navigate` Flow stage over the wire.
+fn expectGraphRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
+    var conn = try connectWhenReady(gpa, io);
+    defer conn.deinit(io);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const ada = [_]proto.DocumentField{.{ .path = "name", .value = .{ .text = "Ada" } }};
+    const grace = [_]proto.DocumentField{.{ .path = "name", .value = .{ .text = "Grace" } }};
+    const lin = [_]proto.DocumentField{.{ .path = "name", .value = .{ .text = "Lin" } }};
+
+    var node_a = try conn.addNode("social", "1", &ada);
+    try node_a.drain(arena.allocator());
+    var node_g = try conn.addNode("social", "2", &grace);
+    try node_g.drain(arena.allocator());
+    var node_l = try conn.addNode("social", "3", &lin);
+    try node_l.drain(arena.allocator());
+
+    var edge_a = try conn.addEdge("social", "1", "mentors", "2");
+    try edge_a.drain(arena.allocator());
+    var edge_b = try conn.addEdge("social", "1", "mentors", "3");
+    try edge_b.drain(arena.allocator());
+
+    var read = try conn.executeFlow(arena.allocator(), "from social\n| navigate mentors as mentee\n| emit { name, mentee.name }\n| limit 5");
+    try std.testing.expect((try read.next(arena.allocator())).? == .row_description);
+    const row1 = (try read.next(arena.allocator())).?;
+    switch (row1) {
+        .row_data => |data| {
+            try std.testing.expectEqualStrings("Ada", data.values[0]);
+            try std.testing.expectEqualStrings("Grace", data.values[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const row2 = (try read.next(arena.allocator())).?;
+    switch (row2) {
+        .row_data => |data| {
+            try std.testing.expectEqualStrings("Ada", data.values[0]);
+            try std.testing.expectEqualStrings("Lin", data.values[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try read.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try read.next(arena.allocator())) == null);
+
+    // Adding an edge to an unknown node is rejected by the Server.
+    var bad = try conn.addEdge("social", "1", "mentors", "99");
+    const bad_message = (try bad.next(arena.allocator())).?;
+    switch (bad_message) {
+        .server_error => |server_error| {
+            try std.testing.expectEqualStrings("GF1002", server_error.code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try bad.next(arena.allocator())) == null);
+}
+
 fn connectWhenReady(gpa: std.mem.Allocator, io: Io) !clint.Connection {
     var last_error: ?anyerror = null;
     for (0..100) |_| {
@@ -296,14 +413,15 @@ fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io:
     // no projection fields. Direct IR input must obey the same static shape
     // constraints as Runa Flow source.
     const empty_projection_ir = [_]u8{
-        0, 4, // wire IR format version
-        0, 4, // canonical IR format version
+        0, 5, // wire IR format version
+        0, 5, // canonical IR format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
         0, // where predicate count
         0, 0, // projection field count
         0, // no limit
+        0, // no navigate
     };
     try clint.codec.writeMessage(&writer.interface, .flow_ir, &empty_projection_ir);
     try writer.interface.flush();

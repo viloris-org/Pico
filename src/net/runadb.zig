@@ -8,6 +8,7 @@ const flow = @import("../flow/exec.zig");
 const flow_ir = @import("../flow/ir.zig");
 const engine_mod = @import("../storage/engine.zig");
 const evidence_mod = @import("../storage/evidence.zig");
+const document_mod = @import("../storage/document.zig");
 const connection_mod = @import("connection.zig");
 const registry_mod = @import("registry.zig");
 const proto = @import("clint_proto");
@@ -242,6 +243,62 @@ pub fn handleConnection(
                         defer gpa.free(payload_bytes);
                         try sendPayload(w, request.evidence_id, payload_bytes);
                         try sendCommandComplete(w, "READ EVIDENCE PAYLOAD", 1);
+                        try w.flush();
+                    },
+                    .document_insert => {
+                        const insert = request.document_insert.?;
+                        // Borrow the request's fields; the engine clones them
+                        // into the collection, so nothing is moved or shared.
+                        var fields: std.ArrayList(document_mod.Field) = .empty;
+                        defer fields.deinit(gpa);
+                        try fields.ensureTotalCapacity(gpa, insert.fields.len);
+                        for (insert.fields) |*field| {
+                            fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
+                        }
+                        eng.insertDocument(insert.collection, insert.id, fields.items) catch |err| {
+                            try sendError(w, 2, "DF1001", @errorName(err));
+                            try w.flush();
+                            continue;
+                        };
+                        var columns = [_][]const u8{"document_id"};
+                        var cells = [_]?[]const u8{insert.id};
+                        try sendRowDescription(w, &columns);
+                        try sendRowData(w, &cells);
+                        try sendCommandComplete(w, "INSERT DOCUMENT", 1);
+                        try w.flush();
+                    },
+                    .graph_add_node => {
+                        const insert = request.graph_add_node.?;
+                        var fields: std.ArrayList(document_mod.Field) = .empty;
+                        defer fields.deinit(gpa);
+                        try fields.ensureTotalCapacity(gpa, insert.fields.len);
+                        for (insert.fields) |*field| {
+                            fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
+                        }
+                        eng.addNode(insert.graph, insert.id, fields.items) catch |err| {
+                            try sendError(w, 2, "GF1001", @errorName(err));
+                            try w.flush();
+                            continue;
+                        };
+                        var node_columns = [_][]const u8{"node_id"};
+                        var node_cells = [_]?[]const u8{insert.id};
+                        try sendRowDescription(w, &node_columns);
+                        try sendRowData(w, &node_cells);
+                        try sendCommandComplete(w, "ADD NODE", 1);
+                        try w.flush();
+                    },
+                    .graph_add_edge => {
+                        const edge = request.graph_add_edge.?;
+                        eng.addEdge(edge.graph, edge.from, edge.label, edge.to) catch |err| {
+                            try sendError(w, 2, "GF1002", @errorName(err));
+                            try w.flush();
+                            continue;
+                        };
+                        var edge_columns = [_][]const u8{"from", "label", "to"};
+                        var edge_cells = [_]?[]const u8{ edge.from, edge.label, edge.to };
+                        try sendRowDescription(w, &edge_columns);
+                        try sendRowData(w, &edge_cells);
+                        try sendCommandComplete(w, "ADD EDGE", 1);
                         try w.flush();
                     },
                 }

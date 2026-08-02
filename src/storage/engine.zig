@@ -3,7 +3,11 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const value = @import("value.zig");
 const wal_mod = @import("wal.zig");
+const vfs_mod = @import("vfs.zig");
 const table_mod = @import("table.zig");
+const document_mod = @import("document.zig");
+const graph_mod = @import("graph.zig");
+const manifest_mod = @import("manifest.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const evidence_mod = @import("evidence.zig");
 const vector_mod = @import("../vector.zig");
@@ -48,6 +52,10 @@ fn enginePkOf(eng: *Engine, table_name: []const u8, values: []const value.Value)
 }
 
 fn engineApplyOp(eng: *Engine, op: *const wal_mod.TxnOp) anyerror!void {
+    if (eng.test_fail_next_apply) {
+        eng.test_fail_next_apply = false;
+        return error.PrimaryKeyNotFound;
+    }
     return eng.applyTxnOp(op);
 }
 
@@ -115,6 +123,12 @@ pub const Engine = struct {
     wal: wal_mod.Wal,
     payloads: evidence_mod.Store,
     tables: std.StringHashMap(Table),
+    /// Document collections (roadmap Phase 2). A name is exclusive between
+    /// tables and document collections; recovery rebuilds both from the WAL.
+    documents: std.StringHashMap(document_mod.Collection),
+    /// Graph collections (roadmap Phase 2). A name is exclusive with tables
+    /// and document collections.
+    graphs: std.StringHashMap(graph_mod.Graph),
     observations: std.ArrayList(evidence_mod.Record),
     next_evidence_id: u64 = 1,
     evidence_stats: EvidenceStats = .{},
@@ -151,6 +165,13 @@ pub const Engine = struct {
     /// unsynchronized against writers — see the concurrency note in
     /// `docs/architecture/wal-and-recovery.md`.
     writer_mutex: Io.Mutex = .init,
+    /// Test-only fault injection at the publication boundary: when true, the
+    /// next coordinator apply fails (as `PrimaryKeyNotFound`) before touching
+    /// the table. The WAL record is already durable at that point, so the test
+    /// asserts that an in-memory publication failure never loses a durable
+    /// commit and that restart converges to the WAL-confirmed prefix. Never set
+    /// outside tests.
+    test_fail_next_apply: bool = false,
 
     pub fn open(gpa: Allocator, io: Io, data_dir: []const u8, sync_wal: bool) !Engine {
         var wal = try wal_mod.Wal.open(gpa, io, data_dir, sync_wal);
@@ -164,6 +185,8 @@ pub const Engine = struct {
             .wal = wal,
             .payloads = payloads,
             .tables = std.StringHashMap(Table).init(gpa),
+            .documents = std.StringHashMap(document_mod.Collection).init(gpa),
+            .graphs = std.StringHashMap(graph_mod.Graph).init(gpa),
             .observations = .empty,
             .coordinator = Coordinator.init(gpa, io),
         };
@@ -182,6 +205,16 @@ pub const Engine = struct {
             entry.value_ptr.deinit(self.gpa);
         }
         self.tables.deinit();
+        var doc_it = self.documents.iterator();
+        while (doc_it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.documents.deinit();
+        var graph_it = self.graphs.iterator();
+        while (graph_it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.graphs.deinit();
         for (self.observations.items) |*record| record.deinit(self.gpa);
         self.observations.deinit(self.gpa);
         self.payloads.deinit();
@@ -198,6 +231,28 @@ pub const Engine = struct {
         const reclaimed = try self.payloads.reclaimOrphans(&committed);
         self.evidence_stats.recovery_orphans_found = reclaimed.count;
         self.evidence_stats.recovery_orphan_bytes = reclaimed.bytes;
+        try self.validateManifest();
+    }
+
+    /// Validate the durable checkpoint manifest against the catalog rebuilt
+    /// from the WAL. A manifest published by an incompatible build, a torn
+    /// checkpoint, or an inconsistent data directory fails startup rather than
+    /// being silently accepted (roadmap Phase 4 format rejection).
+    fn validateManifest(self: *Engine) !void {
+        const manifest = try manifest_mod.read(self.gpa, &self.wal.vfs) orelse return;
+        defer {
+            for (manifest.objects) |*object| self.gpa.free(object.name);
+            self.gpa.free(manifest.objects);
+        }
+        if (self.published_commit_seq < manifest.commit_seq) return error.CorruptManifest;
+        for (manifest.objects) |*object| {
+            const exists = switch (object.kind) {
+                .table => self.tables.contains(object.name),
+                .document => self.documents.contains(object.name),
+                .graph => self.graphs.contains(object.name),
+            };
+            if (!exists) return error.CorruptManifest;
+        }
     }
 
     fn applyRecord(self: *Engine, view: wal_mod.RecordView) !void {
@@ -296,6 +351,52 @@ pub const Engine = struct {
                 self.evidence_stats.committed_count += 1;
                 self.evidence_stats.committed_bytes += metadata.payload_length;
             },
+            .create_document => |create| {
+                if (self.documents.contains(create.name) or self.tables.contains(create.name)) return error.TableExists;
+                var collection = try document_mod.Collection.create(self.gpa, create.name);
+                errdefer collection.deinit();
+                try self.documents.put(collection.name, collection);
+            },
+            .insert_document => |ins| {
+                const collection = self.documents.getPtr(ins.collection) orelse return error.TableNotFound;
+                var fields: std.ArrayList(document_mod.Field) = .empty;
+                defer {
+                    for (fields.items) |*field| field.deinit(self.gpa);
+                    fields.deinit(self.gpa);
+                }
+                try fields.ensureTotalCapacity(self.gpa, ins.fields.len);
+                for (ins.fields) |*field| {
+                    const path = try self.gpa.dupe(u8, field.path);
+                    const item = try field.item.clone(self.gpa);
+                    fields.appendAssumeCapacity(.{ .path = path, .item = item });
+                }
+                try collection.insert(ins.id, fields.items);
+            },
+            .create_graph => |create| {
+                if (self.graphs.contains(create.name) or self.tables.contains(create.name) or self.documents.contains(create.name)) return error.TableExists;
+                var graph = try graph_mod.Graph.create(self.gpa, create.name);
+                errdefer graph.deinit();
+                try self.graphs.put(graph.name, graph);
+            },
+            .add_node => |rec| {
+                const graph = self.graphs.getPtr(rec.graph) orelse return error.TableNotFound;
+                var fields: std.ArrayList(document_mod.Field) = .empty;
+                defer {
+                    for (fields.items) |*field| field.deinit(self.gpa);
+                    fields.deinit(self.gpa);
+                }
+                try fields.ensureTotalCapacity(self.gpa, rec.fields.len);
+                for (rec.fields) |*field| {
+                    const path = try self.gpa.dupe(u8, field.path);
+                    const item = try field.item.clone(self.gpa);
+                    fields.appendAssumeCapacity(.{ .path = path, .item = item });
+                }
+                try graph.addNode(rec.id, fields.items);
+            },
+            .add_edge => |rec| {
+                const graph = self.graphs.getPtr(rec.graph) orelse return error.TableNotFound;
+                try graph.addEdge(rec.from, rec.label, rec.to);
+            },
         }
     }
 
@@ -358,6 +459,13 @@ pub const Engine = struct {
                     const pk = ins.values[pki];
                     if (findShadowRow(shadow, ins.table, pk) != null) return error.DuplicatePrimaryKey;
                 }
+                // Reject a secondary unique value that an earlier accepted
+                // request in this round already inserted. The live table does
+                // not yet contain that row, so this must be checked against the
+                // shadow or the conflict would surface only at apply time, after
+                // the WAL is durable, and break recovery on replay.
+                const pk: value.Value = if (table.pk_index) |pki| ins.values[pki] else .null;
+                if (shadowUniqueViolation(shadow, ins.table, pk, ins.values, table)) return error.UniqueViolation;
             },
             .update => |upd| {
                 const table = self.tables.getPtr(upd.table) orelse return error.PrimaryKeyNotFound;
@@ -377,6 +485,10 @@ pub const Engine = struct {
                     if (idx >= table.rows.items.len) return error.PrimaryKeyNotFound;
                     table.validateUpdateAt(idx, upd.values) catch |err| return mapCoordError(err);
                 }
+                // Same-round secondary unique conflicts for updates: the live
+                // table is validated above, but an earlier accepted request in
+                // this round may hold the unique value without it being live.
+                if (shadowUniqueViolation(shadow, upd.table, upd.pk, upd.values, table)) return error.UniqueViolation;
             },
             .delete => |del| {
                 const table = self.tables.getPtr(del.table) orelse return error.PrimaryKeyNotFound;
@@ -424,7 +536,7 @@ pub const Engine = struct {
     }
 
     fn createTableLocked(self: *Engine, name: []const u8, columns: []const value.Column) !void {
-        if (self.tables.contains(name)) return error.TableExists;
+        if (self.tables.contains(name) or self.documents.contains(name)) return error.TableExists;
 
         var specs: std.ArrayList(ColumnSpec) = .empty;
         defer specs.deinit(self.gpa);
@@ -455,6 +567,121 @@ pub const Engine = struct {
         defer self.writer_mutex.unlock(self.io);
         if (self.tables.contains(name)) return;
         try self.createTableLocked(name, columns);
+    }
+
+    // ── Document collections (roadmap Phase 2) ──
+
+    /// Create an empty document collection. The name is exclusive with tables;
+    /// the WAL record makes the collection durable before it is registered.
+    pub fn createDocument(self: *Engine, name: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        try self.createDocumentLocked(name);
+    }
+
+    fn createDocumentLocked(self: *Engine, name: []const u8) !void {
+        if (self.documents.contains(name) or self.tables.contains(name)) return error.TableExists;
+
+        try self.wal.appendCreateDocument(.{ .name = name });
+
+        var collection = try document_mod.Collection.create(self.gpa, name);
+        errdefer collection.deinit();
+        try self.documents.put(collection.name, collection);
+    }
+
+    /// Insert a document into a collection, rejecting a duplicate id. The
+    /// caller owns `fields`; the collection clones them. The document slice's
+    /// ingest is self-contained: inserting into a nonexistent collection
+    /// creates it (mirroring `observe`), and a table with the same name is
+    /// rejected.
+    pub fn insertDocument(self: *Engine, collection_name: []const u8, id: []const u8, fields: []const document_mod.Field) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+
+        // Validate before touching state or the WAL so a rejected insert leaves
+        // no record and creates no collection.
+        if (id.len == 0) return error.MissingDocumentId;
+        for (fields) |*field| if (field.path.len == 0) return error.EmptyFieldPath;
+
+        if (self.documents.getPtr(collection_name) == null) {
+            try self.createDocumentLocked(collection_name);
+        }
+        const collection = self.documents.getPtr(collection_name) orelse return error.TableNotFound;
+
+        // Reject a duplicate id before touching the WAL so a rejected insert
+        // leaves no record, mirroring the relation slice's pre-validation.
+        if (collection.contains(id)) return error.DuplicateDocumentId;
+
+        const records = try self.gpa.alloc(wal_mod.DocumentFieldRecord, fields.len);
+        defer self.gpa.free(records);
+        for (fields, 0..) |*field, index| {
+            records[index] = .{ .path = field.path, .item = field.item };
+        }
+        try self.wal.appendInsertDocument(.{ .collection = collection_name, .id = id, .fields = records });
+
+        try collection.insert(id, fields);
+    }
+
+    /// Look up a document collection, or null when no collection or table with
+    /// that name exists. Used by the semantic binding to route Flow requests.
+    pub fn getDocumentCollection(self: *Engine, name: []const u8) ?*document_mod.Collection {
+        return self.documents.getPtr(name);
+    }
+
+    // ── Graph collections (roadmap Phase 2) ──
+
+    /// Create an empty graph. The name is exclusive with tables and document
+    /// collections.
+    pub fn createGraph(self: *Engine, name: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        try self.createGraphLocked(name);
+    }
+
+    fn createGraphLocked(self: *Engine, name: []const u8) !void {
+        if (self.graphs.contains(name) or self.tables.contains(name) or self.documents.contains(name)) return error.TableExists;
+
+        try self.wal.appendCreateGraph(.{ .name = name });
+
+        var graph = try graph_mod.Graph.create(self.gpa, name);
+        errdefer graph.deinit();
+        try self.graphs.put(graph.name, graph);
+    }
+
+    /// Add a node, creating the graph on its first node (mirroring the document
+    /// slice's self-contained ingest).
+    pub fn addNode(self: *Engine, graph_name: []const u8, id: []const u8, fields: []const document_mod.Field) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        if (id.len == 0) return error.MissingDocumentId;
+        for (fields) |*field| if (field.path.len == 0) return error.EmptyFieldPath;
+
+        if (self.graphs.getPtr(graph_name) == null) {
+            try self.createGraphLocked(graph_name);
+        }
+        const graph = self.graphs.getPtr(graph_name) orelse return error.TableNotFound;
+        if (graph.containsNode(id)) return error.DuplicateDocumentId;
+
+        const records = try self.gpa.alloc(wal_mod.DocumentFieldRecord, fields.len);
+        defer self.gpa.free(records);
+        for (fields, 0..) |*field, index| records[index] = .{ .path = field.path, .item = field.item };
+        try self.wal.appendAddNode(.{ .graph = graph_name, .id = id, .fields = records });
+        try graph.addNode(id, fields);
+    }
+
+    /// Add a directed labeled edge between two existing nodes.
+    pub fn addEdge(self: *Engine, graph_name: []const u8, from: []const u8, label: []const u8, to: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        const graph = self.graphs.getPtr(graph_name) orelse return error.TableNotFound;
+        if (!graph.containsNode(from) or !graph.containsNode(to)) return error.UnknownNode;
+        try self.wal.appendAddEdge(.{ .graph = graph_name, .from = from, .label = label, .to = to });
+        try graph.addEdge(from, label, to);
+    }
+
+    /// Look up a graph, or null when no graph with that name exists.
+    pub fn getGraph(self: *Engine, name: []const u8) ?*graph_mod.Graph {
+        return self.graphs.getPtr(name);
     }
 
     /// Rank non-null embeddings in one table column. The caller owns the query
@@ -646,7 +873,15 @@ pub const Engine = struct {
         transferred = true;
         const result = request.result;
         request.deinit();
-        if (result) |err| return err;
+        if (result) |err| {
+            // A commit that reaches the coordinator and fails — conflict,
+            // duplicate key, uniqueness, WAL append, or cancellation — leaves
+            // the transaction `failed`, not `idle`: the write set is gone but
+            // the connection must not silently continue as if it had committed.
+            // A failed transaction rejects every operation except rollback.
+            tx.state = .failed;
+            return err;
+        }
     }
 
     /// Rollback discards the transaction's private write set.
@@ -969,7 +1204,36 @@ pub const Engine = struct {
         var it = self.tables.iterator();
         while (it.next()) |entry| refs.appendAssumeCapacity(entry.value_ptr);
 
-        return checkpoint_mod.run(&self.wal, refs.items, self.observations.items, self.publishedSeq());
+        var doc_refs: std.ArrayList(*const document_mod.Collection) = .empty;
+        defer doc_refs.deinit(self.gpa);
+        try doc_refs.ensureTotalCapacity(self.gpa, self.documents.count());
+        var doc_it = self.documents.iterator();
+        while (doc_it.next()) |entry| doc_refs.appendAssumeCapacity(entry.value_ptr);
+
+        var graph_refs: std.ArrayList(*const graph_mod.Graph) = .empty;
+        defer graph_refs.deinit(self.gpa);
+        try graph_refs.ensureTotalCapacity(self.gpa, self.graphs.count());
+        var graph_it = self.graphs.iterator();
+        while (graph_it.next()) |entry| graph_refs.appendAssumeCapacity(entry.value_ptr);
+
+        const stats = try checkpoint_mod.run(&self.wal, refs.items, doc_refs.items, graph_refs.items, self.observations.items, self.publishedSeq());
+
+        // Publish the durable manifest boundary only after the WAL rewrite has
+        // committed, so the manifest always describes state the rewritten WAL
+        // reconstructs. The catalog objects are borrowed for the synchronous
+        // encode inside publish.
+        var objects: std.ArrayList(manifest_mod.CatalogObject) = .empty;
+        defer objects.deinit(self.gpa);
+        try objects.ensureTotalCapacity(self.gpa, self.tables.count() + self.documents.count() + self.graphs.count());
+        var table_it = self.tables.iterator();
+        while (table_it.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .table, .name = entry.key_ptr.* });
+        var doc_it2 = self.documents.iterator();
+        while (doc_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .document, .name = entry.key_ptr.* });
+        var graph_it2 = self.graphs.iterator();
+        while (graph_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .graph, .name = entry.key_ptr.* });
+        const manifest = manifest_mod.Manifest{ .commit_seq = self.publishedSeq(), .objects = objects.items };
+        try manifest_mod.publish(&self.wal.vfs, self.gpa, &manifest);
+        return stats;
     }
 };
 
@@ -1017,6 +1281,33 @@ fn findShadowRow(shadow: []const commit_mod.ShadowEntry, table: []const u8, pk: 
         if (std.mem.eql(u8, entry.table, table) and entry.pk.eql(pk)) return entry;
     }
     return null;
+}
+
+/// Reject a secondary unique-column value already held by an earlier accepted
+/// request in the same round. `pk` is the target row's primary key (or null);
+/// shadow entries for that same row are the transaction's own prior writes and
+/// must not conflict with themselves.
+fn shadowUniqueViolation(
+    shadow: []const commit_mod.ShadowEntry,
+    table_name: []const u8,
+    pk: value.Value,
+    values: []const value.Value,
+    table: *const Table,
+) bool {
+    for (table.columns, 0..) |col, ci| {
+        // A single-column primary key is checked through `by_pk_*`; rechecking
+        // it here would make each insert O(round size).
+        if (!col.unique or (table.pk_index != null and ci == table.pk_index.?)) continue;
+        const v = values[ci];
+        if (v == .null) continue;
+        for (shadow) |*entry| {
+            if (!entry.present or !std.mem.eql(u8, entry.table, table_name)) continue;
+            if (pk != .null and entry.pk.eql(pk)) continue;
+            if (ci >= entry.values.len) continue;
+            if (value.Value.eql(entry.values[ci], v)) return true;
+        }
+    }
+    return false;
 }
 
 fn mapCoordError(err: table_mod.Error) commit_mod.CoordError {
@@ -1613,4 +1904,155 @@ test "vector columns survive checkpoint and restart, and rank deterministically"
         try std.testing.expectEqual(@as(usize, 1), ranked[0].row_index);
         try std.testing.expectEqual(@as(usize, 0), ranked[1].row_index);
     }
+}
+
+test "document collections survive restart and checkpoint" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-engine-documents";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        try eng.createDocument("books");
+
+        var fields = [_]document_mod.Field{
+            .{ .path = try gpa.dupe(u8, "title"), .item = .{ .text = try gpa.dupe(u8, "Dune") } },
+            .{ .path = try gpa.dupe(u8, "author.name"), .item = .{ .text = try gpa.dupe(u8, "Herbert") } },
+        };
+        defer for (&fields) |*f| f.deinit(gpa);
+        try eng.insertDocument("books", "1", &fields);
+        // A duplicate id is rejected before any WAL record is written.
+        try std.testing.expectError(error.DuplicateDocumentId, eng.insertDocument("books", "1", &fields));
+        // A name cannot be both a table and a document collection.
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int }};
+        defer cols[0].deinit(gpa);
+        try std.testing.expectError(error.TableExists, eng.createTable("books", &cols));
+
+        const stats = try eng.checkpoint();
+        try std.testing.expectEqual(@as(usize, 1), stats.collections);
+        try std.testing.expectEqual(@as(usize, 1), stats.documents);
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        const collection = eng.getDocumentCollection("books") orelse return error.NotFound;
+        try std.testing.expectEqual(@as(usize, 1), collection.order.items.len);
+        const doc = collection.order.items[0];
+        try std.testing.expectEqualStrings("1", doc.id);
+        try std.testing.expectEqualStrings("Dune", doc.pathValue("title").?.text);
+        try std.testing.expectEqualStrings("Herbert", doc.pathValue("author.name").?.text);
+    }
+}
+
+test "graph collections survive restart and checkpoint" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-engine-graphs";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        try eng.createGraph("social");
+        var fields = [_]document_mod.Field{.{ .path = try gpa.dupe(u8, "name"), .item = .{ .text = try gpa.dupe(u8, "Ada") } }};
+        defer fields[0].deinit(gpa);
+        try eng.addNode("social", "1", &fields);
+        try eng.addNode("social", "2", &fields);
+        try eng.addEdge("social", "1", "mentors", "2");
+        // An edge to an unknown node is rejected before any WAL record.
+        try std.testing.expectError(error.UnknownNode, eng.addEdge("social", "1", "mentors", "99"));
+
+        const stats = try eng.checkpoint();
+        try std.testing.expectEqual(@as(usize, 1), stats.graphs);
+        try std.testing.expectEqual(@as(usize, 2), stats.graph_nodes);
+        try std.testing.expectEqual(@as(usize, 1), stats.graph_edges);
+    }
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        const graph = eng.getGraph("social") orelse return error.NotFound;
+        try std.testing.expectEqual(@as(usize, 2), graph.nodes.order.items.len);
+        try std.testing.expectEqual(@as(usize, 1), graph.edges.items.len);
+        try std.testing.expectEqualStrings("1", graph.edges.items[0].from);
+        try std.testing.expectEqualStrings("mentors", graph.edges.items[0].label);
+        try std.testing.expectEqualStrings("2", graph.edges.items[0].to);
+    }
+}
+
+test "checkpoint publishes a durable manifest that restart validates" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-engine-manifest";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+        try eng.createDocument("docs");
+        try eng.createGraph("g");
+        _ = try eng.checkpoint();
+    }
+
+    // A clean restart rebuilds the catalog from the rewritten WAL and accepts
+    // the manifest published by the checkpoint.
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        try std.testing.expect(eng.getTable("t") != null);
+        try std.testing.expect(eng.getDocumentCollection("docs") != null);
+        try std.testing.expect(eng.getGraph("g") != null);
+    }
+
+    // A manifest naming an object absent from the rebuilt catalog is an
+    // inconsistent checkpoint: startup rejects it rather than proceeding.
+    {
+        var vfs = try vfs_mod.Vfs.open(io, dir_name);
+        defer vfs.close();
+        var objects = [_]manifest_mod.CatalogObject{.{ .kind = .table, .name = "ghost" }};
+        const bad = manifest_mod.Manifest{ .commit_seq = 0, .objects = objects[0..] };
+        try manifest_mod.publish(&vfs, gpa, &bad);
+    }
+    try std.testing.expectError(error.CorruptManifest, Engine.open(gpa, io, dir_name, true));
+
+    // A manifest written by an incompatible (future) build is rejected.
+    {
+        var vfs = try vfs_mod.Vfs.open(io, dir_name);
+        defer vfs.close();
+        var objects = [_]manifest_mod.CatalogObject{.{ .kind = .table, .name = "t" }};
+        const good = manifest_mod.Manifest{ .commit_seq = 1, .objects = objects[0..] };
+        const bytes = try manifest_mod.encode(gpa, &good);
+        defer gpa.free(bytes);
+        var future = try gpa.dupe(u8, bytes);
+        defer gpa.free(future);
+        std.mem.writeInt(u32, future["RUNADB_MAN".len..][0..4], manifest_mod.FORMAT_VERSION + 1, .little);
+        var atomic = try vfs.createAtomicFile("manifest");
+        defer atomic.deinit();
+        try atomic.writeAtAll(future, 0);
+        try atomic.sync();
+        try atomic.commit();
+    }
+    try std.testing.expectError(error.UnsupportedManifest, Engine.open(gpa, io, dir_name, true));
+
+    // A corrupt complete manifest is rejected, leaving the data directory for
+    // forensics rather than silently recovering around it.
+    {
+        var vfs = try vfs_mod.Vfs.open(io, dir_name);
+        defer vfs.close();
+        var atomic = try vfs.createAtomicFile("manifest");
+        defer atomic.deinit();
+        try atomic.writeAtAll("this is not a manifest", 0);
+        try atomic.sync();
+        try atomic.commit();
+    }
+    try std.testing.expectError(error.InvalidManifest, Engine.open(gpa, io, dir_name, true));
 }

@@ -17,12 +17,19 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wal_mod = @import("wal.zig");
 const table_mod = @import("table.zig");
+const document_mod = @import("document.zig");
+const graph_mod = @import("graph.zig");
 const value_mod = @import("value.zig");
 const evidence_mod = @import("evidence.zig");
 
 pub const Stats = struct {
     tables: usize,
     rows: usize,
+    collections: usize,
+    documents: usize,
+    graphs: usize,
+    graph_nodes: usize,
+    graph_edges: usize,
     /// Live WAL size replaced by this checkpoint, sampled under the WAL append
     /// lock when the rewrite began.
     wal_bytes_before: u64,
@@ -39,10 +46,20 @@ pub const Stats = struct {
 /// `commit_seq` is the published commit watermark at rewrite time. It is
 /// emitted as a `set_commit_seq` record after the reconstruction records so
 /// recovery restores the MVCC watermark after per-commit history is collapsed.
-pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table, observations: []const evidence_mod.Record, commit_seq: u64) !Stats {
+pub fn run(
+    wal: *wal_mod.Wal,
+    tables: []const *const table_mod.Table,
+    collections: []const *const document_mod.Collection,
+    graphs: []const *const graph_mod.Graph,
+    observations: []const evidence_mod.Record,
+    commit_seq: u64,
+) !Stats {
     var rewrite = try wal.beginRewrite();
 
     var rows: usize = 0;
+    var documents: usize = 0;
+    var graph_nodes: usize = 0;
+    var graph_edges: usize = 0;
     {
         // `commit` is self-cleaning, so this errdefer must not cover it.
         errdefer rewrite.abort();
@@ -64,6 +81,40 @@ pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table, observatio
             // INSERT from reusing a retired identifier.
             try rewrite.emitSetSerial(.{ .table = table.name, .next_serial = table.next_serial });
         }
+        // Document collections are reconstructed exactly as current state: one
+        // create_document per collection, then every document in read order.
+        for (collections) |collection| {
+            try rewrite.emitCreateDocument(.{ .name = collection.name });
+            for (collection.order.items) |doc| {
+                var fields: std.ArrayList(wal_mod.DocumentFieldRecord) = .empty;
+                defer fields.deinit(collection.gpa);
+                try fields.ensureTotalCapacity(collection.gpa, doc.fields.items.len);
+                for (doc.fields.items) |*field| {
+                    fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
+                }
+                try rewrite.emitInsertDocument(.{ .collection = collection.name, .id = doc.id, .fields = fields.items });
+                documents += 1;
+            }
+        }
+        // Graphs reconstruct as one create_graph, their nodes, then their
+        // edges, preserving insertion order.
+        for (graphs) |graph| {
+            try rewrite.emitCreateGraph(.{ .name = graph.name });
+            for (graph.nodes.order.items) |node| {
+                var fields: std.ArrayList(wal_mod.DocumentFieldRecord) = .empty;
+                defer fields.deinit(graph.gpa);
+                try fields.ensureTotalCapacity(graph.gpa, node.fields.items.len);
+                for (node.fields.items) |*field| {
+                    fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
+                }
+                try rewrite.emitAddNode(.{ .graph = graph.name, .id = node.id, .fields = fields.items });
+                graph_nodes += 1;
+            }
+            for (graph.edges.items) |edge| {
+                try rewrite.emitAddEdge(.{ .graph = graph.name, .from = edge.from, .label = edge.label, .to = edge.to });
+                graph_edges += 1;
+            }
+        }
         for (observations) |record| try rewrite.emitObserve(record.metadata());
         try rewrite.emitSetCommitSeq(commit_seq);
     }
@@ -75,6 +126,11 @@ pub fn run(wal: *wal_mod.Wal, tables: []const *const table_mod.Table, observatio
     return .{
         .tables = tables.len,
         .rows = rows,
+        .collections = collections.len,
+        .documents = documents,
+        .graphs = graphs.len,
+        .graph_nodes = graph_nodes,
+        .graph_edges = graph_edges,
         .wal_bytes_before = before,
         .wal_bytes_after = after,
     };
@@ -136,7 +192,7 @@ test "checkpoint emits current schema and rows, with set_serial after the insert
         try table.delete(gpa, .{ .int = 7 });
         try std.testing.expectEqual(@as(i64, 8), table.next_serial);
 
-        stats = try run(&wal, &.{&table}, &.{}, 42);
+        stats = try run(&wal, &.{&table}, &.{}, &.{}, &.{}, 42);
     }
 
     try std.testing.expectEqual(@as(usize, 1), stats.tables);
@@ -170,7 +226,7 @@ test "checkpoint of an empty instance still yields a replayable wal" {
     {
         var wal = try wal_mod.Wal.open(gpa, io, dir_name, false);
         defer wal.deinit();
-        const stats = try run(&wal, &.{}, &.{}, 7);
+        const stats = try run(&wal, &.{}, &.{}, &.{}, &.{}, 7);
         try std.testing.expectEqual(@as(usize, 0), stats.tables);
         try std.testing.expectEqual(@as(usize, 0), stats.rows);
     }

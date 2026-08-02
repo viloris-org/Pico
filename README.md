@@ -29,11 +29,17 @@ RunaDB Server is under active development. The current implementation provides:
 - An opt-in MCP stdio adapter for Agent use with the read-only Runa Flow slice
 - Single-instance operation with a local data directory
 - The read-only Runa Flow relation projection slice
-- Canonical Runa Query IR format version `4`
+- Read-only document collections with dotted-path projection, predicates, and
+  `document_insert` ingestion through the official RunaDB Client
+- Read-only graphs with labeled edges, `navigate` traversal, and
+  `graph_add_node`/`graph_add_edge` ingestion through the official RunaDB Client
+- Canonical Runa Query IR format version `5`
 - Immutable Observation Evidence payload storage and verified recovery
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
-- WAL checkpoint (compaction): bounded WAL size and bounded recovery time
+- WAL checkpoint (compaction): bounded WAL size and bounded recovery time,
+  with a versioned manifest boundary record published atomically and validated
+  at startup
 - A single-writer commit coordinator: transaction write sets with commit/rollback,
   group commit, observed-version write-write conflict detection, bounded commit
   admission, and a durable MVCC commit watermark recovered on restart
@@ -52,9 +58,10 @@ operations remain long-horizon target designs. See
 [ADR-0016](docs/adr/0016-long-horizon-unified-database.md) and
 [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
-Mutations, transactions, document and graph operations, semantic-model
-persistence, authorization, and World Continuum bindings are not implemented
-as public capabilities.
+Relation mutations and transactions, graph traversal beyond one labeled hop,
+semantic-model persistence, authorization, and World Continuum bindings are
+not implemented as public capabilities. Document and graph reads and their
+ingest operations are development slices; mutation beyond insertion is not.
 
 ## Build
 

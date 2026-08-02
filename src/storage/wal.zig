@@ -31,6 +31,18 @@ pub const RecordType = enum(u8) {
     /// zero, which would make every pre-checkpoint row look created at seq 0 and
     /// break MVCC ordering after restart. Requires WAL format version 5.
     set_commit_seq = 12,
+    /// Declares a document collection (roadmap Phase 2). The collection name is
+    /// distinct from table names in the catalog.
+    create_document = 13,
+    /// Inserts one document (id + field set) into a named collection.
+    insert_document = 14,
+    /// Declares a graph collection (roadmap Phase 2). The graph name is
+    /// distinct from table and document collection names.
+    create_graph = 15,
+    /// Adds one node (id + field set) to a named graph.
+    add_node = 16,
+    /// Adds one directed labeled edge `from --label--> to` to a named graph.
+    add_edge = 17,
 };
 
 /// One DML op inside an explicit-transaction commit batch.
@@ -103,6 +115,33 @@ pub const SetDefaultRecord = struct { table: []const u8, column: []const u8, def
 pub const SetNotNullRecord = struct { table: []const u8, column: []const u8, enabled: bool };
 pub const ObserveRecord = evidence.Metadata;
 
+pub const CreateDocumentRecord = struct { name: []const u8 };
+
+/// One field of an inserted document. `item` is borrowed during encoding and
+/// cloned into the document during apply.
+pub const DocumentFieldRecord = struct { path: []const u8, item: value.Value };
+
+pub const InsertDocumentRecord = struct {
+    collection: []const u8,
+    id: []const u8,
+    fields: []const DocumentFieldRecord,
+};
+
+pub const CreateGraphRecord = struct { name: []const u8 };
+
+pub const AddNodeRecord = struct {
+    graph: []const u8,
+    id: []const u8,
+    fields: []const DocumentFieldRecord,
+};
+
+pub const AddEdgeRecord = struct {
+    graph: []const u8,
+    from: []const u8,
+    label: []const u8,
+    to: []const u8,
+};
+
 /// Append-only WAL with a versioned file header and checksummed LE frames.
 pub const Wal = struct {
     gpa: Allocator,
@@ -133,6 +172,11 @@ pub const Wal = struct {
     /// Number of `syncData` calls performed by group-commit leaders. Useful for
     /// tests that assert concurrent appenders share durability rounds.
     sync_rounds: u64 = 0,
+    /// Test-only fault injection at the WAL-append boundary: when true, the
+    /// next `appendTxnBatchGroup` call fails before any byte is written, so no
+    /// WAL record becomes durable and every accepted request in the round is
+    /// rejected with `WalAppendFailed`. Never set outside tests.
+    test_fail_next_group_append: bool = false,
 
     pub const OpenError = Allocator.Error || Io.Dir.OpenError || Io.Dir.CreateDirPathOpenError || Io.File.OpenError || Io.File.StatError || Io.File.LengthError || error{
         InvalidWal,
@@ -210,6 +254,41 @@ pub const Wal = struct {
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.gpa);
         try encodeObserve(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendCreateDocument(self: *Wal, rec: CreateDocumentRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeCreateDocument(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendInsertDocument(self: *Wal, rec: InsertDocumentRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeInsertDocument(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendCreateGraph(self: *Wal, rec: CreateGraphRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeCreateGraph(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendAddNode(self: *Wal, rec: AddNodeRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeAddNode(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendAddEdge(self: *Wal, rec: AddEdgeRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeAddEdge(&list, self.gpa, rec);
         try self.appendPayload(list.items);
     }
 
@@ -333,6 +412,13 @@ pub const Wal = struct {
     pub fn appendTxnBatchGroup(self: *Wal, batches: []const TxnBatchGroup) !void {
         if (batches.len == 0) return error.InvalidWal;
         if (self.unusable) return error.WalUnusable;
+        if (self.test_fail_next_group_append) {
+            // Fail before any byte is written: no frame becomes durable, so no
+            // accepted request may appear committed and restart exposes only
+            // the prior confirmed prefix.
+            self.test_fail_next_group_append = false;
+            return error.WalUnusable;
+        }
 
         const end_offset = blk: {
             try self.append_mutex.lock(self.io);
@@ -552,6 +638,41 @@ pub const Wal = struct {
             try self.emitPayload(list.items);
         }
 
+        pub fn emitCreateDocument(self: *Rewrite, rec: CreateDocumentRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeCreateDocument(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
+        pub fn emitInsertDocument(self: *Rewrite, rec: InsertDocumentRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeInsertDocument(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
+        pub fn emitCreateGraph(self: *Rewrite, rec: CreateGraphRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeCreateGraph(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
+        pub fn emitAddNode(self: *Rewrite, rec: AddNodeRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeAddNode(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
+        pub fn emitAddEdge(self: *Rewrite, rec: AddEdgeRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeAddEdge(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
         /// Emit the published commit watermark last, so recovery restores it
         /// after the reconstruction records collapse per-commit history.
         pub fn emitSetCommitSeq(self: *Rewrite, commit_seq: u64) !void {
@@ -695,6 +816,48 @@ fn encodeObserve(list: *std.ArrayList(u8), gpa: Allocator, rec: ObserveRecord) !
     try list.appendSlice(gpa, &rec.payload_digest);
 }
 
+fn encodeCreateDocument(list: *std.ArrayList(u8), gpa: Allocator, rec: CreateDocumentRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.create_document));
+    try writeStr(list, gpa, rec.name);
+}
+
+fn encodeInsertDocument(list: *std.ArrayList(u8), gpa: Allocator, rec: InsertDocumentRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.insert_document));
+    try writeStr(list, gpa, rec.collection);
+    try writeStr(list, gpa, rec.id);
+    if (rec.fields.len > std.math.maxInt(u16)) return error.NameTooLong;
+    try writeU16(list, gpa, @intCast(rec.fields.len));
+    for (rec.fields) |field| {
+        try writeStr(list, gpa, field.path);
+        try writeValue(list, gpa, field.item);
+    }
+}
+
+fn encodeCreateGraph(list: *std.ArrayList(u8), gpa: Allocator, rec: CreateGraphRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.create_graph));
+    try writeStr(list, gpa, rec.name);
+}
+
+fn encodeAddNode(list: *std.ArrayList(u8), gpa: Allocator, rec: AddNodeRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.add_node));
+    try writeStr(list, gpa, rec.graph);
+    try writeStr(list, gpa, rec.id);
+    if (rec.fields.len > std.math.maxInt(u16)) return error.NameTooLong;
+    try writeU16(list, gpa, @intCast(rec.fields.len));
+    for (rec.fields) |field| {
+        try writeStr(list, gpa, field.path);
+        try writeValue(list, gpa, field.item);
+    }
+}
+
+fn encodeAddEdge(list: *std.ArrayList(u8), gpa: Allocator, rec: AddEdgeRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.add_edge));
+    try writeStr(list, gpa, rec.graph);
+    try writeStr(list, gpa, rec.from);
+    try writeStr(list, gpa, rec.label);
+    try writeStr(list, gpa, rec.to);
+}
+
 fn frameChecksum(payload_len: u32, payload: []const u8) u32 {
     var len_bytes: [4]u8 = undefined;
     bytes.writeU32LE(&len_bytes, payload_len);
@@ -750,6 +913,32 @@ pub const RecordView = union(RecordType) {
     set_serial: struct { table: []const u8, next_serial: i64 },
     observe: evidence.Metadata,
     set_commit_seq: u64,
+    create_document: struct { name: []const u8 },
+    insert_document: struct {
+        collection: []const u8,
+        id: []const u8,
+        fields: []const DocumentFieldView,
+    },
+    create_graph: struct { name: []const u8 },
+    add_node: struct {
+        graph: []const u8,
+        id: []const u8,
+        fields: []const DocumentFieldView,
+    },
+    add_edge: struct {
+        graph: []const u8,
+        from: []const u8,
+        label: []const u8,
+        to: []const u8,
+    },
+
+    /// One parsed document field. `path` is borrowed from the frame buffer;
+    /// `item` is owned by the `Owned` value list and is valid for the duration
+    /// of `apply`.
+    pub const DocumentFieldView = struct {
+        path: []const u8,
+        item: value.Value,
+    };
 
     pub const ParsedColumn = struct {
         name: []const u8,
@@ -928,6 +1117,68 @@ pub const RecordView = union(RecordType) {
                 try evidence.validateMetadata(metadata);
                 return .{ .view = .{ .observe = metadata }, .owned = owned };
             },
+            .create_document => {
+                const name = try readStr(payload, &i);
+                if (i != payload.len) return error.InvalidWal;
+                return .{ .view = .{ .create_document = .{ .name = name } }, .owned = owned };
+            },
+            .insert_document => {
+                const collection = try readStr(payload, &i);
+                const id = try readStr(payload, &i);
+                if (id.len == 0) return error.InvalidWal;
+                const n_fields = try readU16(payload, &i);
+                try owned.values.ensureTotalCapacity(gpa, n_fields);
+                try owned.document_fields.ensureTotalCapacity(gpa, n_fields);
+                var k: u16 = 0;
+                while (k < n_fields) : (k += 1) {
+                    const path = try readStr(payload, &i);
+                    if (path.len == 0) return error.InvalidWal;
+                    const item = try readValue(gpa, payload, &i);
+                    owned.values.appendAssumeCapacity(item);
+                    owned.document_fields.appendAssumeCapacity(.{ .path = path, .item = item });
+                }
+                if (i != payload.len) return error.InvalidWal;
+                return .{ .view = .{ .insert_document = .{
+                    .collection = collection,
+                    .id = id,
+                    .fields = owned.document_fields.items,
+                } }, .owned = owned };
+            },
+            .create_graph => {
+                const name = try readStr(payload, &i);
+                if (i != payload.len) return error.InvalidWal;
+                return .{ .view = .{ .create_graph = .{ .name = name } }, .owned = owned };
+            },
+            .add_node => {
+                const graph = try readStr(payload, &i);
+                const id = try readStr(payload, &i);
+                if (id.len == 0) return error.InvalidWal;
+                const n_fields = try readU16(payload, &i);
+                try owned.values.ensureTotalCapacity(gpa, n_fields);
+                try owned.document_fields.ensureTotalCapacity(gpa, n_fields);
+                var k: u16 = 0;
+                while (k < n_fields) : (k += 1) {
+                    const path = try readStr(payload, &i);
+                    if (path.len == 0) return error.InvalidWal;
+                    const item = try readValue(gpa, payload, &i);
+                    owned.values.appendAssumeCapacity(item);
+                    owned.document_fields.appendAssumeCapacity(.{ .path = path, .item = item });
+                }
+                if (i != payload.len) return error.InvalidWal;
+                return .{ .view = .{ .add_node = .{
+                    .graph = graph,
+                    .id = id,
+                    .fields = owned.document_fields.items,
+                } }, .owned = owned };
+            },
+            .add_edge => {
+                const graph = try readStr(payload, &i);
+                const from = try readStr(payload, &i);
+                const label = try readStr(payload, &i);
+                const to = try readStr(payload, &i);
+                if (i != payload.len) return error.InvalidWal;
+                return .{ .view = .{ .add_edge = .{ .graph = graph, .from = from, .label = label, .to = to } }, .owned = owned };
+            },
             .txn_batch => {
                 // Validate shape eagerly; engine expands nested ops during apply.
                 var j: usize = i;
@@ -966,12 +1217,15 @@ pub const RecordView = union(RecordType) {
         columns: std.ArrayList(ParsedColumn),
         values: std.ArrayList(value.Value),
         pk: value.Value,
+        /// Borrowed-path views into `values`; only the backing buffer is freed.
+        document_fields: std.ArrayList(DocumentFieldView) = .empty,
 
         pub fn deinit(self: *Owned) void {
             for (self.values.items) |*v| v.deinit(self.gpa);
             for (self.columns.items) |*c| c.default_expr.deinit(self.gpa);
             self.columns.deinit(self.gpa);
             self.values.deinit(self.gpa);
+            self.document_fields.deinit(self.gpa);
             self.pk.deinit(self.gpa);
         }
     };

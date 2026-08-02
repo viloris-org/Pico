@@ -11,15 +11,31 @@ pub const ParseError = error{
     ExpectedField,
     ExpectedOperator,
     ExpectedLiteral,
+    ExpectedAlias,
     InvalidIdentifier,
     InvalidLiteral,
     InvalidLimit,
     UnsupportedStage,
 } || Allocator.Error;
 
+/// A single `| navigate <edge> as <alias>` stage: for each current node, follow
+/// outgoing edges labeled `edge`; the destination node is addressable through
+/// `<alias>.<path>` in the following emit.
+pub const Navigate = struct {
+    edge: []u8,
+    alias: []u8,
+
+    pub fn deinit(self: *Navigate, gpa: Allocator) void {
+        gpa.free(self.edge);
+        gpa.free(self.alias);
+        self.* = undefined;
+    }
+};
+
 pub const Source = struct {
     relation: []u8,
     where: []Predicate = &.{},
+    navigate: ?Navigate = null,
     fields: [][]u8,
     limit: ?u32 = null,
 
@@ -27,6 +43,7 @@ pub const Source = struct {
         gpa.free(self.relation);
         for (self.where) |*predicate| predicate.deinit(gpa);
         gpa.free(self.where);
+        if (self.navigate) |*navigate| navigate.deinit(gpa);
         for (self.fields) |field| gpa.free(field);
         gpa.free(self.fields);
     }
@@ -102,12 +119,19 @@ pub fn parse(gpa: Allocator, source: []const u8) ParseError!Source {
         for (predicates.items) |*predicate| predicate.deinit(gpa);
         predicates.deinit(gpa);
     }
+    var navigate: ?Navigate = null;
+    errdefer if (navigate) |*navigate_stage| navigate_stage.deinit(gpa);
     var fields: [][]u8 = undefined;
     var fields_allocated = false;
     while (!fields_allocated) {
         const line = nextMeaningfulLine(&lines) orelse break;
         if (std.mem.startsWith(u8, line, "| where ")) {
             try predicates.append(gpa, try parseWhere(gpa, line));
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "| navigate ")) {
+            if (navigate != null) return error.UnsupportedStage;
+            navigate = try parseNavigate(gpa, line);
             continue;
         }
         if (std.mem.startsWith(u8, line, "| emit {")) {
@@ -129,6 +153,7 @@ pub fn parse(gpa: Allocator, source: []const u8) ParseError!Source {
     return .{
         .relation = relation,
         .where = try predicates.toOwnedSlice(gpa),
+        .navigate = navigate,
         .fields = fields,
         .limit = limit,
     };
@@ -166,10 +191,24 @@ fn parseEmit(gpa: Allocator, line: []const u8) ParseError![][]u8 {
     while (parts.next()) |part| {
         const field = std.mem.trim(u8, part, " \t");
         if (field.len == 0) return error.ExpectedField;
-        if (!isIdentifier(field)) return error.InvalidIdentifier;
+        if (!isPath(field)) return error.InvalidIdentifier;
         try fields.append(gpa, try gpa.dupe(u8, field));
     }
     return fields.toOwnedSlice(gpa);
+}
+
+/// Parse one `| navigate <edge> as <alias>` stage. `edge` and `alias` are
+/// single identifiers in the initial graph slice.
+fn parseNavigate(gpa: Allocator, line: []const u8) ParseError!Navigate {
+    const prefix = "| navigate ";
+    if (!std.mem.startsWith(u8, line, prefix)) return error.UnsupportedStage;
+    const body = std.mem.trim(u8, line[prefix.len..], " \t");
+    const as_index = std.mem.indexOf(u8, body, " as ") orelse return error.ExpectedAlias;
+    const edge = std.mem.trim(u8, body[0..as_index], " \t");
+    const alias = std.mem.trim(u8, body[as_index + " as ".len ..], " \t");
+    if (edge.len == 0 or alias.len == 0) return error.ExpectedAlias;
+    if (!isIdentifier(edge) or !isIdentifier(alias)) return error.InvalidIdentifier;
+    return .{ .edge = try gpa.dupe(u8, edge), .alias = try gpa.dupe(u8, alias) };
 }
 
 fn parseLimit(line: []const u8) ParseError!u32 {
@@ -187,7 +226,7 @@ fn parseWhere(gpa: Allocator, line: []const u8) ParseError!Predicate {
     const body = std.mem.trim(u8, line[prefix.len..], " \t");
     if (body.len == 0) return error.ExpectedOperator;
 
-    const column_len = identifierPrefixLength(body) orelse return error.InvalidIdentifier;
+    const column_len = pathPrefixLength(body) orelse return error.InvalidIdentifier;
     const column = try gpa.dupe(u8, body[0..column_len]);
     errdefer gpa.free(column);
     const rest = std.mem.trim(u8, body[column_len..], " \t");
@@ -261,14 +300,24 @@ fn parseQuoted(gpa: Allocator, text: []const u8) ParseError![]u8 {
     return gpa.dupe(u8, text[1 .. text.len - 1]);
 }
 
-/// Length of the identifier prefix of `text`, or null when `text` does not
-/// begin with an identifier.
-fn identifierPrefixLength(text: []const u8) ?usize {
+/// Length of the path prefix of `text`, or null when `text` does not begin
+/// with a path. A path is one or more identifiers joined by single dots
+/// (`a`, `a.b`, `a.b.c`); a trailing dot is rejected.
+fn pathPrefixLength(text: []const u8) ?usize {
     if (text.len == 0) return null;
-    if (!(std.ascii.isAlphabetic(text[0]) or text[0] == '_')) return null;
-    var index: usize = 1;
-    while (index < text.len and (std.ascii.isAlphanumeric(text[index]) or text[index] == '_')) index += 1;
-    return index;
+    var index: usize = 0;
+    while (true) {
+        // One identifier segment. After a dot a further segment is required.
+        if (index >= text.len) return null;
+        if (!(std.ascii.isAlphabetic(text[index]) or text[index] == '_')) return null;
+        index += 1;
+        while (index < text.len and (std.ascii.isAlphanumeric(text[index]) or text[index] == '_')) index += 1;
+        if (index < text.len and text[index] == '.') {
+            index += 1;
+            continue;
+        }
+        return index;
+    }
 }
 
 /// An identifier is deliberately ASCII-only in the initial development slice.
@@ -281,6 +330,24 @@ pub fn isIdentifier(name: []const u8) bool {
         if (!(std.ascii.isAlphanumeric(byte) or byte == '_')) return false;
     }
     return true;
+}
+
+/// A path is one or more identifiers joined by single dots (`a`, `a.b`). A
+/// dotted path addresses a nested document field; a relation column is a path
+/// of length one. The first and last byte must belong to an identifier segment
+/// and no segment may be empty, so `a.` and `a..b` are rejected.
+pub fn isPath(name: []const u8) bool {
+    if (name.len == 0) return false;
+    var segment_start: usize = 0;
+    var i: usize = 0;
+    while (i <= name.len) : (i += 1) {
+        if (i == name.len or name[i] == '.') {
+            if (!isIdentifier(name[segment_start..i])) return false;
+            if (i == name.len) return true;
+            segment_start = i + 1;
+        }
+    }
+    return false;
 }
 
 test "parses a relation projection pipeline" {

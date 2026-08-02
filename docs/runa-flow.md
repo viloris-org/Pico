@@ -1,9 +1,11 @@
 # Runa Flow
 
 Status: Partially implemented development contract. RunaDB Wire Protocol v3.0
-accepts the read-only relation slice below as Runa Flow source or Runa Query IR.
-Canonical IR also implements `observe` and `read_evidence_payload` for immutable
-Observation Evidence. SQL text is not an accepted protocol request. All other
+accepts the read-only relation, document collection, and graph slices below as
+Runa Flow source or Runa Query IR. Canonical IR also implements `observe` and
+`read_evidence_payload` for immutable Observation Evidence, `document_insert`
+for document collection ingestion, and `graph_add_node`/`graph_add_edge` for
+graph ingestion. SQL text is not an accepted protocol request. All other
 operation families remain target design.
 
 ## Purpose
@@ -59,6 +61,68 @@ from observation_evidence
 `observation_evidence` view. It bounds the number of returned rows; `limit 0`
 returns an empty result. Ordering is the relation's current read order because
 no ordering stage is implemented yet.
+
+## Document Collections
+
+A **document collection** is a read-only vertical slice for variable-shape
+objects. Each document has a text id and an ordered set of named fields; a
+field is addressed by a dotted path such as `author.name`. `emit` fields and
+`where` predicates accept dotted paths, so the relation grammar above reads
+documents unchanged:
+
+```runa-flow
+from books
+| where author.name = 'Herbert'
+| emit { title, author.name, pages }
+| limit 5
+```
+
+Semantics of the document slice:
+
+- A document collection is populated through the official RunaDB Client's
+  `insertDocument` operation (canonical IR `document_insert`), which creates
+  the collection on its first insert and rejects a duplicate document id. The
+  collection name is exclusive with table names.
+- `emit` resolves each dotted path against the document; a path absent from a
+  particular document reads as null. Paths are not type-checked statically
+  because documents are variable-shape; a `where` predicate matches only a
+  same-typed field value, and an absent or differently typed field does not
+  match that document.
+- Reads follow the collection's insertion order, matching the relation slice's
+  read order. `limit` bounds the returned rows.
+- This slice does not imply World Continuum State Field or Representation Chart
+  support, arrays, schema evolution, or document mutation beyond insertion.
+
+## Graph Collections
+
+A **graph** is a read-only vertical slice for labeled directed edges between
+nodes. A node is a document-like object (id plus named fields), so node reads
+use the document semantics above. The `navigate` stage traverses one labeled
+hop and names the destination node so the following `emit` can project it:
+
+```runa-flow
+from social
+| where name = 'Ada'
+| navigate mentors as mentee
+| emit { name, mentee.name }
+| limit 5
+```
+
+Semantics of the graph slice:
+
+- Nodes and edges are ingested through the official RunaDB Client's `addNode`
+  and `addEdge` operations (canonical IR `graph_add_node`/`graph_add_edge`).
+  `addNode` creates the graph on its first node; `addEdge` requires both
+  endpoints to exist and rejects a duplicate `(from, label, to)` triple.
+- `navigate <edge> as <alias>` expands each surviving source node into one row
+  per outgoing edge labeled `edge`. A node with no matching edge produces no
+  row. In the `emit`, an unqualified path resolves against the source node and
+  `alias.<path>` resolves against the destination node.
+- Reads follow insertion order (nodes, then edges). `where` stages precede
+  `navigate` and filter source nodes; `limit` bounds the returned rows.
+- This slice does not imply multi-hop path queries, shortest paths, transitive
+  closures, graph mutation beyond adding nodes and edges, or World Continuum
+  State Field and Representation Chart support.
 
 Other stages shown below are illustrative until their grammar and semantics are
 published.
@@ -116,11 +180,11 @@ identities, result shape, policy requirements, and model revision. It does not
 contain source formatting or natural-language text.
 
 The official Zig RunaDB Client sends source or validated IR and implements
-bounded Observation Evidence upload and payload retrieval. Canonical IR format
-4 uses an explicit operation tag for relation `emit`, `observe`, and
-`read_evidence_payload`; relation `emit` carries optional `where` predicates
-and the optional `limit` stage. An older IR version is rejected rather than
-reinterpreted.
+bounded Observation Evidence upload, payload retrieval, and document
+collection ingestion. Canonical IR format 5 uses an explicit operation tag for
+relation `emit`, `observe`, `read_evidence_payload`, `document_insert`, `graph_add_node`, and `graph_add_edge`;
+relation `emit` carries optional `where` predicates and the optional `limit`
+stage. An older IR version is rejected rather than reinterpreted.
 
 `observe` binds a completed protocol attachment to an `object_id`, declared
 modality, normalized media type, observation time, and origin. The Server sets
