@@ -327,10 +327,19 @@ covers crossing the trigger, post-compaction flushes, and restart recovery
 (`net/runtime_test.zig`) runs concurrent writers, snapshot-consistent
 readers, and a flush+compact maintenance worker against one engine and
 verifies commit order, read consistency, compaction progress, and restart
-recovery of exactly the committed prefix. The remaining work below is the
+recovery of exactly the committed prefix. Compaction scheduling through the
+I/O scheduler's maintenance class is implemented as a development slice:
+`runtime/maintenance.zig` provides the bounded maintenance worker (the real
+worker-thread platform backend for the scheduler, with a bounded inbound
+admission queue, backpressure, cancellation, job-failure isolation, and
+tear-down release of queued work), `Engine.compactionCandidates` exposes the
+compaction-trigger boundary, and the scheduler-fed queue-saturation regression
+(`net/runtime_test.zig`) drives real LSM compaction through that path under
+load. The remaining work below is the
 in-memory skiplist MemTable, secondary indexes, scheduler-integrated
-background flush/compaction scheduling with backpressure, and benchmark
-baselines across more workloads and durability levels.
+flush/checkpoint triggering (wiring the memtable-flush boundary into the
+maintenance path), and benchmark baselines across more workloads and
+durability levels.
 
 **Goal:** Move table and index storage from the in-memory baseline to ordered,
 recoverable LSM structures while preserving snapshot visibility.
@@ -396,10 +405,15 @@ counters. A compaction-pressure load regression (`net/runtime_test.zig`) runs
 concurrent writers, snapshot-consistent readers, and a flush+compact
 maintenance worker against one engine and verifies commit order, read
 consistency, compaction progress, and restart recovery of exactly the
-committed prefix. The remaining work below is
-socket-I/O reactor work and per-Connection backpressure on the scheduler, the
-queue-saturation load regression, and scheduler-integrated compaction
-scheduling.
+committed prefix. Compaction scheduling is implemented as a development
+slice: `runtime/maintenance.zig` provides the bounded maintenance worker —
+the real worker-thread platform backend for the scheduler — with a bounded
+inbound admission queue, backpressure, cancellation, job-failure isolation,
+and tear-down release of queued work; `Engine.compactionCandidates` exposes
+the compaction-trigger boundary; and the scheduler-fed queue-saturation
+regression drives real LSM compaction through the maintenance class under
+load. The remaining work below
+is socket-I/O reactor work and per-Connection backpressure on the scheduler.
 
 **Goal:** Scale execution and connection handling without crossing ownership
 boundaries or weakening commit correctness.

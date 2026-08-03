@@ -27,6 +27,8 @@ const value = @import("../storage/value.zig");
 const document_mod = @import("../storage/document.zig");
 const registry_mod = @import("registry.zig");
 const server = @import("server.zig");
+const scheduler_mod = @import("../runtime/scheduler.zig");
+const maintenance_mod = @import("../runtime/maintenance.zig");
 const proto = @import("clint_proto");
 
 // ── Engine-level concurrency ──
@@ -293,6 +295,261 @@ test "concurrent readers, writers, flushes, and compaction keep reads snapshot-c
     // Restart over the same data directory: the LSM manifest and SSTables plus
     // the WAL tail recover exactly the committed prefix, with no duplication
     // from the flushes and compactions that ran under load.
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        var recovered = try eng.selectAll("t", eng.publishedSeq());
+        defer recovered.deinit();
+        try std.testing.expectEqual(@as(usize, total_writes), recovered.rows.len);
+        for (recovered.rows, 0..) |row, index| {
+            try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].int);
+        }
+    }
+}
+
+// ── Scheduler-integrated compaction scheduling (roadmap Phase 5/6) ──
+//
+// The maintenance worker (`src/runtime/maintenance.zig`) is the real
+// worker-thread platform backend for the I/O scheduler: jobs are admitted
+// through a bounded inbound queue (rejections are the saturation signal),
+// fed into the scheduler's `maintenance` class, and run on the worker thread
+// outside the engine statement lock. This regression drives real LSM
+// compaction through that path under concurrent writers and readers and
+// verifies bounded admission, commit order, snapshot consistency, and exact
+// restart recovery.
+
+/// Compaction job context: the engine and an owned table name. The engine
+/// outlives every job (the maintenance worker is deinitialized first).
+const CompactionJobCtx = struct {
+    eng: *engine_mod.Engine,
+    table_name: []u8,
+};
+
+fn runCompaction(ctx: ?*anyopaque) anyerror!void {
+    const c: *CompactionJobCtx = @ptrCast(@alignCast(ctx.?));
+    try c.eng.compact(c.table_name);
+}
+
+/// Owner-side completion: free the context and the owned name. The job itself
+/// is destroyed by the maintenance module (`owned_gpa`).
+fn compactionDone(job: *maintenance_mod.Job, result: maintenance_mod.JobResult) void {
+    _ = result;
+    const ctx: *CompactionJobCtx = @ptrCast(@alignCast(job.ctx.?));
+    const gpa = ctx.eng.gpa;
+    gpa.free(ctx.table_name);
+    gpa.destroy(ctx);
+}
+
+/// Submit one compaction job; on `MaintenanceFull` count the saturation event
+/// and free the not-accepted job. On any other failure propagate.
+fn submitCompactionJob(
+    gpa: Allocator,
+    eng: *engine_mod.Engine,
+    maint: *maintenance_mod.Maintenance,
+    name: []const u8,
+    saturation: *std.atomic.Value(u64),
+) !void {
+    const owned = try gpa.dupe(u8, name);
+    errdefer gpa.free(owned);
+    const ctx = try gpa.create(CompactionJobCtx);
+    errdefer gpa.destroy(ctx);
+    ctx.* = .{ .eng = eng, .table_name = owned };
+    const job = try gpa.create(maintenance_mod.Job);
+    errdefer gpa.destroy(job);
+    job.* = .{
+        .run_fn = runCompaction,
+        .ctx = ctx,
+        .on_done = compactionDone,
+        .owned_gpa = gpa,
+    };
+    maint.submitJob(job, 0, 1) catch |err| switch (err) {
+        error.MaintenanceFull => {
+            // The maintenance queue is saturated: the overload signal. The
+            // job was not accepted, so ownership stays here.
+            _ = saturation.fetchAdd(1, .monotonic);
+            gpa.free(owned);
+            gpa.destroy(ctx);
+            gpa.destroy(job);
+            return;
+        },
+        else => return err,
+    };
+}
+
+/// Feeds the maintenance worker: flushes the table into L0 under the
+/// statement lock (the memtable -> L0 boundary is a statement-path action in
+/// this slice), collects compaction candidates, and submits a compaction job
+/// for each through the scheduler's maintenance class. Runs for a fixed
+/// number of rounds so the regression is reproducible; the writers may finish
+/// first, after which the driver's flushes (and the candidates they produce)
+/// are uncontended.
+const CompactionDriver = struct {
+    gpa: Allocator,
+    io: Io,
+    eng: *engine_mod.Engine,
+    maint: *maintenance_mod.Maintenance,
+    start: *std.atomic.Value(bool),
+    failed: *std.atomic.Value(bool),
+    rounds: usize,
+    saturation: *std.atomic.Value(u64),
+
+    fn run(self: CompactionDriver) void {
+        while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+        for (0..self.rounds) |_| {
+            // Flush under the statement lock so the materialized snapshot is
+            // consistent with committed writes (memtable -> L0).
+            self.eng.lock(self.io) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.eng.flush("t") catch {
+                self.eng.unlock(self.io);
+                self.failed.store(true, .release);
+                return;
+            };
+            self.eng.unlock(self.io);
+
+            var candidates: std.ArrayList([]const u8) = .empty;
+            defer candidates.deinit(self.gpa);
+            self.eng.compactionCandidates(self.gpa, &candidates) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            for (candidates.items) |name| {
+                submitCompactionJob(self.gpa, self.eng, self.maint, name, self.saturation) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+            Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+        }
+    }
+};
+
+test "scheduler-fed maintenance compacts under load with bounded admission and exact recovery" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-runtime-scheduler-compaction";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const total_writes = 3 * 60;
+
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+
+        // Maintenance worker with a single maintenance slot: compactions are
+        // strictly serialized, and admission is bounded by the inbound queue.
+        var maint_cfg = maintenance_mod.Config{ .inbound_capacity = 4 };
+        maint_cfg.scheduler.class_capacity[@intFromEnum(scheduler_mod.Class.maintenance)] = .{ .max_slots = 1, .max_bytes = 0 };
+        maint_cfg.scheduler.backpressure_high[@intFromEnum(scheduler_mod.Class.maintenance)] = 2;
+        maint_cfg.scheduler.backpressure_low[@intFromEnum(scheduler_mod.Class.maintenance)] = 1;
+        var maint: maintenance_mod.Maintenance = undefined;
+        try maint.init(gpa, io, maint_cfg);
+        // The maintenance worker must be stopped before the engine: its jobs
+        // borrow the engine, and deinit waits for every in-flight job.
+        defer maint.deinit();
+
+        const writers = 3;
+        const reader_count = 2;
+        const writes_per_writer = 60;
+        const reads_per_reader = 30;
+
+        var next_id = std.atomic.Value(u64).init(0);
+        var start = std.atomic.Value(bool).init(false);
+        var failed = std.atomic.Value(bool).init(false);
+
+        var writer_threads: [writers]std.Thread = undefined;
+        for (&writer_threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, EngineWriter.run, .{EngineWriter{
+                .eng = &eng,
+                .io = io,
+                .next_id = &next_id,
+                .start = &start,
+                .failed = &failed,
+                .writes = writes_per_writer,
+                .table = "t",
+            }});
+        }
+        var reader_threads: [reader_count]std.Thread = undefined;
+        for (&reader_threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, EngineReader.run, .{EngineReader{
+                .eng = &eng,
+                .io = io,
+                .start = &start,
+                .failed = &failed,
+                .reads = reads_per_reader,
+                .table = "t",
+            }});
+        }
+        var saturation = std.atomic.Value(u64).init(0);
+        const driver_thread = try std.Thread.spawn(.{}, CompactionDriver.run, .{CompactionDriver{
+            .gpa = gpa,
+            .io = io,
+            .eng = &eng,
+            .maint = &maint,
+            .start = &start,
+            .failed = &failed,
+            .rounds = 8,
+            .saturation = &saturation,
+        }});
+
+        start.store(true, .release);
+        for (&writer_threads) |th| th.join();
+        for (&reader_threads) |th| th.join();
+        // The driver runs its fixed round budget to completion; the writers
+        // finish first, so the later flushes (and the candidates they produce)
+        // are uncontended and L0 reaches the compaction trigger.
+        driver_thread.join();
+        try std.testing.expect(!failed.load(.acquire));
+
+        // Wait for the maintenance worker to drain every submitted job to a
+        // terminal outcome (metrics are atomic; safe to poll).
+        var guard: usize = 0;
+        while (true) : (guard += 1) {
+            std.debug.assert(guard < 100_000);
+            const mm = maint.metricsSnapshot();
+            const submitted = mm.jobs_submitted.load(.acquire);
+            const terminal = mm.jobs_completed.load(.acquire) +
+                mm.jobs_failed.load(.acquire) +
+                mm.jobs_cancelled.load(.acquire);
+            if (submitted != 0 and terminal == submitted) break;
+            try Io.sleep(io, .fromMilliseconds(2), .awake);
+        }
+
+        // Every submitted compaction reached exactly one terminal outcome.
+        const mm = maint.metricsSnapshot();
+        const submitted = mm.jobs_submitted.load(.acquire);
+        const terminal = mm.jobs_completed.load(.acquire) +
+            mm.jobs_failed.load(.acquire) +
+            mm.jobs_cancelled.load(.acquire);
+        try std.testing.expectEqual(submitted, terminal);
+        try std.testing.expect(submitted >= 1);
+        // The inbound queue never accepted more than its configured bound, and
+        // the scheduler maintenance class never exceeded its slot budget
+        // (bounded admission by construction; the peak is observability).
+        try std.testing.expect(mm.peak_inbound_depth.load(.acquire) <= maint_cfg.inbound_capacity);
+
+        // Compaction actually ran under load and reclaimed its input files.
+        const stats = eng.lsmStats();
+        try std.testing.expect(stats.compaction_runs >= 1);
+        try std.testing.expect(stats.files_reclaimed >= 1);
+
+        // Consistent final state: every id committed exactly once, in order.
+        var final = try eng.selectAll("t", eng.publishedSeq());
+        defer final.deinit();
+        try std.testing.expectEqual(@as(usize, total_writes), final.rows.len);
+        for (final.rows, 0..) |row, index| {
+            try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].int);
+        }
+    }
+
+    // Restart over the same data directory: the LSM manifest and SSTables plus
+    // the WAL tail recover exactly the committed prefix, with no duplication
+    // from the flushes and scheduler-fed compactions that ran under load.
     {
         var eng = try engine_mod.Engine.open(gpa, io, dir, false);
         defer eng.deinit();

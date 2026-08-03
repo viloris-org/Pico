@@ -40,6 +40,7 @@ pub const mcp = @import("net/mcp.zig");
 pub const connection = @import("net/connection.zig");
 pub const registry = @import("net/registry.zig");
 pub const runtime = @import("runtime/scheduler.zig");
+pub const maintenance = @import("runtime/maintenance.zig");
 pub const runtime_test = @import("net/runtime_test.zig");
 
 test {
@@ -75,5 +76,6 @@ test {
     _ = connection;
     _ = registry;
     _ = runtime;
+    _ = maintenance;
     _ = runtime_test;
 }

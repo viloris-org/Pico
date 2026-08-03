@@ -1516,6 +1516,33 @@ pub const Engine = struct {
         return stats.ran;
     }
 
+    /// Whether `table_name`'s L0 depth crossed the compaction trigger (roadmap
+    /// Phase 5/6 compaction scheduling). Pure read of the LSM version set;
+    /// safe to call under `writer_mutex` or from a maintenance feeder that
+    /// serializes with flushes/compactions on that lock.
+    pub fn needsCompaction(self: *const Engine, table_name: []const u8) bool {
+        return self.lsm.l0FileCount(table_name) >= lsm_store.level0_compaction_trigger;
+    }
+
+    /// Names of PK-addressable tables whose L0 depth crossed the compaction
+    /// trigger. Runs under `writer_mutex` so the version-set reads are
+    /// consistent with concurrent flushes/compactions; the returned names are
+    /// borrowed from the catalog and the caller must copy any it keeps beyond
+    /// the next DDL. The runtime maintenance layer submits compaction jobs for
+    /// these through the I/O scheduler's maintenance class instead of running
+    /// compaction inline on the statement path.
+    pub fn compactionCandidates(self: *Engine, gpa: Allocator, out: *std.ArrayList([]const u8)) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        var it = self.tables.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.pk_index == null) continue;
+            if (self.needsCompaction(entry.key_ptr.*)) {
+                try out.append(gpa, entry.key_ptr.*);
+            }
+        }
+    }
+
     /// Instance-wide LSM observability counters.
     pub fn lsmStats(self: *const Engine) lsm_store.Stats {
         return self.lsm.stats;

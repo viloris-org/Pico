@@ -44,9 +44,14 @@
 //! with hysteresis so a single completion event cannot flap a class.
 //!
 //! The current slice is single-threaded: `enqueue`, `cancel`, and `tick` are
-//! not yet guarded by a runtime mutex. The socket-I/O reactor, per-Connection
-//! byte backpressure, reserved WAL slots, and compaction scheduling arrive in
-//! later slices of the same contract.
+//! not yet guarded by a runtime mutex. The maintenance worker
+//! (`maintenance.zig`) owns this scheduler exclusively on its worker thread;
+//! the socket-I/O reactor and per-Connection byte backpressure arrive in
+//! later slices of the same contract, which must guard the scheduler with a
+//! mutex when connection threads arrive (reserved WAL slots already live at
+//! the commit-admission boundary in `src/commit/coordinator.zig`, and
+//! scheduler-integrated compaction scheduling in `src/runtime/maintenance.zig`
+//! with the engine's `compactionCandidates` API).
 
 const std = @import("std");
 const Io = std.Io;
@@ -400,6 +405,30 @@ pub const Scheduler = struct {
         self.metrics.by_class[ci].cancelled += 1;
         self.maybeClearBackpressure(op.class);
         if (op.callback) |cb| self.invokeCallback(op, cb);
+    }
+
+    /// Cancel every queued op of `class` (queued cancellable ops only), in FIFO
+    /// order, invoking each callback exactly once. Returns the number cancelled.
+    /// Used by teardown paths (maintenance worker stop, instance shutdown) to
+    /// release queued work whose owners are waiting on a terminal callback;
+    /// in-flight and completed ops are left to the normal completion path. Must
+    /// not run concurrently with `tick`.
+    pub fn cancelAllQueued(self: *Scheduler, class: Class) usize {
+        const ci = @intFromEnum(class);
+        var cancelled: usize = 0;
+        while (self.queue_head[ci]) |op| {
+            self.queue_head[ci] = op.queue_next;
+            if (self.queue_head[ci] == null) self.queue_tail[ci] = null;
+            op.queue_next = null;
+            self.queue_len[ci] -= 1;
+            self.queue_bytes[ci] -= op.bytes;
+            op.state = .cancelled;
+            self.metrics.by_class[ci].cancelled += 1;
+            if (op.callback) |cb| self.invokeCallback(op, cb);
+            cancelled += 1;
+        }
+        self.maybeClearBackpressure(class);
+        return cancelled;
     }
 
     // ── Ticks ──
@@ -1240,6 +1269,50 @@ test "cancel releases a queued cancellable op exactly once" {
     platform.complete(&second);
     sched.tick(&plat); // extract + callback `second`
     try std.testing.expectEqual(State.released, second.state);
+    try std.testing.expect(sched.isIdle());
+}
+
+test "cancelAllQueued releases every queued op of a class exactly once" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var cfg = testConfig();
+    // One op per tick (critical reservation forces the shared budget to 1).
+    cfg.class_capacity[@intFromEnum(Class.critical)] = .{ .max_slots = 1, .max_bytes = 0 };
+    cfg.tick_submit_budget_slots = 1;
+    cfg.class_capacity[@intFromEnum(Class.maintenance)] = .{ .max_slots = 4, .max_bytes = 0 };
+    cfg.backpressure_high[@intFromEnum(Class.maintenance)] = 8;
+    cfg.backpressure_low[@intFromEnum(Class.maintenance)] = 8;
+    var sched = try Scheduler.init(gpa, io, cfg);
+    defer sched.deinit();
+    var platform = FakePlatform.init(gpa, false);
+    defer platform.deinit();
+    var plat = platform.platform();
+
+    var ops = [_]Op{.{ .owner = 0, .cancellable = true, .callback = countCallback }} ** 4;
+    g_callback_count = 0;
+    for (&ops) |*op| try sched.enqueue(op, .maintenance, 0, 1);
+
+    // Submit one op so it is in flight; the other three stay queued.
+    sched.tick(&plat);
+    try std.testing.expectEqual(State.submitted, ops[0].state);
+    try std.testing.expectEqual(@as(usize, 3), sched.queuedCount(.maintenance));
+
+    // Teardown release: only queued ops are cancelled, each exactly once.
+    const cancelled = sched.cancelAllQueued(.maintenance);
+    try std.testing.expectEqual(@as(usize, 3), cancelled);
+    try std.testing.expectEqual(@as(usize, 0), sched.queuedCount(.maintenance));
+    try std.testing.expectEqual(@as(u64, 3), sched.classMetrics(.maintenance).cancelled);
+    for (ops[1..]) |*op| {
+        try std.testing.expectEqual(State.cancelled, op.state);
+    }
+    try std.testing.expectEqual(@as(usize, 3), g_callback_count);
+
+    // The in-flight op is untouched and completes normally; its slot frees on
+    // extraction, so the class can admit again.
+    platform.complete(&ops[0]);
+    sched.tick(&plat);
+    try std.testing.expectEqual(State.released, ops[0].state);
+    try std.testing.expectEqual(@as(usize, 4), g_callback_count);
     try std.testing.expect(sched.isIdle());
 }
 
