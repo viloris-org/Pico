@@ -14,7 +14,7 @@ the same host to reproduce.
 
 - Host: AMD Ryzen 5 5500 (6 cores / 12 threads), Linux 7.1.5-zen1-2-zen
 - Storage for durable paths: NVMe btrfs (`/home`, `compress=zstd:3`)
-- RunaDB: worktree at `5484468` (+ local LSM benchmark work), Zig 0.16.0,
+- RunaDB: worktree at `89ba624`, Zig 0.16.0,
   `ReleaseFast`, data under `zig-cache/runadb-lsm-bench` on the same NVMe volume
 - Durability level: default (WAL sync on, durable commit)
 - Optimization level: `ReleaseFast`
