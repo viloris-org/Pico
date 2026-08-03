@@ -4,15 +4,17 @@
 //! RunaDB Wire Protocol (defined in `clint/proto/`) and documented Runa Flow /
 //! Runa Query IR, and never opens a data directory or imports server modules.
 //!
-//! Transports (ADR-0023): QUIC is the target default (vendored zquic); native
-//! TCP is the transport implemented and verified in this checkout. There is
-//! no silent fallback — select the kind explicitly in `transport.Config`.
+//! Transports (ADR-0023): QUIC is the target default (vendored zquic) and is
+//! verified against the server QUIC listener in this checkout (roadmap Phase
+//! 9); native TCP remains implemented and verified, deprecated per ADR-0024.
+//! There is no silent fallback — select the kind explicitly in
+//! `transport.Config`.
 //!
 //! Usage:
 //! ```zig
 //! var conn = try sdk.Connection.connect(gpa, io, .{
 //!     .host = "127.0.0.1",
-//!     .kind = .tcp, // current checkout; QUIC is target design (ADR-0023)
+//!     .kind = .quic, // verified; .tcp also verified (deprecated, ADR-0024)
 //! });
 //! defer conn.deinit(io);
 //! var result = try conn.executeFlow(arena, "from customer\n| emit { id }");

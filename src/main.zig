@@ -19,6 +19,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--quic-port") and i + 1 < raw_args.len) {
             i += 1;
             cfg.quic_port = try std.fmt.parseInt(u16, raw_args[i], 10);
+        } else if (std.mem.eql(u8, a, "--quic-idle-timeout-ms") and i + 1 < raw_args.len) {
+            i += 1;
+            cfg.quic_idle_timeout_ms = try std.fmt.parseInt(u32, raw_args[i], 10);
         } else if (std.mem.eql(u8, a, "--cert") and i + 1 < raw_args.len) {
             i += 1;
             cfg.quic_cert_pem = try Io.Dir.cwd().readFileAlloc(io, raw_args[i], arena, Io.Limit.limited(1 << 20));
@@ -58,6 +61,7 @@ fn printUsage() !void {
         \\  --host <addr>       Listen address (default 127.0.0.1)
         \\  --runa-port <port>  RunaDB Wire Protocol port (default 5434, 0=disable)
         \\  --quic-port <port>  UDP QUIC port (default 5435, 0=disable)
+        \\  --quic-idle-timeout-ms <ms>  QUIC idle timeout (default 30000)
         \\  --cert <path>       QUIC TLS certificate PEM (default embedded dev cert)
         \\  --key <path>        QUIC TLS private key PEM (default embedded dev key)
         \\  --data-dir <path>   Data directory (default ./data)

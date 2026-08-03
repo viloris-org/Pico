@@ -1,6 +1,6 @@
 # RunaDB Wire Protocol v3.0
 
-Status: Implemented development contract. This native TCP protocol is the
+Status: Implemented development contract. This protocol is the
 incompatible successor to the removed SQL-text v0.1 endpoint. It does not
 promise compatibility with the PostgreSQL Frontend/Backend Protocol.
 
@@ -13,6 +13,23 @@ Minor-version compatibility has not yet been defined. The major bump from `2`
 to `3` is the negotiated surface for the cancellation credential that `HELLO_OK`
 now appends: a `v2` peer is rejected at the version check before that framing is
 parsed, so it never sees an ambiguous trailing-payload error.
+
+## Transports
+
+The message format is transport-independent. Two transports carry it today
+(ADR-0015, ADR-0023, ADR-0024):
+
+- **QUIC** (primary): UDP, default port `5435`, ALPN `runadb`, via the
+  vendored pure-Zig zquic stack. TLS 1.3 provides encryption and server
+  identity; the client pins the server leaf certificate digest (ADR-0023
+  §2.3). Client bidi stream 0 is the control stream (`hello` /
+  `hello_ok` / `hello_error`, `cancel_request`, `goodbye`); each request
+  opens the next client bidi stream (4, 8, 12, …), carries one request plus
+  its result sequence, and the server FINs its side when the sequence ends.
+- **TCP** (deprecated): port `5434`, one byte stream per Connection. The
+  CLI default and `--tcp` keep working until the migration condition in
+  ADR-0024 is met; after the removal release TCP is gone and QUIC is the
+  only transport.
 
 ## Framing
 

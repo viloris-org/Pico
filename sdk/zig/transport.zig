@@ -10,12 +10,13 @@ const std = @import("std");
 
 pub const Kind = enum {
     /// QUIC (vendored zquic, ADR-0015) — the SDK's target default transport.
-    /// Requires a server QUIC listener; until roadmap Phase 9 lands, a QUIC
-    /// connect fails with a defined error (`HandshakeTimeout`,
-    /// `QuicRejected`, or `CertificateMismatch`) instead of falling back.
+    /// Verified against the server QUIC listener in this checkout (roadmap
+    /// Phase 9); a QUIC connect against a server without a QUIC listener
+    /// fails with a defined error (`HandshakeTimeout`, `QuicRejected`, or
+    /// `CertificateMismatch`) instead of falling back.
     quic,
     /// Native TCP — the transport currently implemented and verified against
-    /// the RunaDB Server in this checkout.
+    /// the RunaDB Server in this checkout; deprecated per ADR-0024.
     tcp,
 };
 
@@ -44,6 +45,12 @@ pub const Config = struct {
     /// Upper bound for a QUIC stream read while awaiting result messages.
     /// TCP retains blocking stream semantics in this checkout.
     read_timeout_ms: u32 = 30_000,
+    /// QUIC idle timeout (RFC 9000 §10.1) in milliseconds, advertised to the
+    /// server and used as the local leg of the effective timeout
+    /// min(local, peer). The server reaps a connection whose peer stays
+    /// silent this long; a subsequent request then fails with a bounded
+    /// error. Default 30_000 matches the server listener default.
+    idle_timeout_ms: u32 = 30_000,
 
     pub fn effectivePort(self: Config) u16 {
         return self.port orelse switch (self.kind) {

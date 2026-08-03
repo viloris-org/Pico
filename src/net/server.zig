@@ -20,6 +20,10 @@ pub const Config = struct {
     /// self-signed certificate (src/net/dev-cert.pem, RSA-2048).
     quic_cert_pem: ?[]const u8 = null,
     quic_key_pem: ?[]const u8 = null,
+    /// QUIC idle timeout (RFC 9000 §10.1) in milliseconds; the listener reaps
+    /// a connected peer that stays silent this long (min with the peer's
+    /// advertised timeout). Default 30_000.
+    quic_idle_timeout_ms: u32 = 30_000,
 };
 
 pub fn run(gpa: Allocator, io: Io, cfg: Config) !void {
@@ -38,6 +42,7 @@ pub fn run(gpa: Allocator, io: Io, cfg: Config) !void {
             .port = cfg.quic_port,
             .cert_pem = cfg.quic_cert_pem orelse @embedFile("dev-cert.pem"),
             .key_pem = cfg.quic_key_pem orelse @embedFile("dev-key.pem"),
+            .idle_timeout_ms = cfg.quic_idle_timeout_ms,
         };
         var quic_registry = registry_mod.Registry.init(gpa, io, .{});
         const qs = try quic.QuicServer.init(gpa, io, quic_cfg, &eng, &quic_registry, null);

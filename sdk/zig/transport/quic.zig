@@ -1,11 +1,13 @@
 //! RunaDB Zig SDK — QUIC transport over the vendored zquic client
 //! (ADR-0015, ADR-0023 §2).
 //!
-//! Status: **target design** — the client code compiles and drives the zquic
-//! event loop, but no RunaDB Server accepts QUIC connections in this
-//! checkout (roadmap Phase 9), so this path has no end-to-end regression.
-//! A QUIC connect against a server without a QUIC listener fails with a
-//! defined error; there is no silent TCP fallback.
+//! Status: **verified** — the server QUIC listener (`src/net/quic.zig`,
+//! roadmap Phase 9) implements the ADR-0023 §2.1 stream contract and this
+//! transport is exercised end to end by the SDK integration suite
+//! (certificate pinning regressions, request round-trip, idle timeout)
+//! against the independently built server binary. A QUIC connect against a
+//! server without a QUIC listener fails with a defined error; there is no
+//! silent TCP fallback.
 //!
 //! Stream contract (ADR-0023 §2.1): client bidi stream 0 is the control
 //! stream (`hello` / `hello_ok` / `hello_error`, `cancel_request`,
@@ -38,10 +40,15 @@ pub const QuicConn = struct {
     pub fn connect(allocator: Allocator, config: transport.Config) !*QuicConn {
         const server_addr = try resolveAddress(config.host, config.effectivePort());
 
+        // The pre-`self` errdefers clean up `client` only if establishment
+        // fails before the `self` block below takes ownership; the flag keeps
+        // them from double-deinitializing/double-freeing `client` once the
+        // block errdefer owns the cleanup.
+        var client_owned_by_self = false;
         const client = try allocator.create(io_mod.Client);
-        errdefer allocator.destroy(client);
+        errdefer if (!client_owned_by_self) allocator.destroy(client);
         try io_mod.Client.initInPlace(allocator, clientConfig(config), client);
-        errdefer client.deinit();
+        errdefer if (!client_owned_by_self) client.deinit();
 
         try client.startHandshake(server_addr);
 
@@ -52,6 +59,7 @@ pub const QuicConn = struct {
             .client = client,
             .server_addr = server_addr,
         };
+        client_owned_by_self = true;
         errdefer {
             client.deinit();
             allocator.destroy(client);
@@ -166,6 +174,7 @@ fn clientConfig(config: transport.Config) io_mod.ClientConfig {
         .http3 = false,
         .alpn = transport.ALPN,
         .raw_application_streams = true,
+        .max_idle_timeout_ms = config.idle_timeout_ms,
     };
 }
 

@@ -24,6 +24,8 @@ test "RunaDB Client v3 protocol lifecycle, evidence, and request errors" {
         server_path,
         "--runa-port",
         port_text,
+        "--quic-port",
+        "0",
         "--data-dir",
         data_dir,
     };
@@ -589,4 +591,211 @@ fn expectMidStatementCancel(gpa: std.mem.Allocator, io: Io) !void {
         }
         if (!seen_row) return error.TestUnexpectedResult;
     }
+}
+
+// ── QUIC transport (ADR-0015, ADR-0023 §2) ─────────────────────────────────
+//
+// These tests run the SDK's public Connection API over the vendored zquic
+// QUIC transport against the independently built server's QUIC listener
+// (`--quic-port`, roadmap Phase 9). The server is spawned QUIC-only (TCP
+// disabled) with a dedicated self-signed test certificate so the client can
+// pin the exact expected identity (ADR-0023 §2.3): no pin exposes the
+// presented leaf digest for trust-on-first-use, the correct pin succeeds,
+// and a wrong pin fails with `CertificateMismatch` — never a silent TCP
+// fallback.
+
+const quic_port: u16 = 64335;
+const quic_data_dir = "zig-cache/runa-client-quic-integration";
+const quic_idle_port: u16 = 64336;
+const quic_idle_data_dir = "zig-cache/runa-client-quic-idle";
+
+const quic_test_cert = @embedFile("testdata/quic-test-cert.pem");
+const quic_test_key = @embedFile("testdata/quic-test-key.pem");
+const quic_other_cert = @embedFile("testdata/quic-test-cert-other.pem");
+
+test "QUIC transport: certificate pinning regressions and round-trip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const server_path = std.mem.span(std.c.getenv("RUNA_TEST_SERVER") orelse return error.ServerPathMissing);
+
+    Io.Dir.cwd().deleteTree(io, quic_data_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, quic_data_dir) catch {};
+
+    const port_text = "64335";
+    const child_args = [_][]const u8{
+        server_path,
+        "--quic-port", port_text,
+        "--runa-port", "0",
+        "--data-dir", quic_data_dir,
+        "--cert", "sdk/zig/testdata/quic-test-cert.pem",
+        "--key", "sdk/zig/testdata/quic-test-key.pem",
+    };
+    var child = try std.process.spawn(io, .{
+        .argv = &child_args,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+
+    // ── No pin: the connection proceeds and the presented leaf digest is
+    // exposed for trust-on-first-use inspection; the digest must equal the
+    // SHA-256 of the server's certificate DER.
+    {
+        var conn = try connectQuicWhenReady(gpa, io, quic_port, null);
+        defer conn.deinit(io);
+        try std.testing.expectEqualStrings("RunaDB 0.0.1", conn.server_version);
+        const digest = conn.server_cert_digest orelse return error.TestUnexpectedResult;
+        const expected = try sha256OfPem(gpa, quic_test_cert);
+        try std.testing.expectEqualSlices(u8, &expected, &digest);
+
+        // A request round-trip over a QUIC query stream through the public
+        // API: unknown semantic name is rejected by the Server (RF1002).
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var result = try conn.executeFlow(arena.allocator(), "from customer\n| emit { id }");
+        const failure = (try result.next(arena.allocator())).?;
+        switch (failure) {
+            .server_error => |server_error| {
+                try std.testing.expectEqualStrings("RF1002", server_error.code);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expect((try result.next(arena.allocator())) == null);
+
+        // A document insert + read-back round-trip proves query streams carry
+        // request frames and result sequences over QUIC.
+        const fields = [_]proto.DocumentField{
+            .{ .path = "title", .value = .{ .text = "Foundation" } },
+        };
+        var inserted = try conn.insertDocument("qbooks", "1", &fields);
+        const insert_row = try inserted.expectOneRow(arena.allocator());
+        try std.testing.expectEqualStrings("1", insert_row.raw(0));
+        var read = try conn.executeFlow(arena.allocator(), "from qbooks\n| emit { title }");
+        try std.testing.expect((try read.next(arena.allocator())).? == .row_description);
+        const row = (try read.next(arena.allocator())).?;
+        switch (row) {
+            .row_data => |data| try std.testing.expectEqualStrings("Foundation", data.values[0]),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expect((try read.next(arena.allocator())).? == .command_complete);
+        try std.testing.expect((try read.next(arena.allocator())) == null);
+    }
+
+    // ── Correct pin: the presented leaf matches the pinned certificate. ──
+    {
+        var conn = try connectQuicWhenReady(gpa, io, quic_port, quic_test_cert);
+        defer conn.deinit(io);
+        try std.testing.expectEqualStrings("RunaDB 0.0.1", conn.server_version);
+    }
+
+    // ── Wrong pin: CertificateMismatch; no silent fallback. ──
+    {
+        const err = sdk.Connection.connect(gpa, io, .{
+            .host = "127.0.0.1",
+            .port = quic_port,
+            .kind = .quic,
+            .server_cert_pem = quic_other_cert,
+            .connect_timeout_ms = 3000,
+        }) catch |e| e;
+        try std.testing.expectEqual(error.CertificateMismatch, err);
+    }
+}
+
+test "QUIC transport: idle timeout against the SDK client" {
+    // RFC 9000 §10.1: the server reaps a connection whose peer sends nothing
+    // for the effective idle timeout (min of the listener's
+    // --quic-idle-timeout-ms and the client's advertised max_idle_timeout).
+    // The SDK pumps its QUIC event loop only during requests, so a silent
+    // Connection is reaped; the next request then fails with a bounded,
+    // defined error (Timeout after read_timeout_ms) instead of hanging.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const server_path = std.mem.span(std.c.getenv("RUNA_TEST_SERVER") orelse return error.ServerPathMissing);
+
+    Io.Dir.cwd().deleteTree(io, quic_idle_data_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, quic_idle_data_dir) catch {};
+
+    const port_text = "64336";
+    const child_args = [_][]const u8{
+        server_path,
+        "--quic-port", port_text,
+        "--runa-port", "0",
+        "--data-dir", quic_idle_data_dir,
+        "--cert", "sdk/zig/testdata/quic-test-cert.pem",
+        "--key", "sdk/zig/testdata/quic-test-key.pem",
+        "--quic-idle-timeout-ms", "1200",
+    };
+    var child = try std.process.spawn(io, .{
+        .argv = &child_args,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+
+    var conn = try connectQuicWhenReady(gpa, io, quic_idle_port, quic_test_cert);
+    defer conn.deinit(io);
+    try std.testing.expectEqualStrings("RunaDB 0.0.1", conn.server_version);
+
+    // Go silent for longer than the server's 1200 ms idle timeout. The SDK
+    // does not pump between requests, so no keepalive keeps the connection
+    // alive; the server reaps it.
+    try Io.sleep(io, .fromMilliseconds(2000), .awake);
+
+    // The next request must fail with the SDK's bounded read timeout — a
+    // defined error, never a silent hang or a stale success.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var result = try conn.executeFlow(arena.allocator(), "from customer\n| emit { id }");
+    const read_err = result.next(arena.allocator()) catch |e| e;
+    try std.testing.expectEqual(error.Timeout, read_err);
+}
+
+/// SHA-256 of the DER body of a PEM certificate (mirrors the SDK's pinned
+/// digest computation, ADR-0023 §2.3).
+fn sha256OfPem(gpa: std.mem.Allocator, pem: []const u8) ![32]u8 {
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end_m = "-----END CERTIFICATE-----";
+    const bi = std.mem.indexOf(u8, pem, begin) orelse return error.NoCertificate;
+    const after = bi + begin.len;
+    const ei = std.mem.indexOf(u8, pem[after..], end_m) orelse return error.NoCertEnd;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    for (pem[after .. after + ei]) |c| {
+        if (c != '\n' and c != '\r' and c != ' ') {
+            try body.append(gpa, c);
+        }
+    }
+    const decoder = std.base64.standard.Decoder;
+    const der_len = try decoder.calcSizeForSlice(body.items);
+    const der = try gpa.alloc(u8, der_len);
+    defer gpa.free(der);
+    try decoder.decode(der, body.items);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(der, &digest, .{});
+    return digest;
+}
+
+/// Connect the SDK's QUIC transport to `port`, retrying while the server
+/// process starts up. `pin` is the optional pinned certificate PEM.
+fn connectQuicWhenReady(gpa: std.mem.Allocator, io: Io, port: u16, pin: ?[]const u8) !sdk.Connection {
+    var last_error: ?anyerror = null;
+    for (0..100) |_| {
+        if (sdk.Connection.connect(gpa, io, .{
+            .host = "127.0.0.1",
+            .port = port,
+            .kind = .quic,
+            .server_cert_pem = pin,
+            .connect_timeout_ms = 3000,
+            .read_timeout_ms = 1500,
+        })) |conn| {
+            return conn;
+        } else |err| {
+            last_error = err;
+            try Io.sleep(io, .fromMilliseconds(10), .awake);
+        }
+    }
+    return last_error orelse error.ServerDidNotStart;
 }

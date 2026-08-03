@@ -4,36 +4,43 @@ Status: **Draft.** The public module entry point is `sdk/zig/lib.zig`
 (`@import("sdk_zig")` in this repository; the package is
 `.runadb_zig_sdk`). The SDK uses only the RunaDB Wire Protocol and Runa
 Flow; it does not import RunaDB Server modules or access an instance data
-directory. See ADR-0023 for the SDK directory and transport decisions.
+directory. See ADR-0023 for the SDK directory and transport decisions. The
+TCP and QUIC transports are verified in this checkout (see Transports); the
+SDK package as a whole is not a release claim.
 
 ## Compatibility
 
 | Client package | RunaDB Wire Protocol | RunaDB Server | Transport |
 | --- | --- | --- | --- |
-| Checked-out RunaDB Zig SDK | `3.0` | `RunaDB 0.0.1` in this checked-out revision | TCP (verified) |
-| Checked-out RunaDB Zig SDK | `3.0` | — | QUIC (target design, no server support yet) |
+| Checked-out RunaDB Zig SDK | `3.0` | `RunaDB 0.0.1` in this checked-out revision | TCP (verified), QUIC (verified) |
 
 Other server versions are unverified until they have a compatibility
 regression. Run `zig build test` to build the independently deployable
-`runadb` binary and exercise the SDK against it over native TCP.
+`runadb` binary and exercise the SDK against it over native TCP and QUIC
+(the QUIC listener and the SDK QUIC transport, roadmap Phase 9).
 
 ## Transports (ADR-0023)
 
-- **TCP** is implemented and verified in this checkout (port 5434).
+- **TCP** is implemented and verified in this checkout (port 5434); the CLI
+  still defaults to it until the Phase 9 migration condition (ADR-0024) is
+  met.
 - **QUIC** (vendored zquic, ALPN `runadb`, UDP 5435) is the target default
-  transport. The client code compiles and drives the zquic event loop, but no
-  RunaDB Server accepts QUIC connections yet (roadmap Phase 9), so QUIC has
-  no end-to-end regression. A QUIC connect against a server without a QUIC
-  listener fails with a defined error (`HandshakeTimeout`, `QuicRejected`,
-  `CertificateMismatch`) — there is no silent TCP fallback.
+  transport and is verified end to end in this checkout: the server QUIC
+  listener (`src/net/quic.zig`, ADR-0023 §2.1 stream contract) is exercised
+  by the SDK QUIC client through the public API, and the integration suite
+  covers certificate pinning regressions (no pin / correct pin / wrong pin),
+  a request round-trip, and idle-timeout behavior. A QUIC connect against a
+  server without a QUIC listener fails with a defined error
+  (`HandshakeTimeout`, `QuicRejected`, `CertificateMismatch`) — there is no
+  silent TCP fallback.
 
 Select the transport explicitly:
 
 ```zig
 var conn = try sdk.Connection.connect(gpa, io, .{
     .host = "127.0.0.1",
-    .kind = .tcp,   // verified in this checkout
-    // .kind = .quic,  // target design; requires a server QUIC listener
+    .kind = .quic,   // verified in this checkout (server QUIC listener)
+    // .kind = .tcp, // also verified; CLI default until ADR-0024
 });
 ```
 
@@ -42,7 +49,11 @@ expected server certificate) and the SDK compares the SHA-256 digest of the
 presented leaf certificate, failing with `CertificateMismatch` on difference.
 Without a pin, the connection proceeds and the presented certificate's SHA-256
 digest is exposed as `Connection.server_cert_digest` for trust-on-first-use
-inspection (full X.509 chain validation is future work).
+inspection (full X.509 chain validation is future work). The QUIC idle
+timeout is configurable with `Config.idle_timeout_ms` (RFC 9000 §10.1, default
+30 000 ms, matching the server listener); a connection whose peer stays
+silent past the effective timeout is reaped, and a subsequent request fails
+with the SDK's bounded read timeout.
 
 ## API
 

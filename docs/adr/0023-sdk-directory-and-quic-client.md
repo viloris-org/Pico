@@ -113,13 +113,25 @@ trust-on-first-use inspection. Full chain validation is future work.
   listener is exercised end to end by the SDK QUIC client (`runa-cli
   --quic`) against the independently built server binary, and by the
   in-process integration test in `src/net/quic.zig` (handshake, query
-  round-trip, concurrent streams, goodbye).
+  round-trip, concurrent streams, goodbye, idle teardown).
+- **Implemented and verified in this checkout:** certificate pinning
+  regressions and idle-timeout behavior against the SDK client. The SDK
+  integration suite connects through the public Connection API over QUIC to
+  an independently built QUIC-only server: no pin exposes the presented leaf
+  digest, the correct pinned certificate connects, a wrong pinned
+  certificate fails with `CertificateMismatch` (no silent fallback), a
+  request round-trip and document insert/read-back pass, and a connection
+  idle past the listener's configured `max_idle_timeout` is reaped so the
+  next request fails with the SDK's bounded read timeout. The listener's
+  local idle timeout is configurable (`quic.Config.idle_timeout_ms`, server
+  `--quic-idle-timeout-ms`, SDK `Config.idle_timeout_ms`), default 30 s.
 - **Implemented client code (SDK):** the QUIC transport in `sdk/zig/
   transport/quic.zig` compiles against the vendored zquic client, drives
   the zquic event loop, and is verified against the server QUIC listener
   above.
 - The CLI default stays TCP (`--tcp`) until the Phase 9 exit criteria pass
-  (ROADMAP.md); `--quic` selects the QUIC transport explicitly.
+  and the migration condition in ADR-0024 is met (ROADMAP.md); `--quic`
+  selects the QUIC transport explicitly.
 
 ## Decision Drivers
 

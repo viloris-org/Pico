@@ -33,13 +33,13 @@ capabilities exist but are not collectively a release claim:
 | --- | --- | --- |
 | Runa Flow | Read-only relation projection from source or canonical Runa Query IR | [Runa Flow](docs/runa-flow.md) |
 | Persistence | WAL-backed table changes, CRC32 validation, and recovery of a valid committed prefix | [WAL and crash recovery](docs/architecture/wal-and-recovery.md) |
-| Native client path | RunaDB Wire Protocol v3 over sequential TCP and a RunaDB Zig client integration suite | [RunaDB Wire Protocol v3](docs/wire-protocol.md) |
+| Native client path | RunaDB Wire Protocol v3 over QUIC (UDP 5435, vendored zquic) and sequential TCP (deprecated, ADR-0024), with a RunaDB Zig client integration suite covering certificate pinning and idle timeout | [RunaDB Wire Protocol v3](docs/wire-protocol.md), [ADR-0024](docs/adr/0024-tcp-retirement-migration-conditions.md) |
 | Observation Evidence | Immutable evidence ingestion, metadata inspection, bounded payload retrieval, checkpoint retention, restart recovery, orphan reclamation, and startup rejection of corrupt committed payloads through the official RunaDB Client | [Runa Flow](docs/runa-flow.md), [Wire Protocol v3](docs/wire-protocol.md), [ADR-0019](docs/adr/0019-observation-evidence-payload-storage.md) |
 | MCP stdio adapter | Opt-in `--mcp-stdio` process mode serving the read-only `runadb_flow_emit` tool over MCP `2025-11-25` JSON-RPC | [ADR-0021](docs/adr/0021-native-mcp-stdio-adapter.md) |
 | Transaction semantics | Single-writer commit coordinator, `txn` write sets with commit/rollback, group commit, observed-version write-write conflict detection, and a recovered commit watermark | [Write Path and WriteBatch](docs/architecture/write-path.md), [Concurrency Control](docs/architecture/concurrency-control.md) |
 | Target architecture | LSM storage, MVCC, single-writer commits, group commit, VFS, Pager, execution programs, and asynchronous runtime boundaries are designed but not all implemented | [Architecture](docs/ARCHITECTURE.md) |
 | Public development contract | Runa Flow, Runa Query IR, semantic model revision `0`, and RunaDB Wire Protocol v3 | [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md) |
-| Accepted later work | Interactive RunaDB Client, Ed25519 authentication and permissions, and QUIC transport | [ADRs](docs/adr/) |
+| Accepted later work | Interactive RunaDB Client, Ed25519 authentication and permissions | [ADRs](docs/adr/) |
 | Frozen internal slice | `runadb.vector` column ranking and vector WAL values remain implemented in-process but are not exposed through Runa Flow, Runa Query IR, or the wire protocol; deprecated and permanently frozen | [ADR-0020](docs/adr/0020-embedding-and-vector-retrieval-primitives.md) |
 
 The [README](README.md), Runa Flow reference, and Wire Protocol specification
@@ -464,6 +464,21 @@ supported client/server version pairs are published and verified through the
 RunaDB Wire Protocol.
 
 ### Phase 9: QUIC Transition and TCP Retirement
+
+**Status:** The QUIC transport is implemented and its verification evidence is
+in place. The server QUIC listener (`src/net/quic.zig`) implements the
+ADR-0023 §2.1 stream contract; the SDK QUIC client (`sdk/zig/transport/quic.zig`)
+ships control stream 0, per-query streams, ALPN `runadb`, certificate pinning,
+and explicit `--quic` / `--tcp` selection. Certificate pinning regressions
+(no pin / correct pin / wrong pin), a QUIC request round-trip through the SDK
+public API, and idle-timeout behavior against the SDK client are covered by
+the SDK integration suite, and the listener's idle teardown is covered by an
+in-process regression. The TCP migration conditions (supported versions,
+fallback behavior, telemetry, deprecation notice, and the fixed removal
+release decision) are published in ADR-0024. Remaining before the CLI default
+flips to QUIC and TCP is removed: Stream 0 Ed25519 authentication (ADR-0014,
+Phase 7 dependency), the transport telemetry counters, and the flip/removal
+execution per ADR-0024.
 
 **Goal:** Make zquic-based QUIC the primary RunaDB transport while retaining one
 RunaDB application protocol and a controlled TCP migration path.

@@ -21,14 +21,18 @@ RunaDB Server and RunaDB Client communicate only through versioned protocol
 definitions and the public error model. See [product boundaries](docs/products.md)
 and [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md). The
 official Zig SDK lives at [`sdk/zig/`](sdk/zig/README.md) (ADR-0023); it
-speaks the RunaDB Wire Protocol over native TCP today, with a target-design
-QUIC transport (ADR-0015) that awaits server support (roadmap Phase 9).
+speaks the RunaDB Wire Protocol over native TCP and over QUIC (vendored
+zquic, ADR-0015/0023). The server QUIC listener and the SDK QUIC client are
+verified end to end (roadmap Phase 9); TCP remains the CLI default until the
+migration condition in [ADR-0024](docs/adr/0024-tcp-retirement-migration-conditions.md)
+is met.
 
 ## Status
 
 RunaDB Server is under active development. The current implementation provides:
 
 - A native RunaDB Wire Protocol TCP listener and RunaDB Client CLI
+- A QUIC (UDP) listener and verified SDK QUIC client transport (Phase 9)
 - An opt-in MCP stdio adapter for Agent use with the read-only Runa Flow slice
 - Single-instance operation with a local data directory
 - The read-only Runa Flow relation projection slice

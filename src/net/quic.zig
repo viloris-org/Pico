@@ -310,6 +310,10 @@ pub const Config = struct {
     /// acceptable; the SDK pins the leaf digest, ADR-0023 §2.3).
     cert_pem: []const u8,
     key_pem: []const u8,
+    /// Local QUIC idle timeout (RFC 9000 §10.1) in milliseconds: how long a
+    /// connected peer may stay silent before this listener reaps it. The
+    /// effective timeout is min(local, peer-advertised). Default 30_000.
+    idle_timeout_ms: u32 = 30_000,
 };
 
 /// The QUIC listener: owns the zquic `Server` and drives its event loop.
@@ -335,6 +339,7 @@ pub const QuicServer = struct {
             .alpn = ALPN,
             .max_incoming_streams = 4096,
             .max_incoming_uni_streams = 64,
+            .max_idle_timeout_ms = cfg.idle_timeout_ms,
         };
         const zserver = if (sock) |s|
             try io_mod.Server.initFromSocket(gpa, server_cfg, s, true)
@@ -809,6 +814,16 @@ const TestClient = struct {
         self.pump();
     }
 
+    /// Pump only the server leg (no client keepalives/ACKs). Used by the
+    /// idle-timeout regression: pumping the client would send keepalive
+    /// PINGs that refresh the server's idle timer and defeat the reap.
+    fn pumpServer(self: *TestClient) void {
+        if (self.server) |qs| {
+            qs.pumpOnce();
+            qs.dispatch() catch {};
+        }
+    }
+
     fn deinit(self: *TestClient) void {
         self.consumed.deinit();
         self.client.deinit();
@@ -1155,5 +1170,68 @@ test "quic transport: client handshake failure leaves no registry entries" {
         .key_pem = dev_key_pem,
     }, &eng, &registry, bound.sock);
     defer qs.deinit();
+    try std.testing.expectEqual(@as(usize, 0), registry.liveCount());
+}
+
+test "quic transport: idle timeout reaps a silent connection" {
+    // RFC 9000 §10.1: the listener reaps a connection whose peer sends
+    // nothing for the effective idle timeout (min of local config and the
+    // peer's advertised value). The session is torn down and unregistered.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-quic-idle";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    var registry = registry_mod.Registry.init(gpa, io, .{});
+    defer registry.deinit();
+
+    const bound = try bindEphemeralUdp(gpa);
+    const qs = try QuicServer.init(gpa, io, .{
+        .port = 0,
+        .cert_pem = dev_cert_pem,
+        .key_pem = dev_key_pem,
+        .idle_timeout_ms = 1200,
+    }, &eng, &registry, bound.sock);
+    defer qs.deinit();
+    try std.testing.expect(qs.boundPort() > 0);
+
+    var client = try TestClient.connect(gpa, qs.boundPort());
+    defer client.deinit();
+    client.server = qs;
+
+    // TLS 1.3 handshake plus the control-stream hello exchange.
+    {
+        const deadline = compat.milliTimestamp() + 10_000;
+        while (client.client.conn.phase != .connected) {
+            if (compat.milliTimestamp() >= deadline) return error.TestTimeout;
+            client.pumpBoth();
+        }
+        const control = try client.openStream();
+        try std.testing.expectEqual(@as(u64, CONTROL_STREAM), control);
+        var hello_payload: [4]u8 = undefined;
+        std.mem.writeInt(u16, hello_payload[0..2], proto.PROTOCOL_VERSION_MAJOR, .big);
+        std.mem.writeInt(u16, hello_payload[2..4], proto.PROTOCOL_VERSION_MINOR, .big);
+        try client.sendFrame(control, .hello, &hello_payload);
+        const frame = try client.readFrame(control);
+        defer gpa.free(frame[1]);
+        try std.testing.expectEqual(proto.Type.hello_ok, frame[0]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), registry.liveCount());
+
+    // Go silent: pump only the server leg so the client cannot refresh the
+    // server's idle timer with ACKs or keepalive PINGs. The listener must
+    // reap the connection after ~1200 ms, tear down the session, and
+    // unregister it.
+    {
+        const deadline = compat.milliTimestamp() + 10_000;
+        while (registry.liveCount() != 0) {
+            if (compat.milliTimestamp() >= deadline) return error.TestTimeout;
+            client.pumpServer();
+            try Io.sleep(io, .fromMilliseconds(20), .awake);
+        }
+    }
     try std.testing.expectEqual(@as(usize, 0), registry.liveCount());
 }
