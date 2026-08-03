@@ -97,34 +97,33 @@ Switching proceeds as follows:
 
 ## SST File Format
 
-An SST file is the persistent ordered-storage unit of the LSM. Each SST file contains data blocks, index blocks, and metadata.
+An SST file is the persistent ordered-storage unit of the LSM. Each SST file contains data blocks, an index block, a full-key Bloom filter block, and a fixed footer (format version 2):
 
 ```
-[Footer] <- pointer to the metadata index block
-[Metadata filter] <- Bloom filter, statistics, and so on
-[Metadata index] <- location and size of each metadata block
-[Data index] <- last key of each data block (for binary search)
-[Data block N] <- compressed ordered key-value pairs
-...
-[Data block 1] <- compressed ordered key-value pairs
-[Header] <- file magic, format version, key-comparator name
+[Data block 1] ... [Data block N] [Index block] [Bloom filter] [Footer]
 ```
+
+The footer is written at the end of the file and records the index and filter
+locations plus the total entry count. Format version 1 (no Bloom filter block)
+is still readable; version 2 adds the filter. See `lsm/sstable.zig` for the
+exact framing.
 
 ### Data Blocks
 
-- Greedy packing: scan key-value pairs until the accumulated size exceeds `block_size`, or the shared prefix of the current and previous keys exceeds `block_restart_interval` (prefix compression).
-- Prefix compression (delta encoding): each restart point records a complete key; subsequent records store only the difference from the previous key.
-- Optional compression (Snappy/Zstd): applied to the entire data block.
+- Greedy packing: scan key-value pairs until the accumulated size exceeds `block_size`.
+- Prefix compression (delta encoding): not implemented; a documented evolution point.
+- Optional compression (Snappy/Zstd): not implemented; a documented evolution point.
+- Each block is CRC-protected and validated before use.
 
 ### Data Index
 
-- The last key (or separator key) of each data block is an index entry.
-- Reads locate the data block containing a target key through binary search.
+- The last internal key of each data block is an index entry; a point lookup binary-searches the index for the block that may contain the seek key, then scans that block.
 
 ### Metadata Filters
 
-- Full-key or prefix Bloom filters.
-- Point lookups check the Bloom filter first; if it says the key is absent, the SST is skipped to avoid unnecessary I/O.
+- Full-key Bloom filter over the user keys of the entries in the file, with no false negatives and a bounded false positive rate (~1% at the default 10 bits/key).
+- The filter block sits between the index block and the footer, is CRC-protected, and is loaded and validated when the file is opened.
+- Point lookups consult the filter before probing a file: `Reader.find` skips the index search and data-block read on a definitive absent answer, and `Store.pointLookup` uses `Reader.mayContainKey` to skip a file entirely before its index is read (`store.zig` counts these skips in `Stats.point_lookup_bloom_skips`).
 
 ---
 
@@ -161,10 +160,10 @@ See [Write Path and WriteBatch](write-path.md) for the detailed design.
 
 The exact-key lookup path (for a primary-key equality predicate) is:
 
-1. **Active MemTable**: query the skiplist (and Bloom filter). If found, return the newest version.
+1. **Active MemTable**: query the in-memory table's primary-key index. If found, return the newest version.
 2. **Immutable MemTables**: search from newest to oldest. Return on the first match.
-3. **L0 SST**: search from newest to oldest (L0 ranges may overlap). Check the Bloom filter first.
-4. **L1..L{N} SST**: use binary search to locate SST files that may contain the key (ranges do not overlap within a level), then read the relevant data block.
+3. **L0 SST**: search from newest to oldest (L0 ranges may overlap). Check the Bloom filter first (`Reader.mayContainKey`); a definitive absent answer skips the file without reading its index.
+4. **L1..L{N} SST**: use binary search to locate SST files that may contain the key (ranges do not overlap within a level), then check the Bloom filter and read the relevant data block.
 
 Return the first visible version found; if every level returns a tombstone, treat the key as nonexistent.
 
@@ -266,10 +265,10 @@ During startup recovery:
 |------|----------------|-------------|
 | MemTable | In-memory `Table` (rows + PK index + retained versions) remains the write and live-read front | Skiplist with Bloom filter |
 | Persistence | Flush to L0 SST (int/text single-column PK tables) | Full SST levels |
-| SST format | Block-indexed SSTables with per-block CRC (`lsm/sstable.zig`) | Prefix compression + optional block compression |
+| SST format | Block-indexed SSTables with per-block CRC and a full-key Bloom filter block (`lsm/sstable.zig`, format v2; v1 still read) | Prefix compression + optional block compression |
 | Compaction | L0 + overlapping L1 -> sorted non-overlapping L1 (`lsm/store.zig`) | Size-tiered all-level compaction |
 | Manifest | Versioned LSM version-set manifest, atomically rewritten (`lsm/manifest.zig`) | Append-style version_edit records with snapshot tracking |
-| Bloom filter | None | Optional full-key Bloom filter |
+| Bloom filter | Full-key filter written on flush, checked on point lookups (`lsm/bloom.zig`, `Store.point_lookup_bloom_skips`) | Optional prefix filter, block-level filters |
 | Memory limit control | None | WriteBufferManager / write stall |
 | Secondary indexes | Not implemented | Independent LSM structures, then covering indexes (Index-Only Scan) |
 

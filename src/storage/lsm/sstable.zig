@@ -3,10 +3,10 @@
 //! An SST is the persistent ordered-storage unit of the LSM. It holds opaque
 //! byte-sorted internal keys (user key + MVCC sequence suffix, see
 //! `codec.zig`) with byte values, packed into fixed-target data blocks with a
-//! trailing index block and a fixed footer:
+//! trailing index block, a full-key Bloom filter block, and a fixed footer:
 //!
 //! ```text
-//! [Data block 0] [Data block 1] ... [Data block N-1] [Index block] [Footer]
+//! [Data block 0] [Data block 1] ... [Data block N-1] [Index block] [Bloom filter] [Footer]
 //! ```
 //!
 //! Each data block is a sequence of `key_len:u32 key value_len:u32 value`
@@ -14,27 +14,59 @@
 //! entry per data block keyed by the block's *last* internal key, with a
 //! 16-byte value `(block_offset:u64, block_size:u64)`. A point lookup binary
 //! searches the index for the block that may contain the seek key, then scans
-//! that block. The footer is fixed-size and records the index location plus
-//! the total entry count.
+//! that block. The Bloom filter block (roadmap Phase 5) holds the full-key
+//! filter of `bloom.zig`, CRC-protected like the other blocks; point lookups
+//! consult it first and skip the index and data-block reads on a definitive
+//! "absent" answer (`Reader.find`, `Reader.mayContainKey`). The footer is
+//! fixed-size and records the index and filter locations plus the total entry
+//! count.
 //!
 //! Files are written through the directory's atomic-file primitive and synced
 //! before publication, so a torn or interrupted flush never publishes a
-//! half-written SST. Blocks are not compressed and no Bloom filter is written
-//! yet; both are documented evolution points (docs/architecture/lsm-storage.md).
+//! half-written SST. Blocks are not compressed; that remains a documented
+//! evolution point (docs/architecture/lsm-storage.md).
 //!
 //! The comparator is fixed: bytewise internal-key order (see
 //! `codec.internalLessThan`). The header records the format version so a
 //! future comparator or layout change fails validation rather than
-//! misinterpreting old bytes.
+//! misinterpreting old bytes. Format version 2 adds the Bloom filter block;
+//! version 1 files (no filter) are still read, with every lookup treated as
+//! "might contain".
+//!
+//! FORMAT CHANGE (roadmap Phase 5 full-key Bloom filter)
+//!   owner:          lsm (SSTable file format)
+//!   format version: 1 -> 2
+//!   writer behavior:version-2 footer appends [bloom_offset:u64][bloom_size:u64]
+//!                   after the v1 fields; a CRC-protected Bloom filter block is
+//!                   written between the index block and the footer for any
+//!                   non-empty file.
+//!   reader behavior:version 1 files (no filter) are read as before, with
+//!                   every lookup probing; version 2 files load and validate
+//!                   the filter block eagerly and consult it on point lookups;
+//!                   any other version is rejected (UnsupportedSst).
+//!   recovery rule:  recovery reads whatever version each file declares; a
+//!                   corrupt or truncated footer or filter block fails recovery
+//!                   (CorruptSst/InvalidSst) rather than being ignored.
+//!   migration:      none required; old files remain readable and new flushes
+//!                   write version 2.
+//!   tests:          v1 read compatibility, v2 round trip, cheap-probe and
+//!                   find filter behavior, corrupt filter block, truncated
+//!                   footer, unsupported version (this module and `store.zig`).
 
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const codec = @import("codec.zig");
+const bloom = @import("bloom.zig");
 
 pub const file_magic = "RUNADB_SST";
-pub const format_version: u32 = 1;
-pub const footer_len = file_magic.len + 4 + 8 + 8 + 8;
+pub const format_version: u32 = 2;
+/// v1 footer: [magic:12][version:u32][index_offset:u64][index_size:u64][entry_count:u64].
+pub const footer_len_v1 = file_magic.len + 4 + 8 + 8 + 8;
+/// v2 footer appends [bloom_offset:u64][bloom_size:u64].
+pub const footer_len = footer_len_v1 + 16;
+const bloom_offset_pos = footer_len_v1;
+const bloom_size_pos = footer_len_v1 + 8;
 const crc_len = 4;
 pub const default_block_size: usize = 4096;
 pub const default_target_file_size: usize = 4 * 1024 * 1024;
@@ -75,6 +107,9 @@ pub const Builder = struct {
     block: std.ArrayList(u8),
     /// Encoded index entries: `key_len:u32 key offset:u64 size:u64`.
     index: std.ArrayList(u8),
+    /// User-key hashes of every entry, for the full-key Bloom filter built at
+    /// `finish` (roadmap Phase 5).
+    hashes: std.ArrayList(bloom.Hash),
     /// First internal key written (owned), null for an empty SST.
     first_key: ?[]u8,
     /// Last internal key written (owned).
@@ -92,6 +127,7 @@ pub const Builder = struct {
             .offset = 0,
             .block = .empty,
             .index = .empty,
+            .hashes = .empty,
             .first_key = null,
             .last_key = null,
             .entry_count = 0,
@@ -102,6 +138,7 @@ pub const Builder = struct {
         self.atomic.deinit(self.io);
         self.block.deinit(self.gpa);
         self.index.deinit(self.gpa);
+        self.hashes.deinit(self.gpa);
         if (self.first_key) |k| self.gpa.free(k);
         if (self.last_key) |k| self.gpa.free(k);
         self.* = undefined;
@@ -115,6 +152,13 @@ pub const Builder = struct {
         if (self.first_key == null) self.first_key = try self.gpa.dupe(u8, key);
         if (self.last_key) |last| self.gpa.free(last);
         self.last_key = try self.gpa.dupe(u8, key);
+        // The filter is keyed on user keys: within one file a user key appears
+        // at most once, and point lookups probe by user key. Keys shorter than
+        // the suffix carry no user-key portion (raw byte keys used by builder
+        // rejection tests); real entries are always internal keys.
+        if (key.len >= codec.suffix_len) {
+            try self.hashes.append(self.gpa, bloom.hashKey(codec.userKeyOf(key)));
+        }
 
         const entry_len = 4 + key.len + 4 + entry_value.len;
         // Flush the current block once adding this entry would exceed the
@@ -176,13 +220,34 @@ pub const Builder = struct {
         try self.atomic.file.writePositionalAll(self.io, index_bytes, index_start);
         self.offset += index_len;
 
-        // Footer.
+        // Bloom filter block (full-key, roadmap Phase 5) between the index
+        // block and the footer. Empty SSTs carry no filter (bloom_size 0).
+        const bloom_start = self.offset;
+        var bloom_size: u64 = 0;
+        if (self.entry_count != 0) {
+            var filter = try bloom.Filter.build(self.gpa, self.hashes.items, bloom.default_bits_per_key);
+            defer filter.deinit(self.gpa);
+            const encoded = try filter.encode(self.gpa);
+            defer self.gpa.free(encoded);
+            const bloom_len = encoded.len + crc_len;
+            const bloom_bytes = try self.gpa.alloc(u8, bloom_len);
+            defer self.gpa.free(bloom_bytes);
+            @memcpy(bloom_bytes[0..encoded.len], encoded);
+            std.mem.writeInt(u32, bloom_bytes[encoded.len..][0..4], blockCrc(encoded), .little);
+            try self.atomic.file.writePositionalAll(self.io, bloom_bytes, bloom_start);
+            self.offset += bloom_len;
+            bloom_size = bloom_len;
+        }
+
+        // Footer (format version 2): the v1 fields plus the filter location.
         var footer: [footer_len]u8 = undefined;
         @memcpy(footer[0..file_magic.len], file_magic);
         std.mem.writeInt(u32, footer[file_magic.len..][0..4], format_version, .little);
         std.mem.writeInt(u64, footer[file_magic.len + 4 ..][0..8], index_start, .little);
         std.mem.writeInt(u64, footer[file_magic.len + 12 ..][0..8], index_len, .little);
         std.mem.writeInt(u64, footer[file_magic.len + 20 ..][0..8], self.entry_count, .little);
+        std.mem.writeInt(u64, footer[bloom_offset_pos..][0..8], bloom_start, .little);
+        std.mem.writeInt(u64, footer[bloom_size_pos..][0..8], bloom_size, .little);
         try self.atomic.file.writePositionalAll(self.io, &footer, self.offset);
         self.offset += footer_len;
 
@@ -212,33 +277,103 @@ const IndexEntry = struct {
     }
 };
 
-/// Read-only view of one SST file. The index is loaded eagerly; data blocks
-/// are read on demand and validated block by block.
+/// Fields decoded from an SST footer. The v1 fields (magic, version, index
+/// location, entry count) lead the fixed footer; format version 2 appends the
+/// Bloom filter location after them, so the v1 fields always sit at the same
+/// offsets within the read footer.
+const FooterFields = struct {
+    version: u32,
+    index_offset: u64,
+    index_size: u64,
+    entry_count: u64,
+    bloom_offset: u64,
+    bloom_size: u64,
+    /// True when the file carries a version-2 footer and thus a filter block
+    /// location; v1 files have no filter.
+    is_v2: bool,
+};
+
+fn parseV1Fields(footer: []const u8) struct { version: u32, index_offset: u64, index_size: u64, entry_count: u64 } {
+    return .{
+        .version = std.mem.readInt(u32, footer[file_magic.len..][0..4], .little),
+        .index_offset = std.mem.readInt(u64, footer[file_magic.len + 4 ..][0..8], .little),
+        .index_size = std.mem.readInt(u64, footer[file_magic.len + 12 ..][0..8], .little),
+        .entry_count = std.mem.readInt(u64, footer[file_magic.len + 20 ..][0..8], .little),
+    };
+}
+
+/// Read and validate the footer of an open file. A version-2 footer fills the
+/// whole `footer_len` bytes ending at EOF; a version-1 footer fills the last
+/// `footer_len_v1`. The reader tries the v2 position first (its magic check
+/// fails for v1 files, whose last 56 bytes are data plus the v1 footer), then
+/// falls back to the v1 position. Unknown versions are rejected so a future
+/// layout change fails loudly instead of being misinterpreted.
+fn parseFooter(io: Io, file: *Io.File, file_len: u64) !FooterFields {
+    if (file_len < footer_len_v1) return error.InvalidSst;
+    var footer: [footer_len]u8 = undefined;
+    if (file_len >= footer_len) {
+        if (try file.readPositionalAll(io, &footer, file_len - footer_len) != footer_len) return error.CorruptSst;
+        if (std.mem.eql(u8, footer[0..file_magic.len], file_magic)) {
+            const v1 = parseV1Fields(footer[0..footer_len_v1]);
+            if (v1.version != format_version) return error.UnsupportedSst;
+            return .{
+                .version = v1.version,
+                .index_offset = v1.index_offset,
+                .index_size = v1.index_size,
+                .entry_count = v1.entry_count,
+                .bloom_offset = std.mem.readInt(u64, footer[bloom_offset_pos..][0..8], .little),
+                .bloom_size = std.mem.readInt(u64, footer[bloom_size_pos..][0..8], .little),
+                .is_v2 = true,
+            };
+        }
+    }
+    // v1 footer ending at EOF; a truncated v2 footer fails the magic check.
+    if (try file.readPositionalAll(io, footer[0..footer_len_v1], file_len - footer_len_v1) != footer_len_v1) return error.CorruptSst;
+    if (!std.mem.eql(u8, footer[0..file_magic.len], file_magic)) return error.InvalidSst;
+    const v1 = parseV1Fields(footer[0..footer_len_v1]);
+    if (v1.version != 1) return error.UnsupportedSst;
+    return .{
+        .version = v1.version,
+        .index_offset = v1.index_offset,
+        .index_size = v1.index_size,
+        .entry_count = v1.entry_count,
+        .bloom_offset = 0,
+        .bloom_size = 0,
+        .is_v2 = false,
+    };
+}
+
+/// Read-only view of one SST file. The index and the Bloom filter block are
+/// loaded and validated eagerly; data blocks are read on demand and validated
+/// block by block.
 pub const Reader = struct {
     gpa: Allocator,
     io: Io,
     file: Io.File,
     index: std.ArrayList(IndexEntry),
+    /// Full-key Bloom filter (roadmap Phase 5). A no-op filter (num_bits 0)
+    /// for v1 files and empty SSTs: every lookup probes.
+    bloom: bloom.Filter,
     entry_count: u64,
 
     pub fn open(gpa: Allocator, io: Io, dir: Io.Dir, name: []const u8) !Reader {
         var file = try dir.openFile(io, name, .{ .mode = .read_only });
         errdefer file.close(io);
         const file_len = try file.length(io);
-        if (file_len < footer_len) return error.InvalidSst;
-
-        var footer: [footer_len]u8 = undefined;
-        if (try file.readPositionalAll(io, &footer, file_len - footer_len) != footer_len) return error.CorruptSst;
-        if (!std.mem.eql(u8, footer[0..file_magic.len], file_magic)) return error.InvalidSst;
-        const version = std.mem.readInt(u32, footer[file_magic.len..][0..4], .little);
-        if (version != format_version) return error.UnsupportedSst;
-        const index_offset = std.mem.readInt(u64, footer[file_magic.len + 4 ..][0..8], .little);
-        const index_size = std.mem.readInt(u64, footer[file_magic.len + 12 ..][0..8], .little);
-        const entry_count = std.mem.readInt(u64, footer[file_magic.len + 20 ..][0..8], .little);
-
-        if (index_size > max_block_size) return error.CorruptSst;
-        const index_bytes = try readBlock(gpa, io, &file, index_offset, index_size);
+        const fields = try parseFooter(io, &file, file_len);
+        if (fields.index_size > max_block_size) return error.CorruptSst;
+        if (fields.bloom_size > max_block_size) return error.CorruptSst;
+        if (fields.bloom_size != 0 and fields.bloom_offset + fields.bloom_size > file_len) return error.CorruptSst;
+        const index_bytes = try readBlock(gpa, io, &file, fields.index_offset, fields.index_size);
         defer gpa.free(index_bytes);
+
+        var bloom_filter: bloom.Filter = .{ .bits = try gpa.alloc(u64, 0), .num_bits = 0, .k = 0 };
+        errdefer bloom_filter.deinit(gpa);
+        if (fields.bloom_size != 0) {
+            const bloom_bytes = try readBlock(gpa, io, &file, fields.bloom_offset, fields.bloom_size);
+            defer gpa.free(bloom_bytes);
+            bloom_filter = try bloom.Filter.decode(gpa, bloom_bytes[0 .. bloom_bytes.len - crc_len]);
+        }
 
         var index: std.ArrayList(IndexEntry) = .empty;
         errdefer {
@@ -260,15 +395,38 @@ pub const Reader = struct {
             try index.append(gpa, .{ .last_key = last_key, .offset = offset, .size = size });
         }
         if (pos + crc_len != index_bytes.len) return error.CorruptSst;
-        if (entry_count == 0 and index.items.len != 0) return error.CorruptSst;
-        return .{ .gpa = gpa, .io = io, .file = file, .index = index, .entry_count = entry_count };
+        if (fields.entry_count == 0 and index.items.len != 0) return error.CorruptSst;
+        return .{ .gpa = gpa, .io = io, .file = file, .index = index, .bloom = bloom_filter, .entry_count = fields.entry_count };
     }
 
     pub fn deinit(self: *Reader) void {
         for (self.index.items) |*entry| entry.deinit(self.gpa);
         self.index.deinit(self.gpa);
+        self.bloom.deinit(self.gpa);
         self.file.close(self.io);
         self.* = undefined;
+    }
+
+    /// Cheap "might `user_key` be in this file?" probe that reads only the
+    /// footer and the Bloom filter block, not the index (roadmap Phase 5).
+    /// Returns true when the file is v1, carries no filter, or fails any
+    /// quick validation, so the caller still probes the file and a full open
+    /// surfaces the real error. The store's point lookup uses this to skip a
+    /// file whose filter definitively rejects the key.
+    pub fn mayContainKey(gpa: Allocator, io: Io, dir: Io.Dir, name: []const u8, user_key: []const u8) !bool {
+        var file = try dir.openFile(io, name, .{ .mode = .read_only });
+        defer file.close(io);
+        const file_len = try file.length(io);
+        // Any validation doubt probes: the caller then opens the file fully and
+        // the real error surfaces there.
+        const fields = parseFooter(io, &file, file_len) catch return true;
+        if (!fields.is_v2 or fields.bloom_size == 0) return true;
+        if (fields.bloom_size > max_block_size or fields.bloom_offset + fields.bloom_size > file_len) return true;
+        const bloom_bytes = try readBlock(gpa, io, &file, fields.bloom_offset, fields.bloom_size);
+        defer gpa.free(bloom_bytes);
+        var filter = try bloom.Filter.decode(gpa, bloom_bytes[0 .. bloom_bytes.len - crc_len]);
+        defer filter.deinit(gpa);
+        return filter.mayContain(user_key);
     }
 
     pub fn count(self: *const Reader) u64 {
@@ -292,6 +450,9 @@ pub const Reader = struct {
     /// visibility. The caller owns the returned key/value bytes.
     pub fn find(self: *Reader, gpa: Allocator, io: Io, user_key: []const u8) !?Entry {
         if (self.index.items.len == 0) return null;
+        // The full-key Bloom filter (roadmap Phase 5): a definitive "absent"
+        // answer skips the index binary search and the data-block read.
+        if (!self.bloom.mayContain(user_key)) return null;
         const seek = try codec.seekKey(gpa, user_key);
         defer gpa.free(seek);
 
@@ -621,4 +782,168 @@ test "sst rejects bad magic, unsupported version, and corrupt blocks" {
         try file.setLength(io, footer_len - 1);
     }
     try std.testing.expectError(error.InvalidSst, Reader.open(gpa, io, dir, name));
+}
+
+/// Frame `entries` (internal keys) into a version-1 SST with the pre-filter
+/// layout: one data block, one index block, a 40-byte v1 footer. Used to prove
+/// that the current reader still reads files written before format version 2.
+fn writeV1Sst(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8, entries: []const struct { key: []const u8, value: []const u8 }) !void {
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(gpa);
+    var index: std.ArrayList(u8) = .empty;
+    defer index.deinit(gpa);
+    var last_key: []const u8 = undefined;
+    for (entries) |e| {
+        var len_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len_bytes, @intCast(e.key.len), .little);
+        try block.appendSlice(gpa, &len_bytes);
+        try block.appendSlice(gpa, e.key);
+        std.mem.writeInt(u32, &len_bytes, @intCast(e.value.len), .little);
+        try block.appendSlice(gpa, &len_bytes);
+        try block.appendSlice(gpa, e.value);
+        last_key = e.key;
+    }
+    const data_len = block.items.len + crc_len;
+    const data_bytes = try gpa.alloc(u8, data_len);
+    defer gpa.free(data_bytes);
+    @memcpy(data_bytes[0..block.items.len], block.items);
+    std.mem.writeInt(u32, data_bytes[block.items.len..][0..4], blockCrc(block.items), .little);
+
+    var len_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, @intCast(last_key.len), .little);
+    try index.appendSlice(gpa, &len_bytes);
+    try index.appendSlice(gpa, last_key);
+    var num_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &num_bytes, 0, .little);
+    try index.appendSlice(gpa, &num_bytes);
+    std.mem.writeInt(u64, &num_bytes, data_len, .little);
+    try index.appendSlice(gpa, &num_bytes);
+    const index_len = index.items.len + crc_len;
+    const index_bytes = try gpa.alloc(u8, index_len);
+    defer gpa.free(index_bytes);
+    @memcpy(index_bytes[0..index.items.len], index.items);
+    std.mem.writeInt(u32, index_bytes[index.items.len..][0..4], blockCrc(index.items), .little);
+
+    var file = try dir.createFile(io, name, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, data_bytes, 0);
+    try file.writePositionalAll(io, index_bytes, data_len);
+
+    var footer: [footer_len_v1]u8 = undefined;
+    @memcpy(footer[0..file_magic.len], file_magic);
+    std.mem.writeInt(u32, footer[file_magic.len..][0..4], 1, .little);
+    std.mem.writeInt(u64, footer[file_magic.len + 4 ..][0..8], data_len, .little);
+    std.mem.writeInt(u64, footer[file_magic.len + 12 ..][0..8], index_len, .little);
+    std.mem.writeInt(u64, footer[file_magic.len + 20 ..][0..8], entries.len, .little);
+    try file.writePositionalAll(io, &footer, data_len + index_len);
+}
+
+test "sst v2 files carry a bloom filter that skips absent keys" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = try openTestDir(io);
+    defer {
+        dir.close(io);
+        Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    }
+
+    const name = "sst_bloom.sst";
+    var builder = try Builder.create(gpa, io, dir, name);
+    defer builder.deinit();
+    const alpha = try codec.internalKey(gpa, "alpha", 1, .put);
+    defer gpa.free(alpha);
+    const omega = try codec.internalKey(gpa, "omega", 2, .put);
+    defer gpa.free(omega);
+    try builder.add(alpha, "a");
+    try builder.add(omega, "z");
+    _ = try builder.finish();
+
+    // The cheap probe answers definitively for absent keys and opens no index.
+    try std.testing.expect(try Reader.mayContainKey(gpa, io, dir, name, "alpha"));
+    try std.testing.expect(try Reader.mayContainKey(gpa, io, dir, name, "omega"));
+    try std.testing.expect(!(try Reader.mayContainKey(gpa, io, dir, name, "absent")));
+
+    // The full reader agrees, and the filter block is loaded and validated.
+    var reader = try Reader.open(gpa, io, dir, name);
+    defer reader.deinit();
+    const hit = (try reader.find(gpa, io, "alpha")).?;
+    defer {
+        gpa.free(@constCast(hit.key));
+        gpa.free(@constCast(hit.value));
+    }
+    try std.testing.expect((try reader.find(gpa, io, "absent")) == null);
+}
+
+test "sst reads version 1 files without a bloom filter" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = try openTestDir(io);
+    defer {
+        dir.close(io);
+        Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    }
+
+    const v1 = try codec.internalKey(gpa, "v1", 1, .put);
+    defer gpa.free(v1);
+    const v2 = try codec.internalKey(gpa, "v2", 2, .put);
+    defer gpa.free(v2);
+    try writeV1Sst(gpa, io, dir, "sst_v1.sst", &.{
+        .{ .key = v1, .value = "one" },
+        .{ .key = v2, .value = "two" },
+    });
+
+    // A v1 file has no filter, so the probe always probes and the reader
+    // loads a no-op filter: lookups keep working.
+    try std.testing.expect(try Reader.mayContainKey(gpa, io, dir, "sst_v1.sst", "absent"));
+    var reader = try Reader.open(gpa, io, dir, "sst_v1.sst");
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u64, 2), reader.count());
+    try std.testing.expectEqual(@as(u64, 0), reader.bloom.num_bits);
+    const hit = (try reader.find(gpa, io, "v2")).?;
+    defer {
+        gpa.free(@constCast(hit.key));
+        gpa.free(@constCast(hit.value));
+    }
+    try std.testing.expectEqualStrings("two", hit.value);
+    try std.testing.expect((try reader.find(gpa, io, "absent")) == null);
+}
+
+test "sst rejects a corrupt bloom filter block" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = try openTestDir(io);
+    defer {
+        dir.close(io);
+        Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    }
+
+    const name = "sst_bloom_corrupt.sst";
+    {
+        var builder = try Builder.create(gpa, io, dir, name);
+        defer builder.deinit();
+        const k1 = try codec.internalKey(gpa, "k1", 1, .put);
+        defer gpa.free(k1);
+        const k2 = try codec.internalKey(gpa, "k2", 2, .put);
+        defer gpa.free(k2);
+        try builder.add(k1, "v1");
+        try builder.add(k2, "v2");
+        _ = try builder.finish();
+    }
+
+    // Locate the filter block from the footer and corrupt one of its bytes.
+    var file = try dir.openFile(io, name, .{ .mode = .read_write });
+    defer file.close(io);
+    const len = try file.length(io);
+    var footer: [footer_len]u8 = undefined;
+    _ = try file.readPositionalAll(io, &footer, len - footer_len);
+    const bloom_offset = std.mem.readInt(u64, footer[bloom_offset_pos..][0..8], .little);
+    const bloom_size = std.mem.readInt(u64, footer[bloom_size_pos..][0..8], .little);
+    try std.testing.expect(bloom_size > 0);
+    var byte: [1]u8 = undefined;
+    _ = try file.readPositionalAll(io, &byte, bloom_offset + bloom_size / 2);
+    byte[0] ^= 0xFF;
+    try file.writePositionalAll(io, &byte, bloom_offset + bloom_size / 2);
+
+    // The filter block CRC fails at open, before any read can trust it.
+    try std.testing.expectError(error.CorruptSst, Reader.open(gpa, io, dir, name));
 }

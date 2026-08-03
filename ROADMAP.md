@@ -295,15 +295,21 @@ catalog records. The checkpoint flushes every primary-key table before its WAL
 rewrite, so the WAL tail no longer carries flushed rows. Heap tables (no
 single-column primary key) and document/graph/evidence objects remain WAL-only.
 Point and range read paths exist behind the storage boundary, exercised by
-recovery, compaction, and direct tests. The MVCC retention half remains
-implemented as before: row versions carry a creation commit sequence,
-superseded versions are retained with a deletion interval, the engine tracks
-`oldest_active_snapshot_seq` through a bounded snapshot registry, reads
-interpret only versions committed at or before their starting watermark, and
-reclamation frees only versions invisible to every active snapshot — with
-deterministic restart, recovery, point/range, and snapshot-safety coverage.
-The remaining work below is the in-memory skiplist MemTable with Bloom
-filters, secondary indexes, background flush/compaction scheduling with
+recovery, compaction, and direct tests. The SST format (version 2, with
+version 1 still readable) now carries a full-key Bloom filter block
+(`lsm/bloom.zig`) built from the file's user keys at flush and compaction
+write time; point lookups consult it before probing a file, so a definitive
+"absent" answer skips the index and data-block reads (`Reader.mayContainKey`),
+and `Store.point_lookup_bloom_skips` counts the skipped files with
+deterministic L0/L1, v1-compatibility, and corrupt-filter regressions. The
+MVCC retention half remains implemented as before: row versions carry a
+creation commit sequence, superseded versions are retained with a deletion
+interval, the engine tracks `oldest_active_snapshot_seq` through a bounded
+snapshot registry, reads interpret only versions committed at or before their
+starting watermark, and reclamation frees only versions invisible to every
+active snapshot — with deterministic restart, recovery, point/range, and
+snapshot-safety coverage. The remaining work below is the in-memory skiplist
+MemTable, secondary indexes, background flush/compaction scheduling with
 backpressure, and benchmark baselines.
 
 **Goal:** Move table and index storage from the in-memory baseline to ordered,
