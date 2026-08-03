@@ -2,9 +2,15 @@
 
 ## Status
 
-Accepted target design. This ADR changes target contracts only. It does not
-describe an implemented capability of the current single-instance OLTP
-baseline.
+**Frozen.** The MEMO (Memory as a Model) design in this ADR is frozen: it is
+not an active target design and will not be implemented in the current
+baseline. It is no longer a candidate surface for Runa Flow, Runa Query IR, or
+the RunaDB Wire Protocol.
+
+The remainder of this ADR is the historical record of the accepted proposal.
+Reviving any part of the design requires a new ADR that redefines its
+contracts, recovery, observability, compatibility, and tests. No code was
+implemented against this design.
 
 ## Context
 
@@ -35,11 +41,12 @@ not an Agent's operational memory or a path to maintenance actions.
 
 ## Decision
 
-RunaDB's future memory capability is **MEMO**: knowledge is encoded into a
-dedicated, compact **Memory model**, and a frozen reasoning model retrieves
-from it through a structured query protocol. MEMO replaces the frozen
-embedding and RAG primitives of ADR-0020 as the retrieval and memory
-capability.
+This ADR recorded **MEMO** as RunaDB's proposed memory capability: knowledge
+encoded into a dedicated, compact **Memory model**, with a reasoning model
+retrieving from it through a structured query protocol. MEMO was proposed to
+replace the frozen embedding and RAG primitives of ADR-0020 as the retrieval
+and memory capability. The design is frozen (see Status) and is not an active
+target.
 
 ### Roles
 
@@ -183,9 +190,9 @@ artifact never presents itself as current factual state.
 
 ## Consequences
 
-- MEMO supersedes ADR-0020's embedding and RAG primitives as the retrieval
-  and memory capability; ADR-0020 remains the frozen record of those
-  primitives.
+- MEMO is frozen (see Status). ADR-0020's embedding and RAG primitives and
+  ADR-0022's MEMO design are both historical records; neither is an active
+  retrieval or memory capability.
 - A memory artifact is versioned World Continuum state: its reflection
   dataset, Representation Chart, and model/provenance metadata require
   explicit recovery and migration formats before persistence.
@@ -204,6 +211,10 @@ artifact never presents itself as current factual state.
   out-of-domain artifact never presents itself as current factual state.
 
 ## Delivery
+
+None. MEMO is frozen (see Status) and not scheduled for implementation. The
+numbered steps below are retained as the historical record of what the
+proposal required before it could become a public capability:
 
 1. Define the versioned reflection dataset and memory artifact formats, their
    Representation Chart, provenance, recovery, and migration behavior, together

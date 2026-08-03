@@ -23,9 +23,9 @@ The two-phase write-path and transaction-commit model is in [Write Path and Writ
 ## Rationale, Tradeoffs, and Non-Goals
 
 Accepted ADR-0001, ADR-0004 through ADR-0007, ADR-0009 through ADR-0011, and
-the target designs in ADR-0015, ADR-0017, ADR-0018, ADR-0019, ADR-0021, and
-ADR-0022 constrain this architecture; ADR-0017 supersedes the earlier
-SQL-language decisions. Priorities are:
+the target designs in ADR-0015, ADR-0017, ADR-0018, ADR-0019, and ADR-0021
+constrain this architecture (ADR-0022 is frozen); ADR-0017 supersedes the
+earlier SQL-language decisions. Priorities are:
 
 1. Commit semantics remain recoverable after a crash, and unknown formats or corrupt complete records are never interpreted speculatively.
 2. The write path remains predictable under contention, with one observable commit order.

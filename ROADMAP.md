@@ -61,9 +61,10 @@ State Fields, Representation Charts, Causal Dynamics, and Counterfactual
 Branches. Relation, document, key-value, media, vector, sensor, and agent-memory
 forms become views or bindings within that model, not competing stores.
 ADR-0019 delivers the first persistent slice of that model: immutable
-Observation Evidence payload storage. ADR-0022 defines **MEMO (Memory as a
-Model)** as the future retrieval and memory capability, replacing the embedding
-and RAG primitives that ADR-0020 permanently froze and deprecated.
+Observation Evidence payload storage. ADR-0022 defined **MEMO (Memory as a
+Model)** as a proposed retrieval and memory capability; the design is frozen
+and is not an active target. The embedding and RAG primitives of ADR-0020
+remain permanently frozen and deprecated.
 
 Those are design commitments, not implementation claims or a phase sequence.
 Each capability enters the delivery roadmap only after a focused ADR defines
@@ -508,10 +509,10 @@ changes the product direction:
   production default.
 
 World Continuum forms beyond the implemented Observation Evidence slice
-(ADR-0018) and the MEMO retrieval capability (ADR-0022) are accepted target
-contracts; they are described in [Long-Horizon Direction](#long-horizon-direction)
-and enter the delivery sequence only after their focused verification work is
-specified.
+(ADR-0018) are accepted target contracts; they are described in
+[Long-Horizon Direction](#long-horizon-direction) and enter the delivery
+sequence only after their focused verification work is specified. The MEMO
+retrieval capability (ADR-0022) is frozen and is not an accepted target.
 
 ## Change Control
 

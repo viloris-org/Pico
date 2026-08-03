@@ -247,37 +247,42 @@ constraints, or reasoning. Symbolic results remain the source of truth for
 precise logic and access decisions.
 
 **MEMO (Memory as a Model)**:
-RunaDB's target memory and retrieval capability, per ADR-0022. Knowledge from
-a target corpus is encoded into a compact **Memory model**; a frozen reasoning
-model (**Executive model**) retrieves from it through a structured multi-turn
+Frozen target design, per ADR-0022; not an active capability and not
+implemented in the current baseline. The design encodes knowledge from a
+target corpus into a compact **Memory model** and has a reasoning model
+(**Executive model**) retrieve from it through a structured multi-turn
 protocol. A **reflection** is a self-contained, corpus-derived question-answer
-pair used to train the Memory model. MEMO replaces the frozen embedding and
-RAG primitives of ADR-0020.
+pair used to train the Memory model. MEMO was proposed to replace the frozen
+embedding and RAG primitives of ADR-0020; both are now frozen.
 _Avoid_: Retrieval-augmented generation, embedding index, vector search as the
 current or future public retrieval capability
 
 **Reflection**:
-A self-contained, corpus-derived question-answer pair that exposes underlying
-corpus knowledge without requiring access to the source document. Reflections
-are derived training representations, not Observation Evidence.
+Part of the frozen MEMO design (ADR-0022): a self-contained, corpus-derived
+question-answer pair that would expose underlying corpus knowledge without
+requiring access to the source document. Reflections are derived training
+representations, not Observation Evidence.
 _Avoid_: Ground truth, factual record
 
 **Memory Model**:
-The compact model trained to answer from its parameters alone, encoding
-knowledge from a target corpus as a learned State Field. Its Representation
-Chart declares the training corpus, Generator model lineage, coverage,
-uncertainty, and compatibility rules.
+Part of the frozen MEMO design (ADR-0022): the compact model that would be
+trained to answer from its parameters alone, encoding knowledge from a target
+corpus as a learned State Field. Its Representation Chart declares the
+training corpus, Generator model lineage, coverage, uncertainty, and
+compatibility rules.
 _Avoid_: Vector index, retrieval cache, embedding store
 
 **Executive Model**:
-The frozen reasoning model that answers user queries by querying the Memory
-model through the MEMO retrieval protocol. It is treated as a black box;
-RunaDB does not access its weights, gradients, or output logits.
+Part of the frozen MEMO design (ADR-0022): the reasoning model that would
+answer user queries by querying the Memory model through the MEMO retrieval
+protocol. It is treated as a black box; RunaDB does not access its weights,
+gradients, or output logits.
 _Avoid_: Hosted model, in-process inference on the critical path
 
 **Generator Model**:
-The external LLM used offline to distill a target corpus into a reflection QA
-dataset for Memory model training. It may be smaller than the Executive model.
+Part of the frozen MEMO design (ADR-0022): the external LLM that would
+distill a target corpus into a reflection QA dataset for Memory model
+training. It may be smaller than the Executive model.
 _Avoid_: Retrieval model, ranker, in-database inference
 
 **Consistency Level**:

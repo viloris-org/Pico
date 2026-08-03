@@ -11,10 +11,9 @@ The internal/library slice remains implemented and tested with WAL v4
 recovery, but only as frozen internal state: it is not extended, not exposed
 through the wire protocol, and not documented as supported.
 
-Future retrieval and memory needs are designed as **MEMO (Memory as a
-Model)** in ADR-0022. MEMO must define its Representation Chart,
-model/provenance metadata, WAL and recovery format, resource limits, and
-protocol version before it becomes a public query capability.
+The **MEMO (Memory as a Model)** design in ADR-0022 is likewise frozen; no
+memory or retrieval capability is currently an active product target. Any
+future memory or retrieval capability must be introduced by a new ADR.
 
 ## Decision
 
@@ -29,11 +28,10 @@ The server does not infer embeddings, execute a model, or build an on-disk
 vector index in this slice. Observation Evidence remains
 the factual input; an embedding is a derived representation supplied by an
 external component. No future persisted representation, Flow/IR operation, or
-wire-protocol surface will be built on these primitives. Any retrieval or
-memory capability is **MEMO (Memory as a Model)** per ADR-0022, which must
-define its Representation Chart, model/provenance metadata, WAL and recovery
-format, resource limits, and protocol version before becoming a public query
-capability.
+wire-protocol surface will be built on these primitives. The **MEMO (Memory
+as a Model)** design in ADR-0022 is likewise frozen; no memory or retrieval
+capability is an active product target, and any future capability must be
+introduced by a new ADR.
 
 ## Evidence
 
