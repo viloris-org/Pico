@@ -78,10 +78,6 @@ pub const Stats = struct {
     recovery_orphan_bytes: u64 = 0,
     // Reclamation
     files_reclaimed: u64 = 0,
-    // Point lookups (roadmap Phase 5): files whose full-key Bloom filter
-    // definitively rejected the probe key, so the index and data blocks were
-    // never read. Never exposes row contents.
-    point_lookup_bloom_skips: u64 = 0,
 };
 
 pub const Error = error{
@@ -723,8 +719,10 @@ pub const Store = struct {
 
         result.ran = true;
         result.output_files = new_files.items.len;
-        try self.installCompactedFiles(gpa, table_name, input_numbers.items, &new_files);
+        // Sum the output bytes before `installCompactedFiles` transfers file
+        // ownership into the version set and empties the caller's list.
         for (new_files.items) |f| result.output_bytes += f.size;
+        try self.installCompactedFiles(gpa, table_name, input_numbers.items, &new_files);
         self.stats.compaction_runs += 1;
         self.stats.compaction_input_files += result.input_files;
         self.stats.compaction_input_bytes += result.input_bytes;
@@ -817,14 +815,16 @@ pub const Store = struct {
         const seek = try codec.seekKey(gpa, user_key);
         defer gpa.free(seek);
 
-        // L0: ranges overlap; the newest file is authoritative. The Bloom
-        // filter (roadmap Phase 5) skips a file whose filter definitively
-        // rejects the key before its index is even read.
+        // L0: ranges overlap; the newest file is authoritative. `findInFile`
+        // consults the full-key Bloom filter (roadmap Phase 5) before reading
+        // any data block, so a file whose filter rejects the key is probed
+        // without its data-block I/O. (A separate pre-probe that skipped the
+        // index read measured slower for present keys than the data-block
+        // savings were worth; the Pager/static cache is the future fix.)
         var i: usize = meta.levels[level0].items.len;
         while (i > 0) {
             i -= 1;
             const f = meta.levels[level0].items[i];
-            if (!try self.readerMayContain(gpa, f.number, user_key)) continue;
             if (try self.findInFile(gpa, f.number, user_key)) |entry| return entry;
         }
         // L1: non-overlapping, binary search by last key.
@@ -843,21 +843,20 @@ pub const Store = struct {
         }
         if (hit) |idx| {
             const f = l1[idx];
-            if (codec.internalLessThan(f.first_key, seek) or std.mem.eql(u8, f.first_key, seek)) {
-                if (!try self.readerMayContain(gpa, f.number, user_key)) return null;
+            // The file's internal keys span [first, last]; it may contain
+            // `user_key` only when the user-key range covers it. Comparing
+            // against the seek key directly would reject a file whose first
+            // key is the sought user key, because a seek key sorts before
+            // every internal key of its user key.
+            const first_user = codec.userKeyOf(f.first_key);
+            const last_user = codec.userKeyOf(f.last_key);
+            if (std.mem.order(u8, first_user, user_key) != .gt and
+                std.mem.order(u8, last_user, user_key) != .lt)
+            {
                 if (try self.findInFile(gpa, f.number, user_key)) |entry| return entry;
             }
         }
         return null;
-    }
-
-    /// Whether `number`'s Bloom filter leaves `user_key` possible. Counts a
-    /// definitive miss as a skip; files without a filter (v1, empty) always
-    /// probe.
-    fn readerMayContain(self: *Store, gpa: Allocator, number: u64, user_key: []const u8) !bool {
-        const maybe = try sstable.Reader.mayContainKey(gpa, self.io, self.dir, &fileName(number), user_key);
-        if (!maybe) self.stats.point_lookup_bloom_skips += 1;
-        return maybe;
     }
 
     fn findInFile(self: *Store, gpa: Allocator, number: u64, user_key: []const u8) !?Entry {
@@ -1335,7 +1334,7 @@ test "recovery reclaims orphan sst files and rejects a corrupt manifest" {
     try std.testing.expectError(error.InvalidLsmManifest, broken.loadFromDisk(gpa));
 }
 
-test "point lookups skip files whose bloom filter rejects the key" {
+test "point lookups resolve present, tombstoned, and absent keys across levels" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const dir = test_dir ++ "-bloom-skip";
@@ -1346,8 +1345,7 @@ test "point lookups skip files whose bloom filter rejects the key" {
     }
 
     // Flush 1 materializes keys 1..3; flush 2 keeps 1 and 3 and tombstones
-    // key 2. Both files' filters therefore cover 1..3, so the L0 filter can
-    // only skip a key absent from the whole table.
+    // key 2. Both files' filters therefore cover 1..3.
     var first = [_]table_mod.Row{
         try makeRow(gpa, 1, 10, 1),
         try makeRow(gpa, 2, 20, 2),
@@ -1366,24 +1364,25 @@ test "point lookups skip files whose bloom filter rejects the key" {
     try store.publishManifest(gpa);
     try std.testing.expectEqual(@as(usize, 2), store.tables.get("t").?.levels[0].items.len);
 
-    // A present key resolves in the newest file without any skip.
+    // A present key resolves in the newest file to its newest put.
     const key3 = codec.encodeIntKey(3);
     var hit3 = (try store.pointLookup(gpa, "t", &key3)).?;
     defer hit3.deinit(gpa);
     try std.testing.expect(!hit3.is_delete);
-    try std.testing.expectEqual(@as(u64, 0), store.stats.point_lookup_bloom_skips);
 
-    // A key absent from the whole table is rejected by both L0 files.
+    // A key absent from the whole table is rejected across both L0 files.
     const missing = codec.encodeIntKey(99);
     try std.testing.expect((try store.pointLookup(gpa, "t", &missing)) == null);
-    try std.testing.expectEqual(@as(u64, 2), store.stats.point_lookup_bloom_skips);
 
     // Compaction resolves key 2's tombstone and drops it; the compacted L1
-    // file spans keys 1..3 but no longer contains 2, so the filter rejects it
-    // right after the range check (one more skip).
+    // file spans keys 1..3 but no longer contains 2, so the point lookup
+    // returns nothing after the range check and the filter rejection.
     const compacted = try store.compactTable(gpa, "t");
     try std.testing.expect(compacted.ran);
     const key2 = codec.encodeIntKey(2);
     try std.testing.expect((try store.pointLookup(gpa, "t", &key2)) == null);
-    try std.testing.expectEqual(@as(u64, 3), store.stats.point_lookup_bloom_skips);
+    const key1 = codec.encodeIntKey(1);
+    var hit1 = (try store.pointLookup(gpa, "t", &key1)).?;
+    defer hit1.deinit(gpa);
+    try std.testing.expect(!hit1.is_delete);
 }

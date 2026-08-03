@@ -298,19 +298,27 @@ Point and range read paths exist behind the storage boundary, exercised by
 recovery, compaction, and direct tests. The SST format (version 2, with
 version 1 still readable) now carries a full-key Bloom filter block
 (`lsm/bloom.zig`) built from the file's user keys at flush and compaction
-write time; point lookups consult it before probing a file, so a definitive
-"absent" answer skips the index and data-block reads (`Reader.mayContainKey`),
-and `Store.point_lookup_bloom_skips` counts the skipped files with
-deterministic L0/L1, v1-compatibility, and corrupt-filter regressions. The
+write time; point lookups consult it before reading a data block, so a
+definitive "absent" answer skips the index search and data-block read
+(`Reader.find`), with deterministic v1-compatibility, corrupt-filter,
+block-boundary, and L0/L1 point-lookup regressions. A store-level pre-probe
+was measured and dropped: it read the filter block twice per lookup and made
+present-key lookups 1.75x slower than the data-block savings were worth, so
+`Reader.mayContainKey` remains as a footer+filter probe for a future table
+cache. The
 MVCC retention half remains implemented as before: row versions carry a
 creation commit sequence, superseded versions are retained with a deletion
 interval, the engine tracks `oldest_active_snapshot_seq` through a bounded
 snapshot registry, reads interpret only versions committed at or before their
 starting watermark, and reclamation frees only versions invisible to every
 active snapshot — with deterministic restart, recovery, point/range, and
-snapshot-safety coverage. The remaining work below is the in-memory skiplist
-MemTable, secondary indexes, background flush/compaction scheduling with
-backpressure, and benchmark baselines.
+snapshot-safety coverage. The `runa-lsm-bench` harness records a first
+baseline (durable inserts with per-batch flush, compaction, present/absent
+point lookups, and restart recovery) in
+docs/benchmarks/lsm-baseline-2026-08-02.md. The remaining work below is the
+in-memory skiplist MemTable, secondary indexes, background flush/compaction
+scheduling with backpressure, and benchmark baselines across more workloads
+and durability levels.
 
 **Goal:** Move table and index storage from the in-memory baseline to ordered,
 recoverable LSM structures while preserving snapshot visibility.

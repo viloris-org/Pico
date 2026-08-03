@@ -99,6 +99,21 @@ pub fn build(b: *std.Build) void {
     const run_wal_bench = b.addRunArtifact(wal_bench_exe);
     wal_bench_step.dependOn(&run_wal_bench.step);
 
+    const lsm_bench_exe = b.addExecutable(.{
+        .name = "runa-lsm-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lsm_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "runadb", .module = mod },
+            },
+        }),
+    });
+    const lsm_bench_step = b.step("lsm-bench", "Run LSM baseline benchmarks");
+    const run_lsm_bench = b.addRunArtifact(lsm_bench_exe);
+    lsm_bench_step.dependOn(&run_lsm_bench.step);
+
     // ── CLI binary ──
 
     const cli_exe = b.addExecutable(.{

@@ -123,7 +123,7 @@ exact framing.
 
 - Full-key Bloom filter over the user keys of the entries in the file, with no false negatives and a bounded false positive rate (~1% at the default 10 bits/key).
 - The filter block sits between the index block and the footer, is CRC-protected, and is loaded and validated when the file is opened.
-- Point lookups consult the filter before probing a file: `Reader.find` skips the index search and data-block read on a definitive absent answer, and `Store.pointLookup` uses `Reader.mayContainKey` to skip a file entirely before its index is read (`store.zig` counts these skips in `Stats.point_lookup_bloom_skips`).
+- Point lookups consult the filter before reading a data block: `Reader.find` skips the index search and data-block read on a definitive absent answer, so `Store.pointLookup` probes a file without its data-block I/O. `Reader.mayContainKey` exposes the same filter as a cheap footer+filter probe for a future table cache. (A store-level pre-probe measured slower for present keys than the data-block savings were worth on this no-cache design; the Pager/static page cache is the planned fix.)
 
 ---
 
@@ -162,7 +162,7 @@ The exact-key lookup path (for a primary-key equality predicate) is:
 
 1. **Active MemTable**: query the in-memory table's primary-key index. If found, return the newest version.
 2. **Immutable MemTables**: search from newest to oldest. Return on the first match.
-3. **L0 SST**: search from newest to oldest (L0 ranges may overlap). Check the Bloom filter first (`Reader.mayContainKey`); a definitive absent answer skips the file without reading its index.
+3. **L0 SST**: search from newest to oldest (L0 ranges may overlap). Check the Bloom filter first; a definitive absent answer skips the data-block read.
 4. **L1..L{N} SST**: use binary search to locate SST files that may contain the key (ranges do not overlap within a level), then check the Bloom filter and read the relevant data block.
 
 Return the first visible version found; if every level returns a tombstone, treat the key as nonexistent.
@@ -268,7 +268,7 @@ During startup recovery:
 | SST format | Block-indexed SSTables with per-block CRC and a full-key Bloom filter block (`lsm/sstable.zig`, format v2; v1 still read) | Prefix compression + optional block compression |
 | Compaction | L0 + overlapping L1 -> sorted non-overlapping L1 (`lsm/store.zig`) | Size-tiered all-level compaction |
 | Manifest | Versioned LSM version-set manifest, atomically rewritten (`lsm/manifest.zig`) | Append-style version_edit records with snapshot tracking |
-| Bloom filter | Full-key filter written on flush, checked on point lookups (`lsm/bloom.zig`, `Store.point_lookup_bloom_skips`) | Optional prefix filter, block-level filters |
+| Bloom filter | Full-key filter written on flush, checked before data-block reads on point lookups (`lsm/bloom.zig`, `sstable.zig`) | Optional prefix filter, block-level filters, table cache |
 | Memory limit control | None | WriteBufferManager / write stall |
 | Secondary indexes | Not implemented | Independent LSM structures, then covering indexes (Index-Only Scan) |
 

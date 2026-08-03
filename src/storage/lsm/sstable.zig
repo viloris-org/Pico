@@ -150,8 +150,6 @@ pub const Builder = struct {
             if (!codec.internalLessThan(last, key)) return error.InvalidSst;
         }
         if (self.first_key == null) self.first_key = try self.gpa.dupe(u8, key);
-        if (self.last_key) |last| self.gpa.free(last);
-        self.last_key = try self.gpa.dupe(u8, key);
         // The filter is keyed on user keys: within one file a user key appears
         // at most once, and point lookups probe by user key. Keys shorter than
         // the suffix carry no user-key portion (raw byte keys used by builder
@@ -162,10 +160,17 @@ pub const Builder = struct {
 
         const entry_len = 4 + key.len + 4 + entry_value.len;
         // Flush the current block once adding this entry would exceed the
-        // target size and the block is non-empty.
+        // target size and the block is non-empty. `finishBlock` records the
+        // index entry under the block's true last key, so `last_key` must
+        // still be the previous entry's key here; it is updated only after
+        // the flush decision. Recording the incoming key instead made the
+        // index point at the next block's first key and point lookups missed
+        // keys at block boundaries.
         if (self.block.items.len != 0 and self.block.items.len + entry_len > self.block_size) {
             try self.finishBlock();
         }
+        if (self.last_key) |last| self.gpa.free(last);
+        self.last_key = try self.gpa.dupe(u8, key);
         try self.block.ensureUnusedCapacity(self.gpa, entry_len);
         var len_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_bytes, @intCast(key.len), .little);
@@ -872,6 +877,53 @@ test "sst v2 files carry a bloom filter that skips absent keys" {
         gpa.free(@constCast(hit.value));
     }
     try std.testing.expect((try reader.find(gpa, io, "absent")) == null);
+}
+
+test "sst find locates every key across block boundaries" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var dir = try openTestDir(io);
+    defer {
+        dir.close(io);
+        Io.Dir.cwd().deleteTree(io, test_dir) catch {};
+    }
+
+    // A tiny block size forces many blocks, so many keys land exactly at a
+    // block boundary. Every key must be found by find(): a regression for the
+    // builder recording the next block's first key as the index entry, which
+    // made the binary search land one block early and miss boundary keys.
+    const name = "sst_boundary.sst";
+    var builder = try Builder.create(gpa, io, dir, name);
+    defer builder.deinit();
+    builder.block_size = 96;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        const key = try std.fmt.allocPrint(gpa, "key-{d:0>4}", .{i});
+        defer gpa.free(key);
+        const internal = try codec.internalKey(gpa, key, @intCast(i + 1), .put);
+        defer gpa.free(internal);
+        const val = try std.fmt.allocPrint(gpa, "v-{d}", .{i});
+        defer gpa.free(val);
+        try builder.add(internal, val);
+    }
+    _ = try builder.finish();
+
+    var reader = try Reader.open(gpa, io, dir, name);
+    defer reader.deinit();
+    try std.testing.expect(reader.index.items.len > 1);
+    var found: usize = 0;
+    i = 0;
+    while (i < 300) : (i += 1) {
+        const probe = try std.fmt.allocPrint(gpa, "key-{d:0>4}", .{i});
+        defer gpa.free(probe);
+        const hit = (try reader.find(gpa, io, probe)).?;
+        defer {
+            gpa.free(@constCast(hit.key));
+            gpa.free(@constCast(hit.value));
+        }
+        found += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 300), found);
 }
 
 test "sst reads version 1 files without a bloom filter" {
