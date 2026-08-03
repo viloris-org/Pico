@@ -306,6 +306,14 @@ _Avoid_: Single-threaded (the implementation may use multiple threads while seri
 
 ### Storage Files and Execution
 
+**Payload Backend**:
+The physical mechanism that holds Observation Evidence payload bytes behind the
+ADR-0019 envelope contract. The default is immutable payload files under the
+Data Directory; an optional object-storage backend (ADR-0025) may hold the same
+envelope without changing the logical, recovery, or durability contracts.
+_Avoid_: Treating an external object-store URL as the evidence value or as a
+substitute for RunaDB persistence
+
 **VFS (Virtual File System)**:
 A storage-file abstraction bound to a **data directory**. It validates logical filenames, manages handle lifetimes, provides positional I/O and synchronization, and atomically publishes manifests, SSTables, and similar artifacts. The storage layer uses only logical names and does not construct absolute paths.
 _Avoid_: Pluggable multi-filesystem product feature, passing OS paths directly to WAL/LSM

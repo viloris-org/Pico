@@ -96,7 +96,10 @@ Payload bytes live in versioned immutable payload files under the instance's
 Data Directory. Catalog and LSM records contain the logical metadata plus a
 versioned payload reference; they do not contain an external filesystem path
 or URL. The payload reference is an internal format and is never a public
-RunaDB Wire Protocol value.
+RunaDB Wire Protocol value. An optional object-storage payload backend
+(ADR-0025) may hold the same envelope as an explicit, non-default placement;
+it is a backend, not an external reference, and does not change the logical,
+recovery, or durability contracts of this ADR.
 
 Payload files use this validated envelope:
 

@@ -48,6 +48,16 @@ through their chart. Observation Evidence remains the factual anchor; a State
 Field, learned output, simulation, or Counterfactual Branch must never silently
 replace it.
 
+Unification is a contract, not a physical requirement. A World Continuum form
+is not required to share one engine or storage substrate with other forms:
+each form may use the most suitable physical engine and storage for its data,
+provided the World Continuum query, governance, history, provenance, and
+recovery contracts are met at the boundary and no external store substitutes
+for RunaDB durability. Large multimodal payloads, for example, may be held by
+an object-storage payload backend (ADR-0025) without becoming external
+references. The single request surface is Runa Flow and Runa Query IR; physical
+bindings are versioned implementation details, never a second query language.
+
 RunaDB supports representation evolution through immutable chart versions,
 explicit validity and coverage ranges, and re-projection transitions. A new
 chart may be populated incrementally or on demand. It must report its coverage
@@ -104,6 +114,9 @@ tests before it is supported.
 - The RunaDB Wire Protocol next major version must carry the typed Runa Query
   IR forms required by this model. It must not treat opaque model output or
   unvalidated natural-language requests as executable input.
+- Physical bindings are free to use the best engine and storage per form; the
+  World Continuum contracts (query, governance, history, provenance,
+  recovery) are unified, not the physical implementation.
 - ADR-0017 remains authoritative for Runa Flow, Runa Query IR, validated
   execution, and the RunaDB Client/RunaDB Server seam. This ADR supersedes its
   future model-specific operation framing and its semantic-model assumption
