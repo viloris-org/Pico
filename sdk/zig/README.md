@@ -40,8 +40,9 @@ var conn = try sdk.Connection.connect(gpa, io, .{
 QUIC server identity is pinned: pass `server_cert_pem` (the PEM of the
 expected server certificate) and the SDK compares the SHA-256 digest of the
 presented leaf certificate, failing with `CertificateMismatch` on difference.
-Without a pin, the connection proceeds and the certificate is exposed for
-trust-on-first-use inspection (full X.509 chain validation is future work).
+Without a pin, the connection proceeds and the presented certificate's SHA-256
+digest is exposed as `Connection.server_cert_digest` for trust-on-first-use
+inspection (full X.509 chain validation is future work).
 
 ## API
 

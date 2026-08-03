@@ -32,6 +32,12 @@ pub const Connection = struct {
     io: Io,
     impl: Impl,
     server_version: []const u8,
+    /// SHA-256 digest of the server's presented leaf certificate, available
+    /// after a successful QUIC handshake for trust-on-first-use inspection
+    /// (ADR-0023 §2.3). Null on TCP and when the peer presented no
+    /// certificate. Pin verification (if `server_cert_pem` was configured)
+    /// happens in the transport before connect returns.
+    server_cert_digest: ?[32]u8 = null,
     next_upload_id: u64 = 1,
     /// Unpredictable credential received in HELLO_OK; names this Connection for
     /// the Server's cancellation routing.
@@ -61,6 +67,15 @@ pub const Connection = struct {
             },
         };
         errdefer self.deinit(io);
+
+        // Expose the QUIC server identity: the transport pinned the presented
+        // leaf against `server_cert_pem` when one was configured; surface the
+        // digest regardless so callers can implement trust-on-first-use
+        // inspection themselves.
+        switch (self.impl) {
+            .quic => |q| self.server_cert_digest = if (q.peer_cert_presented) q.peer_cert_digest else null,
+            .tcp => {},
+        }
 
         // Version negotiation: HELLO / HELLO_OK (or HELLO_ERROR) on the
         // control stream (TCP: the connection stream; QUIC: stream 0).
@@ -157,16 +172,34 @@ pub const Connection = struct {
         var payload_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
         std.crypto.hash.Blake3.hash(payload, &payload_digest, .{});
 
+        // If staging or the IR request fails after ATTACHMENT_BEGIN reached
+        // the Server, release the staged attachment with a best-effort
+        // ATTACHMENT_ABORT. The Server's abort path frees the reservation and
+        // staged bytes whether or not ATTACHMENT_FINISH already arrived; a
+        // well-formed abort against no in-flight attachment is a no-op, so it
+        // is safe on every failure path. Without it the Connection's next
+        // `observe` would be rejected with EV1001 while the stale attachment
+        // lingers until close.
+        var staged = false;
+        errdefer if (staged) abortStaging(&req, upload_id);
+
         var begin: [8 + 8 + proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
         std.mem.writeInt(u64, begin[0..8], upload_id, .big);
         std.mem.writeInt(u64, begin[8..16], payload.len, .big);
         @memcpy(begin[16..], &payload_digest);
         try req.writeMessage(.attachment_begin, &begin);
         try req.flush();
+        staged = true;
+
+        // The chunk buffer is heap-allocated and sized to the actual payload:
+        // `observe` is library code and must not assume a large call stack
+        // (a stack chunk would be 256 KiB plus framing).
+        const chunk_capacity = 8 + @min(payload.len, proto.MAX_ATTACHMENT_CHUNK_LENGTH);
+        const chunk = try self.allocator.alloc(u8, chunk_capacity);
+        defer self.allocator.free(chunk);
         var offset: usize = 0;
         while (offset < payload.len) {
             const length = @min(proto.MAX_ATTACHMENT_CHUNK_LENGTH, payload.len - offset);
-            var chunk: [8 + proto.MAX_ATTACHMENT_CHUNK_LENGTH]u8 = undefined;
             std.mem.writeInt(u64, chunk[0..8], upload_id, .big);
             @memcpy(chunk[8..][0..length], payload[offset .. offset + length]);
             try req.writeMessage(.attachment_chunk, chunk[0 .. 8 + length]);
@@ -333,6 +366,19 @@ const Request = struct {
         };
     }
 };
+
+/// Best-effort ATTACHMENT_ABORT on a request stream whose staging failed.
+/// Runs from an errdefer after `observe` sent ATTACHMENT_BEGIN: the Server
+/// frees the staged bytes and reservation when the upload id matches, so a
+/// write failure or a later local error cannot leak a staging slot on an
+/// otherwise usable Connection. Failures here are ignored: if the transport
+/// is broken there is nothing left to clean up.
+fn abortStaging(req: *Request, upload_id: u64) void {
+    var payload: [8]u8 = undefined;
+    std.mem.writeInt(u64, &payload, upload_id, .big);
+    req.writeMessage(.attachment_abort, &payload) catch {};
+    req.flush() catch {};
+}
 
 /// Wrap canonical IR bytes with the negotiated format version and send them as
 /// a FLOW_IR request. The caller owns `ir_bytes` and frees it after this call.
@@ -608,4 +654,115 @@ test "query result rejects a row with a different column count" {
     try std.testing.expect((try result.next(arena.allocator())).? == .row_description);
     try std.testing.expectError(error.Protocol, result.next(arena.allocator()));
     try std.testing.expect((try result.next(arena.allocator())) == null);
+}
+
+// ── Canonical IR builders (golden byte vectors) ──
+// These match src/flow/ir.zig encode(): u16(BE) version, u64(BE) model
+// revision, operation byte, then per-operation fields with u16(BE)
+// length-prefixed strings and the scalar value tags 0=null, 1=int(i64 BE),
+// 2=text, 3=bool.
+
+test "buildReadPayloadIr emits the canonical evidence payload request" {
+    const gpa = std.testing.allocator;
+    const bytes = try buildReadPayloadIr(gpa, 0x0102030405060708);
+    defer gpa.free(bytes);
+    const expected = [_]u8{
+        0x00, 0x05, // IR format version 5
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
+        0x03, // read_evidence_payload
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // evidence_id
+    };
+    try std.testing.expectEqualSlices(u8, &expected, bytes);
+}
+
+test "buildObserveIr emits the canonical observe request" {
+    const gpa = std.testing.allocator;
+    const bytes = try buildObserveIr(gpa, 7, "cam", .image, "image/png", "2026-01-01", "test");
+    defer gpa.free(bytes);
+    const expected = [_]u8{
+        0x00, 0x05, // IR format version 5
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
+        0x02, // observe
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, // upload_id 7
+        0x00, 0x03, 'c', 'a', 'm', // object_id
+        0x02, // modality image
+        0x00, 0x09, 'i', 'm', 'a', 'g', 'e', '/', 'p', 'n', 'g', // media_type
+        0x00, 0x0a, '2', '0', '2', '6', '-', '0', '1', '-', '0', '1', // observed_at
+        0x00, 0x04, 't', 'e', 's', 't', // origin
+    };
+    try std.testing.expectEqualSlices(u8, &expected, bytes);
+}
+
+test "buildInsertDocumentIr emits canonical fields with every scalar tag" {
+    const gpa = std.testing.allocator;
+    const fields = [_]proto.DocumentField{
+        .{ .path = "title", .value = .{ .text = "Dune" } },
+        .{ .path = "pages", .value = .{ .int = 412 } },
+        .{ .path = "ok", .value = .{ .bool = true } },
+        .{ .path = "empty", .value = .null },
+    };
+    const bytes = try buildInsertDocumentIr(gpa, "books", "1", &fields);
+    defer gpa.free(bytes);
+    const expected = [_]u8{
+        0x00, 0x05, // IR format version 5
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
+        0x04, // document_insert
+        0x00, 0x05, 'b', 'o', 'o', 'k', 's', // collection
+        0x00, 0x01, '1', // id
+        0x00, 0x04, // field count
+        // title = "Dune"
+        0x00, 0x05, 't', 'i', 't', 'l', 'e', 0x02, 0x00, 0x04, 'D', 'u', 'n', 'e',
+        // pages = 412
+        0x00, 0x05, 'p', 'a', 'g', 'e', 's', 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x9c,
+        // ok = true
+        0x00, 0x02, 'o', 'k', 0x03, 0x01,
+        // empty = null
+        0x00, 0x05, 'e', 'm', 'p', 't', 'y', 0x00,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, bytes);
+}
+
+test "buildGraphAddNodeIr emits the canonical graph node request" {
+    const gpa = std.testing.allocator;
+    const fields = [_]proto.DocumentField{.{ .path = "name", .value = .{ .text = "Ada" } }};
+    const bytes = try buildGraphAddNodeIr(gpa, "social", "1", &fields);
+    defer gpa.free(bytes);
+    const expected = [_]u8{
+        0x00, 0x05, // IR format version 5
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
+        0x05, // graph_add_node
+        0x00, 0x06, 's', 'o', 'c', 'i', 'a', 'l', // graph
+        0x00, 0x01, '1', // id
+        0x00, 0x01, // field count
+        // name = "Ada"
+        0x00, 0x04, 'n', 'a', 'm', 'e', 0x02, 0x00, 0x03, 'A', 'd', 'a',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, bytes);
+}
+
+test "buildGraphAddEdgeIr emits the canonical graph edge request" {
+    const gpa = std.testing.allocator;
+    const bytes = try buildGraphAddEdgeIr(gpa, "social", "1", "mentors", "2");
+    defer gpa.free(bytes);
+    const expected = [_]u8{
+        0x00, 0x05, // IR format version 5
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
+        0x06, // graph_add_edge
+        0x00, 0x06, 's', 'o', 'c', 'i', 'a', 'l', // graph
+        0x00, 0x01, '1', // from
+        0x00, 0x07, 'm', 'e', 'n', 't', 'o', 'r', 's', // label
+        0x00, 0x01, '2', // to
+    };
+    try std.testing.expectEqualSlices(u8, &expected, bytes);
+}
+
+test "buildInsertDocumentIr rejects oversized strings and field counts" {
+    const gpa = std.testing.allocator;
+    const long = "x" ** (std.math.maxInt(u16) + 1);
+    const fields = [_]proto.DocumentField{.{ .path = "p", .value = .{ .text = long } }};
+    try std.testing.expectError(error.StringTooLarge, buildInsertDocumentIr(gpa, "books", "1", &fields));
+
+    const too_many = try gpa.alloc(proto.DocumentField, std.math.maxInt(u16) + 1);
+    defer gpa.free(too_many);
+    try std.testing.expectError(error.StringTooLarge, buildInsertDocumentIr(gpa, "books", "1", too_many));
 }
