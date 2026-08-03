@@ -55,6 +55,30 @@ The sequential statement contract is preserved: consume or drain a
 `QueryResult` before issuing the next statement; issuing a request while a
 result sequence is in flight fails with `StatementInProgress`.
 
+### Typed rows and result helpers
+
+`QueryResult` offers a typed row surface in addition to the raw message
+iterator (`QueryResult.next`). `nextRow` skips the leading `ROW_DESCRIPTION`
+and returns each data row as a `Row` with named, typed column access
+(`row.text(i)`, `row.int(i)`, `row.uint(i)`, `row.boolean(i)`, `row.isNull(i)`,
+and `row.indexOf("name")`), returning `null` at the statement's terminal
+message:
+
+```zig
+var result = try conn.executeFlow(arena, "from books\n| emit { title, pages }");
+while (try result.nextRow(arena)) |row| {
+    const title = row.text(0).?; // optional: null for NULL cells
+    const pages = try row.int(1);
+}
+```
+
+Single-row statements (`observe`, `insertDocument`, `addNode`, `addEdge`)
+return exactly one row and can be consumed with `result.expectOneRow(arena)`.
+A failed statement surfaces as `error.StatementFailed`, with the severity,
+code, and message available on `result.failure`; `result.affectedRows(arena)`
+returns the committed row count from `COMMAND_COMPLETE`, and
+`result.ensureSuccess(arena)` drains, failing on error.
+
 `Connection.observe` stages a payload in bounded protocol chunks and submits a
 canonical `observe` IR request. It returns the committed `evidence_id` as a
 normal result row. `Connection.readEvidencePayload` retrieves one payload and

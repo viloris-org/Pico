@@ -499,6 +499,69 @@ fn appendIrString(output: *std.ArrayList(u8), gpa: Allocator, value: []const u8)
     try output.appendSlice(gpa, value);
 }
 
+/// The terminal SERVER_ERROR of a failed statement. `QueryResult.next`
+/// captures it on `QueryResult.failure`; the row helpers surface it as
+/// `error.StatementFailed` so callers can inspect the code and message.
+pub const Failure = struct {
+    severity: u8, // 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
+    code: []const u8,
+    message: []const u8,
+};
+
+/// One decoded result row with named, typed column access. Backed by the
+/// arena passed to `QueryResult.nextRow`/`expectOneRow`; valid until the next
+/// read on the same result. The Server renders scalars as text — ints as
+/// decimal, bools as "true"/"false" — with a null flag for NULL cells.
+pub const Row = struct {
+    columns: []const []const u8,
+    values: []const []const u8,
+    nulls: []const bool,
+
+    pub fn columnCount(self: Row) usize {
+        return self.values.len;
+    }
+
+    /// The index of the named column, or null.
+    pub fn indexOf(self: Row, name: []const u8) ?usize {
+        for (self.columns, 0..) |column, index| {
+            if (std.mem.eql(u8, column, name)) return index;
+        }
+        return null;
+    }
+
+    pub fn isNull(self: Row, index: usize) bool {
+        return self.nulls[index];
+    }
+
+    /// The column's text value; null when the cell is NULL. Use `raw` to read
+    /// the underlying cell regardless of the null flag.
+    pub fn text(self: Row, index: usize) ?[]const u8 {
+        return if (self.nulls[index]) null else self.values[index];
+    }
+
+    /// The underlying cell bytes (empty string for NULL).
+    pub fn raw(self: Row, index: usize) []const u8 {
+        return self.values[index];
+    }
+
+    /// The column parsed as a signed 64-bit integer.
+    pub fn int(self: Row, index: usize) !i64 {
+        return std.fmt.parseInt(i64, self.values[index], 10);
+    }
+
+    /// The column parsed as an unsigned 64-bit integer.
+    pub fn uint(self: Row, index: usize) !u64 {
+        return std.fmt.parseInt(u64, self.values[index], 10);
+    }
+
+    /// The column parsed as a boolean ("true"/"false").
+    pub fn boolean(self: Row, index: usize) !bool {
+        if (std.mem.eql(u8, self.values[index], "true")) return true;
+        if (std.mem.eql(u8, self.values[index], "false")) return false;
+        return error.InvalidBoolean;
+    }
+};
+
 /// Iterator over query result messages.
 pub const QueryResult = struct {
     allocator: Allocator,
@@ -510,6 +573,12 @@ pub const QueryResult = struct {
     done: bool = false,
     state: State = .initial,
     column_count: ?u16 = null,
+    /// Column names from the leading ROW_DESCRIPTION, when one arrived.
+    columns: []const []const u8 = &.{},
+    /// COMMAND_COMPLETE row count, captured when the statement finished.
+    affected_rows: ?u64 = null,
+    /// The terminal SERVER_ERROR, when the statement failed.
+    failure: ?Failure = null,
 
     const State = enum {
         initial,
@@ -530,9 +599,20 @@ pub const QueryResult = struct {
                 .row_description => {
                     self.state = .rows;
                     self.column_count = msg.row_description.column_count;
+                    self.columns = msg.row_description.columns;
                     return msg;
                 },
-                .command_complete, .server_error, .goodbye => {
+                .command_complete => {
+                    self.affected_rows = msg.command_complete.affected_rows;
+                    self.finish();
+                    return msg;
+                },
+                .server_error => {
+                    self.failure = .{ .severity = msg.server_error.severity, .code = msg.server_error.code, .message = msg.server_error.message };
+                    self.finish();
+                    return msg;
+                },
+                .goodbye => {
                     self.finish();
                     return msg;
                 },
@@ -555,10 +635,16 @@ pub const QueryResult = struct {
                 // terminal message, exactly like SERVER_ERROR before any row
                 // was sent.
                 .server_error => {
+                    self.failure = .{ .severity = msg.server_error.severity, .code = msg.server_error.code, .message = msg.server_error.message };
                     self.finish();
                     return msg;
                 },
-                .command_complete, .goodbye => {
+                .command_complete => {
+                    self.affected_rows = msg.command_complete.affected_rows;
+                    self.finish();
+                    return msg;
+                },
+                .goodbye => {
                     self.finish();
                     return msg;
                 },
@@ -567,6 +653,60 @@ pub const QueryResult = struct {
                     return error.Protocol;
                 },
             },
+        }
+    }
+
+    /// Read the next data row, skipping the leading ROW_DESCRIPTION framing.
+    /// Returns null at the statement's terminal message (COMMAND_COMPLETE or
+    /// GOODBYE). A failed statement (SERVER_ERROR) is `error.StatementFailed`;
+    /// the error's code and message are on `self.failure`.
+    pub fn nextRow(self: *QueryResult, arena: Allocator) !?Row {
+        while (true) {
+            const msg = (try self.next(arena)) orelse return null;
+            switch (msg) {
+                .row_data => |data| return Row{
+                    .columns = self.columns,
+                    .values = data.values,
+                    .nulls = data.nulls,
+                },
+                .server_error => return error.StatementFailed,
+                .row_description, .command_complete, .goodbye => {},
+                else => return error.Protocol,
+            }
+        }
+    }
+
+    /// Require exactly one data row. `observe`, `insertDocument`, `addNode`,
+    /// and `addEdge` each return exactly one row, so their results can be
+    /// consumed with this helper. `error.ExpectedRow` when the statement
+    /// returned no rows, `error.UnexpectedRow` when it returned more than one,
+    /// and `error.StatementFailed` when it failed (details on `self.failure`).
+    pub fn expectOneRow(self: *QueryResult, arena: Allocator) !Row {
+        const row = (try self.nextRow(arena)) orelse return error.ExpectedRow;
+        if ((try self.nextRow(arena)) != null) return error.UnexpectedRow;
+        return row;
+    }
+
+    /// Consume the remainder of the result and return the row count from the
+    /// terminal COMMAND_COMPLETE. A failed statement is
+    /// `error.StatementFailed` (details on `self.failure`).
+    pub fn affectedRows(self: *QueryResult, arena: Allocator) !u64 {
+        while (true) {
+            const msg = (try self.next(arena)) orelse break;
+            switch (msg) {
+                .command_complete => return self.affected_rows orelse error.Protocol,
+                .server_error => return error.StatementFailed,
+                else => {},
+            }
+        }
+        return self.affected_rows orelse error.Protocol;
+    }
+
+    /// Consume the remainder of the result, failing on SERVER_ERROR with
+    /// details on `self.failure`.
+    pub fn ensureSuccess(self: *QueryResult, arena: Allocator) !void {
+        while (try self.next(arena)) |msg| {
+            if (msg == .server_error) return error.StatementFailed;
         }
     }
 
@@ -654,6 +794,174 @@ test "query result rejects a row with a different column count" {
     try std.testing.expect((try result.next(arena.allocator())).? == .row_description);
     try std.testing.expectError(error.Protocol, result.next(arena.allocator()));
     try std.testing.expect((try result.next(arena.allocator())) == null);
+}
+
+test "nextRow yields typed rows and captures the terminal command" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    var writer = codec.TestStream.init("", gpa);
+    defer writer.deinit();
+
+    // ROW_DESCRIPTION: two columns, "a" and "b".
+    var desc: [2 + 4 + 1 + 4 + 1]u8 = undefined;
+    std.mem.writeInt(u16, desc[0..2], 2, .big);
+    std.mem.writeInt(u32, desc[2..6], 1, .big);
+    desc[6] = 'a';
+    std.mem.writeInt(u32, desc[7..11], 1, .big);
+    desc[11] = 'b';
+    try codec.writeMessage(writer.stream(), .row_description, &desc);
+
+    // ROW_DATA: a = "41" (an int rendered as text), b = "true" (a bool).
+    var data: [2 + 1 + 4 + 2 + 1 + 4 + 4]u8 = undefined;
+    std.mem.writeInt(u16, data[0..2], 2, .big);
+    data[2] = 0; // a not null
+    std.mem.writeInt(u32, data[3..7], 2, .big);
+    @memcpy(data[7..9], "41");
+    data[9] = 0; // b not null
+    std.mem.writeInt(u32, data[10..14], 4, .big);
+    @memcpy(data[14..18], "true");
+    try codec.writeMessage(writer.stream(), .row_data, &data);
+
+    // COMMAND_COMPLETE: affected_rows = 1, tag "SELECT 1".
+    var complete: [8 + 4 + 8]u8 = undefined;
+    std.mem.writeInt(u64, complete[0..8], 1, .big);
+    std.mem.writeInt(u32, complete[8..12], 8, .big);
+    @memcpy(complete[12..], "SELECT 1");
+    try codec.writeMessage(writer.stream(), .command_complete, &complete);
+
+    var reader = codec.TestStream.init(writer.sink.items, gpa);
+    defer reader.deinit();
+    var result = QueryResult{ .allocator = gpa, .stream = reader.stream() };
+
+    const row = (try result.nextRow(arena.allocator())).?;
+    try std.testing.expectEqual(@as(usize, 2), row.columnCount());
+    try std.testing.expectEqual(@as(usize, 0), row.indexOf("a").?);
+    try std.testing.expectEqual(@as(usize, 1), row.indexOf("b").?);
+    try std.testing.expect(row.indexOf("missing") == null);
+    try std.testing.expect(!row.isNull(0));
+    try std.testing.expectEqualStrings("41", row.text(0).?);
+    try std.testing.expectEqual(@as(i64, 41), try row.int(0));
+    try std.testing.expectEqual(@as(u64, 41), try row.uint(0));
+    try std.testing.expect(try row.boolean(1));
+    try std.testing.expect((try result.nextRow(arena.allocator())) == null);
+    try std.testing.expectEqual(@as(u64, 1), result.affected_rows.?);
+    try std.testing.expect(result.failure == null);
+    // The terminal command was already consumed; affectedRows still reports it.
+    try std.testing.expectEqual(@as(u64, 1), try result.affectedRows(arena.allocator()));
+}
+
+test "result helpers surface server errors" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // SERVER_ERROR: severity ERROR(2), code "RF1002", message
+    // "SemanticNameNotFound".
+    const payload = [_]u8{
+        2,
+        0, 0, 0, 6, 'R', 'F', '1', '0', '0', '2',
+        0, 0, 0, 20, 'S', 'e', 'm', 'a', 'n', 't', 'i', 'c', 'N', 'a', 'm', 'e', 'N', 'o', 't', 'F', 'o', 'u', 'n', 'd',
+    };
+
+    // nextRow: StatementFailed, failure details captured.
+    {
+        var writer = codec.TestStream.init("", gpa);
+        defer writer.deinit();
+        try codec.writeMessage(writer.stream(), .server_error, &payload);
+        var reader = codec.TestStream.init(writer.sink.items, gpa);
+        defer reader.deinit();
+        var result = QueryResult{ .allocator = gpa, .stream = reader.stream() };
+
+        try std.testing.expectError(error.StatementFailed, result.nextRow(arena.allocator()));
+        try std.testing.expectEqual(@as(u8, 2), result.failure.?.severity);
+        try std.testing.expectEqualStrings("RF1002", result.failure.?.code);
+        try std.testing.expectEqualStrings("SemanticNameNotFound", result.failure.?.message);
+    }
+    // affectedRows: StatementFailed with the code captured.
+    {
+        var writer = codec.TestStream.init("", gpa);
+        defer writer.deinit();
+        try codec.writeMessage(writer.stream(), .server_error, &payload);
+        var reader = codec.TestStream.init(writer.sink.items, gpa);
+        defer reader.deinit();
+        var result = QueryResult{ .allocator = gpa, .stream = reader.stream() };
+
+        try std.testing.expectError(error.StatementFailed, result.affectedRows(arena.allocator()));
+        try std.testing.expectEqualStrings("RF1002", result.failure.?.code);
+    }
+    // ensureSuccess: StatementFailed.
+    {
+        var writer = codec.TestStream.init("", gpa);
+        defer writer.deinit();
+        try codec.writeMessage(writer.stream(), .server_error, &payload);
+        var reader = codec.TestStream.init(writer.sink.items, gpa);
+        defer reader.deinit();
+        var result = QueryResult{ .allocator = gpa, .stream = reader.stream() };
+
+        try std.testing.expectError(error.StatementFailed, result.ensureSuccess(arena.allocator()));
+    }
+}
+
+test "expectOneRow requires exactly one row" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // Exactly one row: row_description + one row_data + command_complete.
+    {
+        var writer = codec.TestStream.init("", gpa);
+        defer writer.deinit();
+        try codec.writeMessage(writer.stream(), .row_description, &.{ 0, 1, 0, 0, 0, 1, 'x' });
+        try codec.writeMessage(writer.stream(), .row_data, &.{ 0, 1, 0, 0, 0, 0, 1, '3' });
+        var complete: [8 + 4 + 3]u8 = undefined;
+        std.mem.writeInt(u64, complete[0..8], 1, .big);
+        std.mem.writeInt(u32, complete[8..12], 3, .big);
+        @memcpy(complete[12..], "GET");
+        try codec.writeMessage(writer.stream(), .command_complete, &complete);
+
+        var reader = codec.TestStream.init(writer.sink.items, gpa);
+        defer reader.deinit();
+        var result = QueryResult{ .allocator = gpa, .stream = reader.stream() };
+        const row = try result.expectOneRow(arena.allocator());
+        try std.testing.expectEqualStrings("3", row.text(0).?);
+        try std.testing.expectEqual(@as(u64, 1), result.affected_rows.?);
+    }
+    // Zero rows: row_description + command_complete.
+    {
+        var writer = codec.TestStream.init("", gpa);
+        defer writer.deinit();
+        try codec.writeMessage(writer.stream(), .row_description, &.{ 0, 1, 0, 0, 0, 1, 'x' });
+        var complete: [8 + 4 + 3]u8 = undefined;
+        std.mem.writeInt(u64, complete[0..8], 0, .big);
+        std.mem.writeInt(u32, complete[8..12], 3, .big);
+        @memcpy(complete[12..], "GET");
+        try codec.writeMessage(writer.stream(), .command_complete, &complete);
+
+        var reader = codec.TestStream.init(writer.sink.items, gpa);
+        defer reader.deinit();
+        var result = QueryResult{ .allocator = gpa, .stream = reader.stream() };
+        try std.testing.expectError(error.ExpectedRow, result.expectOneRow(arena.allocator()));
+    }
+    // Two rows: row_description + two row_data + command_complete.
+    {
+        var writer = codec.TestStream.init("", gpa);
+        defer writer.deinit();
+        try codec.writeMessage(writer.stream(), .row_description, &.{ 0, 1, 0, 0, 0, 1, 'x' });
+        try codec.writeMessage(writer.stream(), .row_data, &.{ 0, 1, 0, 0, 0, 0, 1, '3' });
+        try codec.writeMessage(writer.stream(), .row_data, &.{ 0, 1, 0, 0, 0, 0, 1, '4' });
+        var complete: [8 + 4 + 3]u8 = undefined;
+        std.mem.writeInt(u64, complete[0..8], 2, .big);
+        std.mem.writeInt(u32, complete[8..12], 3, .big);
+        @memcpy(complete[12..], "GET");
+        try codec.writeMessage(writer.stream(), .command_complete, &complete);
+
+        var reader = codec.TestStream.init(writer.sink.items, gpa);
+        defer reader.deinit();
+        var result = QueryResult{ .allocator = gpa, .stream = reader.stream() };
+        try std.testing.expectError(error.UnexpectedRow, result.expectOneRow(arena.allocator()));
+    }
 }
 
 // ── Canonical IR builders (golden byte vectors) ──

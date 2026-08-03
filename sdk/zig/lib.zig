@@ -16,7 +16,9 @@
 //! });
 //! defer conn.deinit(io);
 //! var result = try conn.executeFlow(arena, "from customer\n| emit { id }");
-//! while (try result.next(arena)) |msg| { ... }
+//! while (try result.nextRow(arena)) |row| {
+//!     const id = row.int(row.indexOf("id").?);
+//! }
 //! ```
 
 pub const proto = @import("clint_proto");
@@ -28,12 +30,20 @@ pub const quic_transport = @import("transport/quic.zig");
 
 pub const Connection = connection.Connection;
 pub const QueryResult = connection.QueryResult;
+pub const Row = connection.Row;
+pub const Failure = connection.Failure;
 pub const Message = codec.Message;
 pub const ProtocolError = codec.ProtocolError;
 /// Connection establishment configuration (host, port, transport kind,
 /// QUIC server-certificate pin, timeouts). See `transport.zig`.
 pub const Config = transport.Config;
 pub const TransportKind = transport.Kind;
+
+/// RunaDB Wire Protocol version spoken by this SDK (v3.0; `clint/proto`).
+pub const protocol_major = proto.PROTOCOL_VERSION_MAJOR;
+pub const protocol_minor = proto.PROTOCOL_VERSION_MINOR;
+/// Canonical Runa Query IR format version written by this SDK.
+pub const ir_format_version = proto.IR_FORMAT_VERSION;
 
 test {
     _ = codec;

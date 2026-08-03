@@ -146,14 +146,10 @@ fn expectEvidenceRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
     var result = try conn.observe("camera_1", .image, "image/png", "2026-07-31T12:00:00+08:00", "integration-camera", payload);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    try std.testing.expect((try result.next(arena.allocator())).? == .row_description);
-    const row = (try result.next(arena.allocator())).?;
-    const evidence_id = switch (row) {
-        .row_data => |data| try std.fmt.parseInt(u64, data.values[0], 10),
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect((try result.next(arena.allocator())).? == .command_complete);
-    try std.testing.expect((try result.next(arena.allocator())) == null);
+    // observe is a single-row statement: the row helper consumes the framing
+    // (ROW_DESCRIPTION) and the terminal COMMAND_COMPLETE for us.
+    const row = try result.expectOneRow(arena.allocator());
+    const evidence_id = try row.uint(0);
 
     const recovered = try conn.readEvidencePayload(gpa, evidence_id);
     defer gpa.free(recovered);
@@ -206,14 +202,8 @@ fn expectDocumentRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
         .{ .path = "pages", .value = .{ .int = 412 } },
     };
     var inserted = try conn.insertDocument("books", "1", &fields);
-    try std.testing.expect((try inserted.next(arena.allocator())).? == .row_description);
-    const insert_row = (try inserted.next(arena.allocator())).?;
-    switch (insert_row) {
-        .row_data => |data| try std.testing.expectEqualStrings("1", data.values[0]),
-        else => return error.TestUnexpectedResult,
-    }
-    try std.testing.expect((try inserted.next(arena.allocator())).? == .command_complete);
-    try std.testing.expect((try inserted.next(arena.allocator())) == null);
+    const insert_row = try inserted.expectOneRow(arena.allocator());
+    try std.testing.expectEqualStrings("1", insert_row.raw(0));
 
     var read = try conn.executeFlow(arena.allocator(), "from books\n| where author.name = 'Herbert'\n| emit { title, author.name, pages }\n| limit 5");
     try std.testing.expect((try read.next(arena.allocator())).? == .row_description);
