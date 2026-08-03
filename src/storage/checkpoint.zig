@@ -36,6 +36,10 @@ pub const Stats = struct {
     /// lock when the rewrite began.
     wal_bytes_before: u64,
     wal_bytes_after: u64,
+    /// PK tables the checkpoint's maintenance loop compacted because their L0
+    /// depth crossed `lsm_store.level0_compaction_trigger`. Set by the engine;
+    /// the WAL rewrite itself never compacts.
+    compactions: usize = 0,
 };
 
 /// Rewrite `wal` so it describes exactly `tables` and nothing else.

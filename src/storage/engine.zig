@@ -1434,6 +1434,21 @@ pub const Engine = struct {
         // replays on top of without duplication.
         try self.lsm.publishManifest(self.gpa);
 
+        // Roadmap Phase 5: keep L0 depth bounded on the automatic maintenance
+        // path. After this checkpoint's flush, compact any PK table whose L0
+        // depth crossed the trigger, merging its L0 files (with the overlapping
+        // L1 files) into L1 before the WAL rewrite. Compaction rewrites the LSM
+        // manifest itself, so no extra publication is needed here; the durable
+        // LSM shape after a checkpoint therefore has at most
+        // `level0_compaction_trigger - 1` overlapping L0 files per table.
+        var compacted_tables: usize = 0;
+        var compact_it = self.tables.iterator();
+        while (compact_it.next()) |entry| {
+            if (entry.value_ptr.pk_index != null) {
+                if (try self.compactIfTriggered(entry.key_ptr.*)) compacted_tables += 1;
+            }
+        }
+
         var doc_refs: std.ArrayList(*const document_mod.Collection) = .empty;
         defer doc_refs.deinit(self.gpa);
         try doc_refs.ensureTotalCapacity(self.gpa, self.documents.count());
@@ -1451,6 +1466,7 @@ pub const Engine = struct {
         // plus heap tables rewritten into the WAL.
         stats.tables += flushed_tables;
         stats.rows += flushed_rows;
+        stats.compactions = compacted_tables;
 
         // Publish the durable manifest boundary only after the WAL rewrite has
         // committed, so the manifest always describes state the rewritten WAL
@@ -1487,6 +1503,17 @@ pub const Engine = struct {
         try self.writer_mutex.lock(self.io);
         defer self.writer_mutex.unlock(self.io);
         _ = try self.lsm.compactTable(self.gpa, table_name);
+    }
+
+    /// Merge `table_name`'s L0 files into L1 when its L0 depth reached
+    /// `lsm_store.level0_compaction_trigger` (roadmap Phase 5 compaction
+    /// scheduling). Returns whether a compaction ran. Must run under
+    /// `writer_mutex` (via `checkpoint`) because compaction rewrites the
+    /// version-set manifest and reclaims input files.
+    fn compactIfTriggered(self: *Engine, table_name: []const u8) !bool {
+        if (self.lsm.l0FileCount(table_name) < lsm_store.level0_compaction_trigger) return false;
+        const stats = try self.lsm.compactTable(self.gpa, table_name);
+        return stats.ran;
     }
 
     /// Instance-wide LSM observability counters.
@@ -2442,6 +2469,68 @@ test "checkpoint after a flush reuses the lsm store and compaction reclaims spac
         var r3 = try eng.selectByPk("t", .{ .int = 3 }, eng.publishedSeq());
         defer r3.deinit();
         try std.testing.expectEqual(@as(i64, 30), r3.rows[0].values[1].int);
+    }
+}
+
+test "checkpoint auto-compacts a table whose L0 depth crosses the trigger" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = "zig-cache/runadb-test-lsm-trigger";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var cols = [_]value.Column{
+            .{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true },
+            .{ .name = try gpa.dupe(u8, "v"), .type_tag = .int },
+        };
+        defer for (&cols) |*c| c.deinit(gpa);
+        try eng.createTable("t", &cols);
+        for (1..7) |i| {
+            try eng.insert("t", &.{ .{ .int = @intCast(i) }, .{ .int = @intCast(i * 10) } });
+        }
+        try eng.flush("t");
+        try std.testing.expectEqual(@as(usize, 1), eng.lsm.l0FileCount("t"));
+
+        // Each checkpoint's flush loop adds one L0 file; the first two stay
+        // below the trigger.
+        for (0..2) |_| {
+            const stats = try eng.checkpoint();
+            try std.testing.expectEqual(@as(usize, 0), stats.compactions);
+        }
+        try std.testing.expectEqual(@as(usize, 3), eng.lsm.l0FileCount("t"));
+
+        // The 3rd checkpoint's flush crosses the trigger: the maintenance
+        // loop merges all four L0 files into one non-overlapping L1 file.
+        const stats = try eng.checkpoint();
+        try std.testing.expectEqual(@as(usize, 1), stats.compactions);
+        try std.testing.expectEqual(@as(u64, 1), eng.lsmStats().compaction_runs);
+        try std.testing.expectEqual(@as(usize, 0), eng.lsm.l0FileCount("t"));
+
+        // Writes after the compaction ride a fresh L0 file; the next
+        // checkpoint stays below the trigger.
+        try eng.insert("t", &.{ .{ .int = 7 }, .{ .int = 70 } });
+        _ = try eng.checkpoint();
+        try std.testing.expectEqual(@as(usize, 1), eng.lsm.l0FileCount("t"));
+        try std.testing.expectEqual(@as(u64, 1), eng.lsmStats().compaction_runs);
+    }
+
+    // Restart recovers the whole committed set from the L1 file plus the WAL
+    // tail without duplication.
+    {
+        var eng = try Engine.open(gpa, io, dir_name, true);
+        defer eng.deinit();
+        var all = try eng.selectAll("t", eng.publishedSeq());
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 7), all.rows.len);
+        for (all.rows, 1..) |row, i| {
+            try std.testing.expectEqual(@as(i64, @intCast(i)), row.values[0].int);
+            try std.testing.expectEqual(@as(i64, @intCast(i * 10)), row.values[1].int);
+        }
+        // The L0 file for row 7's post-compaction flush survived recovery.
+        try std.testing.expectEqual(@as(usize, 1), eng.lsm.l0FileCount("t"));
     }
 }
 

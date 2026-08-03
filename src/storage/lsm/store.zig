@@ -53,6 +53,14 @@ const level1: u8 = 1;
 const file_prefix = "sst_";
 const file_suffix = ".sst";
 
+/// L0 depth at which the checkpoint's maintenance loop merges a table's L0
+/// files (with their overlapping L1 files) into L1 (roadmap Phase 5: "flush
+/// and compaction scheduling"). The automatic maintenance path compacts once a
+/// table's L0 depth crosses this trigger, so point and range reads check a
+/// bounded number of overlapping L0 files. Manual `flush`/`compact` calls are
+/// explicit operator actions and never trigger on their own.
+pub const level0_compaction_trigger: u8 = 4;
+
 /// Instance-wide LSM observability (roadmap Phase 5 "Observability is a day-one
 /// design constraint"). Counters never expose row contents.
 pub const Stats = struct {
@@ -235,6 +243,13 @@ pub const Store = struct {
         self.tables.deinit();
         self.dir.close(self.io);
         self.* = undefined;
+    }
+
+    /// Number of L0 files in one table's version set (compaction-trigger
+    /// visibility for the checkpoint maintenance loop).
+    pub fn l0FileCount(self: *const Store, table_name: []const u8) usize {
+        const meta = self.tables.get(table_name) orelse return 0;
+        return meta.levels[level0].items.len;
     }
 
     pub fn hasTable(self: *const Store, name: []const u8) bool {

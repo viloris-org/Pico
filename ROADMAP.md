@@ -316,10 +316,21 @@ active snapshot — with deterministic restart, recovery, point/range, and
 snapshot-safety coverage. The `runa-lsm-bench` harness records a first
 baseline (durable inserts with per-batch flush, compaction, present/absent
 point lookups, and restart recovery) in
-docs/benchmarks/lsm-baseline-2026-08-02.md. The remaining work below is the
-in-memory skiplist MemTable, secondary indexes, background flush/compaction
-scheduling with backpressure, and benchmark baselines across more workloads
-and durability levels.
+docs/benchmarks/lsm-baseline-2026-08-02.md. The checkpoint's maintenance
+loop now compacts any PK table whose L0 depth crosses
+`lsm_store.level0_compaction_trigger` after its flush, merging the L0 files
+(with the overlapping L1 files) into one non-overlapping L1 file before the
+WAL rewrite, so the automatic maintenance path keeps L0 depth bounded;
+`checkpoint_stats.compactions` reports the count, and a deterministic test
+covers crossing the trigger, post-compaction flushes, and restart recovery
+(`Engine.checkpoint`). A threaded compaction-pressure load regression
+(`net/runtime_test.zig`) runs concurrent writers, snapshot-consistent
+readers, and a flush+compact maintenance worker against one engine and
+verifies commit order, read consistency, compaction progress, and restart
+recovery of exactly the committed prefix. The remaining work below is the
+in-memory skiplist MemTable, secondary indexes, scheduler-integrated
+background flush/compaction scheduling with backpressure, and benchmark
+baselines across more workloads and durability levels.
 
 **Goal:** Move table and index storage from the in-memory baseline to ordered,
 recoverable LSM structures while preserving snapshot visibility.
@@ -381,9 +392,14 @@ durability — and rejects further write admission with the retryable overload o
 complete its WAL append and sync. The reservation uses the WAL module's own encoded-frame size
 model, is covered by deterministic engine-level regressions (slot budget, byte budget,
 cancellation release, and release after a drain round), and exposes reservation and rejection
-counters. The remaining work below is
-socket-I/O reactor work and per-Connection backpressure on the scheduler, and the queue-saturation
-and compaction-pressure load regressions.
+counters. A compaction-pressure load regression (`net/runtime_test.zig`) runs
+concurrent writers, snapshot-consistent readers, and a flush+compact
+maintenance worker against one engine and verifies commit order, read
+consistency, compaction progress, and restart recovery of exactly the
+committed prefix. The remaining work below is
+socket-I/O reactor work and per-Connection backpressure on the scheduler, the
+queue-saturation load regression, and scheduler-integrated compaction
+scheduling.
 
 **Goal:** Scale execution and connection handling without crossing ownership
 boundaries or weakening commit correctness.

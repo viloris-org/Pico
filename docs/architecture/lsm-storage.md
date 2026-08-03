@@ -190,7 +190,7 @@ Traverse the key range with ordered iterators:
 
 | Condition | Action |
 |------|------|
-| L0 file count exceeds `level0_file_num_compaction_trigger` | Select a batch of L0 files and merge them into L1 |
+| L0 file count exceeds `level0_file_num_compaction_trigger` | Select a batch of L0 files and merge them into L1. Implemented on the automatic maintenance path: the checkpoint flushes each PK table, then compacts tables whose L0 depth reached `lsm_store.level0_compaction_trigger` (default 4) before the WAL rewrite, so a checkpoint leaves at most `trigger - 1` overlapping L0 files per table. Manual `FLUSH` is an explicit operator action and does not trigger on its own. |
 | Total size of a level exceeds its target | Select the SST with the largest overlap into the next level and merge it |
 | Manual `COMPACT` command | Compact the key range specified by the user |
 
@@ -266,7 +266,7 @@ During startup recovery:
 | MemTable | In-memory `Table` (rows + PK index + retained versions) remains the write and live-read front | Skiplist with Bloom filter |
 | Persistence | Flush to L0 SST (int/text single-column PK tables) | Full SST levels |
 | SST format | Block-indexed SSTables with per-block CRC and a full-key Bloom filter block (`lsm/sstable.zig`, format v2; v1 still read) | Prefix compression + optional block compression |
-| Compaction | L0 + overlapping L1 -> sorted non-overlapping L1 (`lsm/store.zig`) | Size-tiered all-level compaction |
+| Compaction | L0 + overlapping L1 -> sorted non-overlapping L1 (`lsm/store.zig`); checkpoint auto-compacts tables whose L0 depth crosses `level0_compaction_trigger` | Size-tiered all-level compaction with scheduler-integrated background scheduling and backpressure |
 | Manifest | Versioned LSM version-set manifest, atomically rewritten (`lsm/manifest.zig`) | Append-style version_edit records with snapshot tracking |
 | Bloom filter | Full-key filter written on flush, checked before data-block reads on point lookups (`lsm/bloom.zig`, `sstable.zig`) | Optional prefix filter, block-level filters, table cache |
 | Memory limit control | None | WriteBufferManager / write stall |

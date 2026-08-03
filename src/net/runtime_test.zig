@@ -108,6 +108,42 @@ const EngineReader = struct {
     }
 };
 
+/// Maintenance worker for the compaction-pressure load regression: flushes the
+/// table into L0 and compacts L0 into L1 repeatedly, each under the engine
+/// statement lock (the current slice's design: flush/compaction are synchronous
+/// maintenance that may stall statements but must never reorder commits or leak
+/// the lock). A failure sets the shared flag instead of panicking so the other
+/// threads can finish and the test can report the precise worker.
+const MaintenanceWorker = struct {
+    eng: *engine_mod.Engine,
+    io: Io,
+    start: *std.atomic.Value(bool),
+    failed: *std.atomic.Value(bool),
+    rounds: usize,
+    table: []const u8,
+
+    fn run(self: MaintenanceWorker) void {
+        while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+        for (0..self.rounds) |_| {
+            self.eng.lock(self.io) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.eng.flush(self.table) catch {
+                self.eng.unlock(self.io);
+                self.failed.store(true, .release);
+                return;
+            };
+            self.eng.compact(self.table) catch {
+                self.eng.unlock(self.io);
+                self.failed.store(true, .release);
+                return;
+            };
+            self.eng.unlock(self.io);
+        }
+    }
+};
+
 test "engine serializes concurrent readers and writers on the statement lock" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -166,6 +202,106 @@ test "engine serializes concurrent readers and writers on the statement lock" {
     try std.testing.expectEqual(@as(usize, total_writes), final.rows.len);
     for (final.rows, 0..) |row, index| {
         try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].int);
+    }
+}
+
+// ── Compaction-pressure load regression (roadmap Phase 5/6) ──
+
+test "concurrent readers, writers, flushes, and compaction keep reads snapshot-consistent and recoverable" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-runtime-compaction-pressure";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const total_writes = 3 * 60;
+
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+
+        const writers = 3;
+        const reader_count = 2;
+        const writes_per_writer = 60;
+        const reads_per_reader = 30;
+        const maintenance_rounds = 6;
+
+        var next_id = std.atomic.Value(u64).init(0);
+        var start = std.atomic.Value(bool).init(false);
+        var failed = std.atomic.Value(bool).init(false);
+
+        // Writers claim unique ids from the shared counter and commit each
+        // insert synchronously under the statement lock, so id `i` commits at
+        // commit_seq `i+1` even with the maintenance worker interleaving.
+        var writer_threads: [writers]std.Thread = undefined;
+        for (&writer_threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, EngineWriter.run, .{EngineWriter{
+                .eng = &eng,
+                .io = io,
+                .next_id = &next_id,
+                .start = &start,
+                .failed = &failed,
+                .writes = writes_per_writer,
+                .table = "t",
+            }});
+        }
+        var reader_threads: [reader_count]std.Thread = undefined;
+        for (&reader_threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, EngineReader.run, .{EngineReader{
+                .eng = &eng,
+                .io = io,
+                .start = &start,
+                .failed = &failed,
+                .reads = reads_per_reader,
+                .table = "t",
+            }});
+        }
+        // Maintenance pressure: flush into L0 and compact into L1 under the
+        // statement lock, so compaction stalls statements without ever
+        // reordering commits, racing a reader, or leaking the lock.
+        var maintenance_thread = try std.Thread.spawn(.{}, MaintenanceWorker.run, .{MaintenanceWorker{
+            .eng = &eng,
+            .io = io,
+            .start = &start,
+            .failed = &failed,
+            .rounds = maintenance_rounds,
+            .table = "t",
+        }});
+
+        start.store(true, .release);
+        for (&writer_threads) |th| th.join();
+        for (&reader_threads) |th| th.join();
+        maintenance_thread.join();
+        try std.testing.expect(!failed.load(.acquire));
+
+        // Compaction actually ran under load and reclaimed its input files.
+        const stats = eng.lsmStats();
+        try std.testing.expect(stats.compaction_runs >= 1);
+
+        // Consistent final state: every id committed exactly once, in order.
+        var final = try eng.selectAll("t", eng.publishedSeq());
+        defer final.deinit();
+        try std.testing.expectEqual(@as(usize, total_writes), final.rows.len);
+        for (final.rows, 0..) |row, index| {
+            try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].int);
+        }
+    }
+
+    // Restart over the same data directory: the LSM manifest and SSTables plus
+    // the WAL tail recover exactly the committed prefix, with no duplication
+    // from the flushes and compactions that ran under load.
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        var recovered = try eng.selectAll("t", eng.publishedSeq());
+        defer recovered.deinit();
+        try std.testing.expectEqual(@as(usize, total_writes), recovered.rows.len);
+        for (recovered.rows, 0..) |row, index| {
+            try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].int);
+        }
     }
 }
 
