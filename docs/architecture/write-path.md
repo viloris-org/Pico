@@ -342,7 +342,7 @@ application is a pure data-structure operation, so failure is currently expected
 | Commit sequence | Monotonic `commit_seq` allocated by the coordinator, rebuilt from WAL on recovery | Same (MVCC foundation) |
 | Two-phase write | `txn` write-set staging + coordinator commit | Read-set tracking + serializable validation |
 | Conflict detection | Observed-version write-write conflicts, PK and unique revalidation in the round | Range-history strict-OCC |
-| Write stall | Bounded admission and `CommitQueueFull` rejection | Explicit retryable overload; LSM/compaction pressure feeds back before resource exhaustion |
+| Write stall | Bounded admission (`CommitQueueFull`) and reserved-WAL-capacity admission (`WalReservationExhausted`, a retryable overload outcome) | Explicit retryable overload; LSM/compaction pressure feeds back before resource exhaustion |
 | Write amplification metrics | Coordinator commit/conflict/rejection counters | Write amplification, queue/admission, conflict, commit-latency, and batch-size metrics |
 
 ## RunaDB Decisions

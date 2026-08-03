@@ -372,9 +372,18 @@ tick discipline from the I/O scheduling contract (completion extraction records 
 callbacks run within a budget and never drive the platform, and submission follows class priority
 — critical first, foreground round-robin at owner granularity, maintenance with the remaining
 per-tick budget) with high/low backpressure hysteresis, cancellation of queued cancellable work,
-and deterministic regressions against a fake platform backend. The remaining work below is
-socket-I/O reactor work and per-Connection backpressure on the scheduler, reserved WAL slots for
-commit, and the queue-saturation and compaction-pressure load regressions.
+and deterministic regressions against a fake platform backend. Reserved WAL slots for commit are
+implemented at the commit-admission boundary: the coordinator holds a configurable WAL slot/byte
+reservation per admitted commit request — released when the request's `txn_batch` frame is
+appended in a group-commit round, or when the request is withdrawn, cancelled, or rejected before
+durability — and rejects further write admission with the retryable overload outcome
+`WalReservationExhausted` when the reservation is exhausted, so an admitted commit can always
+complete its WAL append and sync. The reservation uses the WAL module's own encoded-frame size
+model, is covered by deterministic engine-level regressions (slot budget, byte budget,
+cancellation release, and release after a drain round), and exposes reservation and rejection
+counters. The remaining work below is
+socket-I/O reactor work and per-Connection backpressure on the scheduler, and the queue-saturation
+and compaction-pressure load regressions.
 
 **Goal:** Scale execution and connection handling without crossing ownership
 boundaries or weakening commit correctness.

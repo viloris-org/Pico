@@ -38,6 +38,11 @@ const value = @import("../storage/value.zig");
 
 pub const CoordError = error{
     CommitQueueFull,
+    /// The reserved WAL capacity (io-scheduling contract) is exhausted: every
+    /// admitted commit must be able to complete its WAL append and sync, so
+    /// admission pauses rather than letting WAL work pile up behind other I/O
+    /// classes. Retryable overload; the Connection must not be torn down.
+    WalReservationExhausted,
     WriteWriteConflict,
     DuplicatePrimaryKey,
     UniqueViolation,
@@ -52,6 +57,16 @@ pub const Config = struct {
     queue_capacity: usize = 64,
     /// Maximum combined staged bytes across the queue before rejection.
     max_queued_bytes: u64 = 256 * 1024 * 1024,
+    /// Reserved WAL slot capacity (roadmap Phase 6, I/O scheduling contract).
+    /// A request holds one slot from admission until its `txn_batch` frame has
+    /// been appended in a group-commit round, so the budget must cover the
+    /// whole admitted queue (every queued request is one drain batch). Defaults
+    /// to `queue_capacity` so the memory-bound queue wall stays the first
+    /// admission limit unless an operator tunes WAL capacity separately.
+    wal_reserved_slots: usize = 64,
+    /// Reserved WAL byte capacity (encoded `txn_batch` frame bytes). 0 means
+    /// bytes are unlimited (slots still bound the WAL).
+    wal_reserved_bytes: u64 = 256 * 1024 * 1024,
 };
 
 /// One immutable commit request, produced by a `txn.Transaction`.
@@ -68,6 +83,9 @@ pub const Request = struct {
     /// Structural byte weight of `ops`, stored by `submit` and reused by
     /// `cancel` so the queued-byte accounting has a single source of truth.
     byte_weight: u64 = 0,
+    /// Encoded `txn_batch` frame size of `ops` (WAL module's size model), held
+    /// by the WAL reservation from admission until the frame is appended.
+    wal_frame_bytes: u64 = 0,
     /// In-round cancellation mark, checked exactly once when a queued request
     /// is admitted into a drain round, before a commit sequence is assigned.
     /// Withdrawal removes a still-queued request entirely and marks it done
@@ -166,6 +184,36 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
         /// and in-round terminations). A cancel that arrives after the commit
         /// is already durable is a no-op and is not counted.
         cancelled: u64 = 0,
+        /// ── WAL reservation (roadmap Phase 6, I/O scheduling contract) ──
+        /// Reserved WAL slot/byte capacity currently held by admitted requests
+        /// (queued or inside a drain round). The reservation guarantees that
+        /// every admitted commit can complete its WAL append and sync; it is
+        /// released when a request's frame is appended or the request is
+        /// withdrawn/rejected before durability.
+        reserved_wal_slots: usize = 0,
+        reserved_wal_bytes: u64 = 0,
+        /// Observability.
+        wal_reservations: u64 = 0,
+        wal_reservation_rejections: u64 = 0,
+        peak_reserved_wal_slots: usize = 0,
+        peak_reserved_wal_bytes: u64 = 0,
+
+        /// Snapshot of the live WAL reservation for tests and observability.
+        pub const WalReservationState = struct {
+            slots_reserved: usize,
+            slots_used: usize,
+            bytes_reserved: u64,
+            bytes_used: u64,
+        };
+
+        pub fn walReservationState(self: *const Self) WalReservationState {
+            return .{
+                .slots_reserved = self.cfg.wal_reserved_slots,
+                .slots_used = self.reserved_wal_slots,
+                .bytes_reserved = self.cfg.wal_reserved_bytes,
+                .bytes_used = self.reserved_wal_bytes,
+            };
+        }
 
         pub fn init(gpa: Allocator, io: Io) Self {
             return .{ .gpa = gpa, .io = io };
@@ -193,8 +241,16 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
             self.next_commit_seq = seq + 1;
         }
 
-        /// Enqueue a request for the next drain. Rejects when the queue is full
-        /// or the queued byte budget is exceeded, so admission is bounded.
+        /// Enqueue a request for the next drain. Rejects when the queue is full,
+        /// the queued byte budget is exceeded, or the reserved WAL capacity is
+        /// exhausted, so admission is bounded in both memory and WAL I/O.
+        ///
+        /// WAL reservation: a request holds one reserved WAL slot (and its
+        /// encoded frame bytes) from admission until its `txn_batch` frame has
+        /// been appended in a group-commit round. Because the reservation is
+        /// held while queued, the budget covers a full drain batch: once a
+        /// request is admitted, it can always complete its WAL append and sync
+        /// without being starved by maintenance/foreground I/O.
         pub fn submit(self: *Self, ctx: Ctx, request: *Request) CoordError!void {
             _ = ctx;
             try self.writer_mutex.lock(self.io);
@@ -208,9 +264,34 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                 self.queue_rejections += 1;
                 return error.CommitQueueFull;
             }
+            const wal_bytes = wal_mod.Wal.txnBatchFrameBytes(request.ops);
+            if (self.walReservationExhausted(wal_bytes)) {
+                self.wal_reservation_rejections += 1;
+                return error.WalReservationExhausted;
+            }
             request.byte_weight = bytes;
+            request.wal_frame_bytes = wal_bytes;
             try self.queue.append(self.gpa, request);
             self.queued_bytes += bytes;
+            self.reserved_wal_slots += 1;
+            self.reserved_wal_bytes += wal_bytes;
+            self.wal_reservations += 1;
+            if (self.reserved_wal_slots > self.peak_reserved_wal_slots) {
+                self.peak_reserved_wal_slots = self.reserved_wal_slots;
+            }
+            if (self.reserved_wal_bytes > self.peak_reserved_wal_bytes) {
+                self.peak_reserved_wal_bytes = self.reserved_wal_bytes;
+            }
+        }
+
+        /// True when admitting `frame_bytes` would exceed the reserved WAL
+        /// capacity. Critical capacity is reserved for commit/recovery/manifest
+        /// publication; when it is exhausted the commit path pauses admission
+        /// instead of growing unbounded WAL work.
+        fn walReservationExhausted(self: *const Self, frame_bytes: u64) bool {
+            if (self.reserved_wal_slots >= self.cfg.wal_reserved_slots) return true;
+            if (self.cfg.wal_reserved_bytes != 0 and self.reserved_wal_bytes + frame_bytes > self.cfg.wal_reserved_bytes) return true;
+            return false;
         }
 
         /// Cancel a submitted request. Returns true when the request was still
@@ -238,6 +319,7 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                     // reorder commit candidates.
                     _ = self.queue.orderedRemove(i);
                     self.queued_bytes -= request.byte_weight;
+                    self.releaseWalReservation(request);
                     self.cancelled += 1;
                     request.done = true;
                     request.result = error.Canceled;
@@ -275,15 +357,18 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                 if (req.cancelled) {
                     // Terminate before validation: no commit sequence, WAL
                     // frame, or publication. Deterministic and leaves no
-                    // visibility hole.
+                    // visibility hole. The reservation is released: the
+                    // request never reaches the WAL.
                     req.result = error.Canceled;
                     req.done = true;
+                    self.releaseWalReservation(req);
                     self.cancelled += 1;
                     continue;
                 }
                 self.validateRequest(ctx, req, &shadow) catch |err| {
                     req.result = err;
                     req.done = true;
+                    self.releaseWalReservation(req);
                     self.conflicts += 1;
                     continue;
                 };
@@ -304,15 +389,20 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
             }
 
             // Pass 3: persist every accepted write set in one durability round.
+            // The WAL append consumes the reserved capacity; afterwards it is
+            // released for the next admitted batch. Releasing after the append
+            // (not after apply) is correct: apply consumes no WAL I/O.
             wal.appendTxnBatchGroup(batches.items) catch {
                 // No WAL record was published; no request may appear committed.
                 for (accepted.items) |req| {
                     req.result = error.WalAppendFailed;
                     req.done = true;
+                    self.releaseWalReservation(req);
                 }
                 self.conflicts += accepted.items.len;
                 return;
             };
+            for (accepted.items) |req| self.releaseWalReservation(req);
 
             // Pass 4: apply in commit order and advance the watermark after
             // each, so readers never observe a later commit before an earlier
@@ -431,6 +521,16 @@ pub fn Coordinator(comptime Ctx: type, comptime hooks: Hooks(Ctx)) type {
                 };
             }
             return null;
+        }
+
+        /// Release the WAL reservation held by `req` after its frame has been
+        /// appended (or the request was withdrawn/rejected before the WAL).
+        /// Every admission path that holds a reservation has exactly one
+        /// release: cancel-withdrawal, in-round termination, validation
+        /// failure, append failure, or successful append.
+        fn releaseWalReservation(self: *Self, req: *const Request) void {
+            self.reserved_wal_slots -= 1;
+            self.reserved_wal_bytes -= req.wal_frame_bytes;
         }
     };
 }

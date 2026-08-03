@@ -406,6 +406,19 @@ pub const Wal = struct {
         ops: []const TxnOp,
     };
 
+    /// Encoded size of one `txn_batch` frame for `ops`, including the frame
+    /// header. Mirrors `appendTxnBatchGroup`'s encoding exactly, so admission
+    /// accounting and the actual write share one size model. The commit
+    /// coordinator uses this to reserve WAL capacity (roadmap Phase 6, I/O
+    /// scheduling contract) before admitting a commit request, guaranteeing
+    /// that every admitted commit can complete its WAL append and sync.
+    pub fn txnBatchFrameBytes(ops: []const TxnOp) u64 {
+        var payload: u64 = 1 + 8 + 2; // type byte + commit_seq + n_ops
+        // Each op is preceded by its u32 encoded length inside the frame.
+        for (ops) |op| payload += 4 + txnOpBytes(op);
+        return frame_header_len + payload;
+    }
+
     /// Append several `txn_batch` frames under one append-mutex hold and sync
     /// once through the end offset, so a group of commits pays a single
     /// durability round without merging their identity or commit order.
@@ -1308,6 +1321,38 @@ fn writeU64(list: *std.ArrayList(u8), gpa: Allocator, v: u64) !void {
     try list.appendSlice(gpa, &b);
 }
 
+/// Encoded size of one `TxnOp`, mirroring `encodeTxnOp` byte for byte.
+fn txnOpBytes(op: TxnOp) u64 {
+    return switch (op) {
+        .insert => |rec| 1 + strBytes(rec.table) + 2 + valueBytes(rec.values),
+        .update => |rec| 1 + strBytes(rec.table) + valueBytesOne(rec.pk) + 2 + valueBytes(rec.values),
+        .delete => |rec| 1 + strBytes(rec.table) + valueBytesOne(rec.pk),
+    };
+}
+
+/// `writeStr`: u16 length prefix + bytes.
+fn strBytes(s: []const u8) u64 {
+    return 2 + s.len;
+}
+
+/// `writeValue` for a single value.
+fn valueBytesOne(v: value.Value) u64 {
+    return switch (v) {
+        .null => 1,
+        .int => 1 + 8,
+        .text => |t| 1 + strBytes(t),
+        .bool => 1 + 1,
+        .vector => |items| 1 + 2 + 4 * items.len,
+    };
+}
+
+/// `writeValue` across a value slice.
+fn valueBytes(vals: []const value.Value) u64 {
+    var total: u64 = 0;
+    for (vals) |v| total += valueBytesOne(v);
+    return total;
+}
+
 fn encodeTxnOp(list: *std.ArrayList(u8), gpa: Allocator, op: TxnOp) !void {
     switch (op) {
         .insert => |rec| {
@@ -1994,6 +2039,41 @@ test "wal appends a group of txn_batch frames as one durable round" {
         try replayWal(&wal, &sink, BatchSink.apply);
         try std.testing.expectEqual(@as(u32, 2), sink.inserts);
     }
+}
+
+test "txnBatchFrameBytes matches the encoded frame size" {
+    const gpa = std.testing.allocator;
+    const table_a = try gpa.dupe(u8, "users");
+    defer gpa.free(table_a);
+    const table_b = try gpa.dupe(u8, "orders");
+    defer gpa.free(table_b);
+    const text_v = try gpa.dupe(u8, "hello");
+    defer gpa.free(text_v);
+    const pk_text = try gpa.dupe(u8, "o1");
+    defer gpa.free(pk_text);
+    const ops = [_]TxnOp{
+        .{ .insert = .{ .table = table_a, .values = &.{ .{ .int = 7 }, .{ .text = text_v } } } },
+        .{ .update = .{ .table = table_a, .pk = .{ .int = 7 }, .values = &.{.{ .bool = true }} } },
+        .{ .delete = .{ .table = table_b, .pk = .{ .text = pk_text } } },
+    };
+
+    // Encode one frame exactly as appendTxnBatchGroup does and compare the
+    // size model against the real bytes, so the admission reservation and the
+    // durable write can never drift apart.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try list.append(gpa, @intFromEnum(RecordType.txn_batch));
+    try writeU64(&list, gpa, 42);
+    try writeU16(&list, gpa, @intCast(ops.len));
+    for (ops) |op| {
+        var sub: std.ArrayList(u8) = .empty;
+        defer sub.deinit(gpa);
+        try encodeTxnOp(&sub, gpa, op);
+        if (sub.items.len > std.math.maxInt(u32)) return error.InvalidWal;
+        try writeU32(&list, gpa, @intCast(sub.items.len));
+        try list.appendSlice(gpa, sub.items);
+    }
+    try std.testing.expectEqual(frame_header_len + list.items.len, Wal.txnBatchFrameBytes(&ops));
 }
 
 const BatchSink = struct {

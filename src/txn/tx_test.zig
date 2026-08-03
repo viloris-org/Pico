@@ -309,6 +309,178 @@ test "commit queue is bounded and rejects overflow" {
     try std.testing.expectEqual(count, all.rows.len);
 }
 
+test "WAL reservation rejects commits beyond the reserved slot budget" {
+    const dir = "zig-cache/runadb-txn-wal-reserve-slots";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{});
+
+    // A small reserved WAL slot budget: only two admitted commits may hold
+    // WAL capacity at once (io-scheduling contract). A third admission must be
+    // rejected with the retryable overload outcome, not grow WAL work without
+    // bound.
+    eng.coordinator.cfg.wal_reserved_slots = 2;
+
+    var txns: [4]txn_mod.Transaction = undefined;
+    var requests: [4]commit_mod.Request = undefined;
+    var count: usize = 0;
+    var rejected = false;
+    for (&txns, 0..) |*tx, i| {
+        tx.* = eng.beginTransaction();
+        try eng.stageInsert(tx, "t", &.{.{ .int = @intCast(i + 1) }});
+        const observed = try gpa.alloc(?u64, 1);
+        observed[0] = null;
+        const ops = try tx.toWalOps();
+        requests[i] = .{ .gpa = gpa, .ops = ops, .observed = observed, .read_seq = tx.snapshot_seq };
+        eng.coordinator.submit(&eng, &requests[i]) catch |err| {
+            if (err == error.WalReservationExhausted) {
+                rejected = true;
+                requests[i].deinit();
+                tx.deinit();
+                continue;
+            }
+            requests[i].deinit();
+            tx.deinit();
+            return err;
+        };
+        count += 1;
+    }
+    try std.testing.expect(rejected);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(usize, 2), eng.coordinator.reserved_wal_slots);
+    try std.testing.expectEqual(@as(usize, 2), eng.coordinator.wal_reservations);
+    // Requests 3 and 4 are both rejected: the two held reservations are not
+    // released until the drain appends the frames.
+    try std.testing.expectEqual(@as(usize, 2), eng.coordinator.wal_reservation_rejections);
+    try std.testing.expectEqual(@as(usize, 2), eng.coordinator.peak_reserved_wal_slots);
+
+    // The reservation is released once the group-commit round appends the
+    // frames, so new commits are admitted again.
+    try eng.coordinator.drain(&eng);
+    try std.testing.expectEqual(@as(usize, 0), eng.coordinator.reserved_wal_slots);
+    try std.testing.expectEqual(@as(u64, 0), eng.coordinator.reserved_wal_bytes);
+    for (requests[0..count]) |*req| req.deinit();
+    for (txns[0..count]) |*tx| tx.deinit();
+
+    var all = try eng.selectAll("t", eng.publishedSeq());
+    defer all.deinit();
+    try std.testing.expectEqual(count, all.rows.len);
+}
+
+test "WAL byte reservation rejects an oversized frame" {
+    const dir = "zig-cache/runadb-txn-wal-reserve-bytes";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{col("name", .text)});
+
+    // Byte budget small enough that a frame carrying a long text value cannot
+    // be admitted even though slots remain. 0 disables the byte bound; here we
+    // exercise it.
+    eng.coordinator.cfg.wal_reserved_bytes = 64;
+
+    var txns: [2]txn_mod.Transaction = undefined;
+    var requests: [2]commit_mod.Request = undefined;
+    var count: usize = 0;
+    var rejected = false;
+    for (&txns, 0..) |*tx, idx| {
+        tx.* = eng.beginTransaction();
+        if (idx == 0) {
+            // Small frame: one int + one one-char text cell fits the budget.
+            const small_text = try gpa.dupe(u8, "x");
+            defer gpa.free(small_text);
+            try eng.stageInsert(tx, "t", &.{ .{ .int = 1 }, .{ .text = small_text } });
+        } else {
+            const big_text = try gpa.alloc(u8, 256);
+            @memset(big_text, 'x');
+            defer gpa.free(big_text);
+            try eng.stageInsert(tx, "t", &.{ .{ .int = 2 }, .{ .text = big_text } });
+        }
+        const observed = try gpa.alloc(?u64, 1);
+        observed[0] = null;
+        const ops = try tx.toWalOps();
+        requests[idx] = .{ .gpa = gpa, .ops = ops, .observed = observed, .read_seq = tx.snapshot_seq };
+        eng.coordinator.submit(&eng, &requests[idx]) catch |err| {
+            if (err == error.WalReservationExhausted) {
+                rejected = true;
+                requests[idx].deinit();
+                tx.deinit();
+                continue;
+            }
+            requests[idx].deinit();
+            tx.deinit();
+            return err;
+        };
+        count += 1;
+    }
+    try std.testing.expect(rejected);
+    // The small frame was admitted; the oversized one was not. The byte budget
+    // is the wall here: slots are still available (default 64).
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(usize, 1), eng.coordinator.wal_reservation_rejections);
+    try std.testing.expect(eng.coordinator.reserved_wal_bytes > 0);
+
+    try eng.coordinator.drain(&eng);
+    try std.testing.expectEqual(@as(u64, 0), eng.coordinator.reserved_wal_bytes);
+    for (requests[0..count]) |*req| req.deinit();
+    for (txns[0..count]) |*tx| tx.deinit();
+}
+
+test "cancelling a queued commit releases its WAL reservation" {
+    const dir = "zig-cache/runadb-txn-wal-reserve-cancel";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+    }
+    try makeTable(&eng, "t", "id", &.{});
+
+    // One reserved WAL slot. After the queued request is cancelled (withdrawn
+    // before any commit sequence is assigned), its reservation returns and a
+    // later commit is admitted.
+    eng.coordinator.cfg.wal_reserved_slots = 1;
+
+    var tx_a = eng.beginTransaction();
+    defer tx_a.deinit();
+    try eng.stageInsert(&tx_a, "t", &.{.{ .int = 1 }});
+    const obs_a = try gpa.alloc(?u64, 1);
+    obs_a[0] = null;
+    var req_a = commit_mod.Request{ .gpa = gpa, .ops = try tx_a.toWalOps(), .observed = obs_a, .read_seq = tx_a.snapshot_seq };
+    defer req_a.deinit();
+    try eng.coordinator.submit(&eng, &req_a);
+    try std.testing.expectEqual(@as(usize, 1), eng.coordinator.reserved_wal_slots);
+
+    var tx_b = eng.beginTransaction();
+    defer tx_b.deinit();
+    try eng.stageInsert(&tx_b, "t", &.{.{ .int = 2 }});
+    const obs_b = try gpa.alloc(?u64, 1);
+    obs_b[0] = null;
+    var req_b = commit_mod.Request{ .gpa = gpa, .ops = try tx_b.toWalOps(), .observed = obs_b, .read_seq = tx_b.snapshot_seq };
+    defer req_b.deinit();
+    try std.testing.expectError(error.WalReservationExhausted, eng.coordinator.submit(&eng, &req_b));
+
+    // Withdrawal releases the reservation; the cancelled request publishes
+    // nothing and leaves no commit-sequence gap.
+    try std.testing.expect(try eng.coordinator.cancel(&req_a));
+    try std.testing.expectEqual(error.Canceled, req_a.result.?);
+    try std.testing.expectEqual(@as(usize, 0), eng.coordinator.reserved_wal_slots);
+
+    // The later request is admitted and commits.
+    try eng.coordinator.submit(&eng, &req_b);
+    try eng.coordinator.drain(&eng);
+    try std.testing.expectEqual(@as(u64, 0), eng.coordinator.reserved_wal_bytes);
+    try std.testing.expectEqual(@as(usize, 2), eng.coordinator.wal_reservations);
+
+    var all = try eng.selectAll("t", eng.publishedSeq());
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 1), all.rows.len);
+}
+
 test "a cancelled queued commit is withdrawn without a commit-sequence gap" {
     const dir = "zig-cache/runadb-txn-cancel-withdraw";
     var eng = try freshEngine(dir);
