@@ -1,12 +1,13 @@
 # Runa Flow
 
 Status: Partially implemented development contract. RunaDB Wire Protocol v3.0
-accepts the read-only relation, document collection, and graph slices below as
-Runa Flow source or Runa Query IR. Canonical IR also implements `observe` and
-`read_evidence_payload` for immutable Observation Evidence, `document_insert`
-for document collection ingestion, and `graph_add_node`/`graph_add_edge` for
-graph ingestion. SQL text is not an accepted protocol request. All other
-operation families remain target design.
+accepts the read-only relation, document collection, graph, and KV collection
+slices below as Runa Flow source or Runa Query IR. Canonical IR also implements
+`observe` and `read_evidence_payload` for immutable Observation Evidence,
+`document_insert` for document collection ingestion, `graph_add_node`/
+`graph_add_edge` for graph ingestion, and `kv_put` for KV collection ingestion.
+SQL text is not an accepted protocol request. All other operation families
+remain target design.
 
 ## Purpose
 
@@ -124,6 +125,37 @@ Semantics of the graph slice:
   closures, graph mutation beyond adding nodes and edges, or World Continuum
   State Field and Representation Chart support.
 
+## KV Collections
+
+A **KV collection** is a read-only vertical slice that maps a text **key** to a
+scalar **value** (`int`, `text`, `bool`, or `null`). Each entry reads as a
+two-field row through the relation grammar above, so no new source stages are
+needed:
+
+```runa-flow
+from session
+| where key = 'theme'
+| emit { key, value }
+| limit 5
+```
+
+Semantics of the KV slice:
+
+- Entries are ingested through the official RunaDB Client's `putKv` operation
+  (canonical IR `kv_put`), which creates the collection on its first put. A put
+  is an **upsert**: it stores the value for a key, replacing the value of an
+  existing key. Keys are arbitrary non-empty text; values are scalar-only, and
+  a vector value is rejected rather than silently stored.
+- `emit` resolves `key` to the entry's text key and `value` to its scalar;
+  any other path reads as null, exactly like an absent document field. A
+  `where` predicate on `key` or `value` filters entries; a type mismatch
+  behaves like an absent value and never matches.
+- Reads follow insertion order (a replaced key keeps its original position);
+  `where` filters and `limit` bounds the returned rows.
+- This slice does not imply delete, TTLs, range scans beyond the `where`/
+  `limit` stages, or World Continuum State Field and Representation Chart
+  support.
+
 Other stages shown below are illustrative until their grammar and semantics are
 published.
 
@@ -180,11 +212,13 @@ identities, result shape, policy requirements, and model revision. It does not
 contain source formatting or natural-language text.
 
 The official Zig RunaDB Client sends source or validated IR and implements
-bounded Observation Evidence upload, payload retrieval, and document
-collection ingestion. Canonical IR format 5 uses an explicit operation tag for
-relation `emit`, `observe`, `read_evidence_payload`, `document_insert`, `graph_add_node`, and `graph_add_edge`;
-relation `emit` carries optional `where` predicates and the optional `limit`
-stage. An older IR version is rejected rather than reinterpreted.
+bounded Observation Evidence upload, payload retrieval, document collection
+ingestion, graph ingestion, and KV collection ingestion. Canonical IR format 6
+uses an explicit operation tag for relation `emit`, `observe`,
+`read_evidence_payload`, `document_insert`, `graph_add_node`,
+`graph_add_edge`, and `kv_put`; relation `emit` carries optional `where`
+predicates and the optional `limit` stage. An older IR version is rejected
+rather than reinterpreted.
 
 `observe` binds a completed protocol attachment to an `object_id`, declared
 modality, normalized media type, observation time, and origin. The Server sets

@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const value_mod = @import("../storage/value.zig");
 
-pub const FORMAT_VERSION: u16 = 5;
+pub const FORMAT_VERSION: u16 = 6;
 pub const DEVELOPMENT_MODEL_REVISION: u64 = 0;
 
 pub const IrError = error{
@@ -31,6 +31,8 @@ pub const Operation = enum(u8) {
     graph_add_node = 5,
     /// Add one directed labeled edge to a named graph (roadmap Phase 2).
     graph_add_edge = 6,
+    /// Upsert one key/value pair into a named KV collection (roadmap Phase 2).
+    kv_put = 7,
 };
 
 pub const Observe = struct {
@@ -118,6 +120,23 @@ pub const GraphAddEdge = struct {
     }
 };
 
+/// One KV upsert: store `item` under text `key` in a named KV collection
+/// (roadmap Phase 2). `item` is a scalar value owned by the request; the
+/// engine clones it into the collection. Putting into a nonexistent collection
+/// creates it on its first put.
+pub const KvPut = struct {
+    collection: []u8,
+    key: []u8,
+    item: value_mod.Value,
+
+    fn deinit(self: *KvPut, gpa: Allocator) void {
+        gpa.free(self.collection);
+        gpa.free(self.key);
+        self.item.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
 pub const Request = struct {
     model_revision: u64,
     operation: Operation = .emit,
@@ -131,6 +150,7 @@ pub const Request = struct {
     navigate: ?Navigate = null,
     graph_add_node: ?GraphAddNode = null,
     graph_add_edge: ?GraphAddEdge = null,
+    kv_put: ?KvPut = null,
 
     pub fn deinit(self: *Request, gpa: Allocator) void {
         gpa.free(self.relation);
@@ -143,6 +163,7 @@ pub const Request = struct {
         if (self.document_insert) |*insert| insert.deinit(gpa);
         if (self.graph_add_node) |*insert| insert.deinit(gpa);
         if (self.graph_add_edge) |*edge| edge.deinit(gpa);
+        if (self.kv_put) |*put| put.deinit(gpa);
     }
 };
 
@@ -231,6 +252,12 @@ pub fn encode(gpa: Allocator, request: *const Request) ![]u8 {
             try appendString(&output, gpa, edge.label);
             try appendString(&output, gpa, edge.to);
         },
+        .kv_put => {
+            const put = request.kv_put.?;
+            try appendString(&output, gpa, put.collection);
+            try appendString(&output, gpa, put.key);
+            try appendIrValue(&output, gpa, put.item);
+        },
     }
     return output.toOwnedSlice(gpa);
 }
@@ -252,6 +279,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
     var navigate_stage: ?Navigate = null;
     var graph_add_node: ?GraphAddNode = null;
     var graph_add_edge: ?GraphAddEdge = null;
+    var kv_put: ?KvPut = null;
     var transferred = false;
     errdefer {
         if (!transferred) {
@@ -265,6 +293,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
             if (document_insert) |*insert| insert.deinit(gpa);
             if (graph_add_node) |*insert| insert.deinit(gpa);
             if (graph_add_edge) |*edge| edge.deinit(gpa);
+            if (kv_put) |*put| put.deinit(gpa);
         }
     }
     switch (operation) {
@@ -316,6 +345,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
         .document_insert => document_insert = try decodeDocumentInsert(gpa, bytes, &pos),
         .graph_add_node => graph_add_node = try decodeGraphAddNode(gpa, bytes, &pos),
         .graph_add_edge => graph_add_edge = try decodeGraphAddEdge(gpa, bytes, &pos),
+        .kv_put => kv_put = try decodeKvPut(gpa, bytes, &pos),
     }
     if (pos != bytes.len) return error.InvalidFormat;
     var request = Request{
@@ -331,6 +361,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) IrError!Request {
         .navigate = navigate_stage,
         .graph_add_node = graph_add_node,
         .graph_add_edge = graph_add_edge,
+        .kv_put = kv_put,
     };
     transferred = true;
     errdefer request.deinit(gpa);
@@ -404,6 +435,15 @@ fn decodeGraphAddEdge(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!Gr
     return .{ .graph = graph, .from = from, .label = label, .to = to };
 }
 
+fn decodeKvPut(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!KvPut {
+    const collection = try readString(gpa, bytes, pos);
+    errdefer gpa.free(collection);
+    const key = try readString(gpa, bytes, pos);
+    errdefer gpa.free(key);
+    const item = try readIrValue(gpa, bytes, pos);
+    return .{ .collection = collection, .key = key, .item = item };
+}
+
 fn decodePredicate(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!ast.Predicate {
     const column = try readString(gpa, bytes, pos);
     errdefer gpa.free(column);
@@ -453,7 +493,7 @@ fn decodeLiteral(gpa: Allocator, bytes: []const u8, pos: *usize) IrError!ast.Lit
 pub fn validate(request: *const Request) IrError!void {
     switch (request.operation) {
         .emit => {
-            if (request.observe != null or request.evidence_id != 0 or request.document_insert != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
+            if (request.observe != null or request.evidence_id != 0 or request.document_insert != null or request.graph_add_node != null or request.graph_add_edge != null or request.kv_put != null) return error.InvalidOperation;
             if (!ast.isIdentifier(request.relation)) return error.InvalidIdentifier;
             for (request.where) |predicate| {
                 // A relation column is a path of length one; a dotted path
@@ -491,16 +531,16 @@ pub fn validate(request: *const Request) IrError!void {
         },
         .observe => {
             const observation = request.observe orelse return error.InvalidOperation;
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null or request.kv_put != null) return error.InvalidOperation;
             if (observation.upload_id == 0 or observation.object_id.len == 0 or observation.media_type.len == 0 or observation.observed_at.len == 0 or observation.origin.len == 0) return error.ExpectedField;
             if (observation.modality < 1 or observation.modality > 6) return error.InvalidModality;
         },
         .read_evidence_payload => {
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id == 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id == 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null or request.kv_put != null) return error.InvalidOperation;
         },
         .document_insert => {
             const insert = request.document_insert orelse return error.InvalidOperation;
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null or request.kv_put != null) return error.InvalidOperation;
             if (insert.collection.len == 0 or insert.id.len == 0) return error.ExpectedField;
             if (!ast.isIdentifier(insert.collection)) return error.InvalidIdentifier;
             for (insert.fields) |*field| {
@@ -510,7 +550,7 @@ pub fn validate(request: *const Request) IrError!void {
         },
         .graph_add_node => {
             const insert = request.graph_add_node orelse return error.InvalidOperation;
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_edge != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_edge != null or request.kv_put != null) return error.InvalidOperation;
             if (insert.graph.len == 0 or insert.id.len == 0) return error.ExpectedField;
             if (!ast.isIdentifier(insert.graph)) return error.InvalidIdentifier;
             for (insert.fields) |*field| {
@@ -520,9 +560,16 @@ pub fn validate(request: *const Request) IrError!void {
         },
         .graph_add_edge => {
             const edge = request.graph_add_edge orelse return error.InvalidOperation;
-            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null) return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null or request.kv_put != null) return error.InvalidOperation;
             if (edge.graph.len == 0 or edge.from.len == 0 or edge.label.len == 0 or edge.to.len == 0) return error.ExpectedField;
             if (!ast.isIdentifier(edge.graph) or !ast.isIdentifier(edge.label)) return error.InvalidIdentifier;
+        },
+        .kv_put => {
+            const put = request.kv_put orelse return error.InvalidOperation;
+            if (request.relation.len != 0 or request.where.len != 0 or request.fields.len != 0 or request.observe != null or request.evidence_id != 0 or request.limit != null or request.document_insert != null or request.navigate != null or request.graph_add_node != null or request.graph_add_edge != null) return error.InvalidOperation;
+            if (put.collection.len == 0 or put.key.len == 0) return error.ExpectedField;
+            if (!ast.isIdentifier(put.collection)) return error.InvalidIdentifier;
+            if (put.item == .vector) return error.UnsupportedValue;
         },
     }
 }
@@ -711,7 +758,7 @@ test "IR encoding round trips exactly" {
 
 test "IR decode rejects an empty projection" {
     const bytes = [_]u8{
-        0, 5, // format version
+        0, 6, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
@@ -735,7 +782,7 @@ test "IR encode rejects identifiers outside the source grammar" {
 
 test "IR decode rejects an invalid limit presence flag" {
     const bytes = [_]u8{
-        0, 5, // format version
+        0, 6, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
@@ -750,7 +797,7 @@ test "IR decode rejects an invalid limit presence flag" {
 
 test "IR decode rejects an invalid predicate op" {
     const bytes = [_]u8{
-        0, 5, // format version
+        0, 6, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
@@ -763,7 +810,7 @@ test "IR decode rejects an invalid predicate op" {
 
 test "IR decode rejects an invalid in-list literal tag" {
     const bytes = [_]u8{
-        0, 5, // format version
+        0, 6, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
@@ -836,7 +883,7 @@ test "IR encode rejects an is null predicate with a literal" {
 
 test "IR decodes a canonical observe request" {
     const bytes = [_]u8{
-        0, 5, // format version
+        0, 6, // format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         2, // observe operation
         0, 0, 0,   0,   0,   0, 0, 7, // upload id
@@ -897,4 +944,78 @@ test "document_insert IR round trips exactly" {
     try std.testing.expectEqualStrings("title", decoded.document_insert.?.fields[0].path);
     try std.testing.expectEqual(@as(i64, 412), decoded.document_insert.?.fields[1].item.int);
     try std.testing.expectEqual(true, decoded.document_insert.?.fields[2].item.bool);
+}
+
+test "kv_put IR round trips exactly" {
+    const gpa = std.testing.allocator;
+    var request = Request{
+        .model_revision = DEVELOPMENT_MODEL_REVISION,
+        .operation = .kv_put,
+        .relation = @constCast(""),
+        .fields = &.{},
+        .kv_put = .{
+            .collection = try gpa.dupe(u8, "cache"),
+            .key = try gpa.dupe(u8, "region"),
+            .item = .{ .text = try gpa.dupe(u8, "north") },
+        },
+    };
+    defer request.deinit(gpa);
+    const bytes = try encode(gpa, &request);
+    defer gpa.free(bytes);
+    var decoded = try decode(gpa, bytes);
+    defer decoded.deinit(gpa);
+    try std.testing.expectEqual(Operation.kv_put, decoded.operation);
+    try std.testing.expectEqualStrings("cache", decoded.kv_put.?.collection);
+    try std.testing.expectEqualStrings("region", decoded.kv_put.?.key);
+    try std.testing.expectEqualStrings("north", decoded.kv_put.?.item.text);
+
+    // Int and bool values round trip too.
+    var int_request = Request{
+        .model_revision = DEVELOPMENT_MODEL_REVISION,
+        .operation = .kv_put,
+        .relation = @constCast(""),
+        .fields = &.{},
+        .kv_put = .{
+            .collection = try gpa.dupe(u8, "cache"),
+            .key = try gpa.dupe(u8, "retries"),
+            .item = .{ .int = 3 },
+        },
+    };
+    defer int_request.deinit(gpa);
+    const int_bytes = try encode(gpa, &int_request);
+    defer gpa.free(int_bytes);
+    var int_decoded = try decode(gpa, int_bytes);
+    defer int_decoded.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 3), int_decoded.kv_put.?.item.int);
+}
+
+test "kv_put IR rejects a vector value and a non-identifier collection" {
+    const gpa = std.testing.allocator;
+    var vector_request = Request{
+        .model_revision = DEVELOPMENT_MODEL_REVISION,
+        .operation = .kv_put,
+        .relation = @constCast(""),
+        .fields = &.{},
+        .kv_put = .{
+            .collection = try gpa.dupe(u8, "cache"),
+            .key = try gpa.dupe(u8, "k"),
+            .item = .{ .vector = try gpa.dupe(f32, &.{ 1, 2 }) },
+        },
+    };
+    defer vector_request.deinit(gpa);
+    try std.testing.expectError(error.UnsupportedValue, encode(gpa, &vector_request));
+
+    var name_request = Request{
+        .model_revision = DEVELOPMENT_MODEL_REVISION,
+        .operation = .kv_put,
+        .relation = @constCast(""),
+        .fields = &.{},
+        .kv_put = .{
+            .collection = try gpa.dupe(u8, "cache-name"),
+            .key = try gpa.dupe(u8, "k"),
+            .item = .{ .int = 1 },
+        },
+    };
+    defer name_request.deinit(gpa);
+    try std.testing.expectError(error.InvalidIdentifier, encode(gpa, &name_request));
 }

@@ -295,6 +295,16 @@ pub const Connection = struct {
         return sendFlowIr(self, ir_bytes);
     }
 
+    /// Upsert one key/value pair into a named KV collection through canonical
+    /// Runa Query IR, creating the collection on its first put. `value` is
+    /// borrowed and must outlive the call; the result's single row carries
+    /// the stored key and value.
+    pub fn putKv(self: *Connection, collection: []const u8, key: []const u8, value: proto.DocumentValue) !QueryResult {
+        const ir_bytes = try buildKvPutIr(self.allocator, collection, key, value);
+        defer self.allocator.free(ir_bytes);
+        return sendFlowIr(self, ir_bytes);
+    }
+
     /// Request cooperative cancellation of the statement currently executing
     /// on this Connection. Fire-and-forget: the Server never replies, and an
     /// unknown or already-revoked credential is a protocol no-op. A cancellation
@@ -463,6 +473,18 @@ fn buildGraphAddEdgeIr(gpa: Allocator, graph: []const u8, from: []const u8, labe
     try appendIrString(&output, gpa, from);
     try appendIrString(&output, gpa, label);
     try appendIrString(&output, gpa, to);
+    return output.toOwnedSlice(gpa);
+}
+
+fn buildKvPutIr(gpa: Allocator, collection: []const u8, key: []const u8, value: proto.DocumentValue) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(gpa);
+    try appendInt(&output, gpa, u16, proto.IR_FORMAT_VERSION);
+    try appendInt(&output, gpa, u64, 0);
+    try output.append(gpa, 7); // kv_put operation
+    try appendIrString(&output, gpa, collection);
+    try appendIrString(&output, gpa, key);
+    try appendIrValue(&output, gpa, value);
     return output.toOwnedSlice(gpa);
 }
 
@@ -861,8 +883,40 @@ test "result helpers surface server errors" {
     // "SemanticNameNotFound".
     const payload = [_]u8{
         2,
-        0, 0, 0, 6, 'R', 'F', '1', '0', '0', '2',
-        0, 0, 0, 20, 'S', 'e', 'm', 'a', 'n', 't', 'i', 'c', 'N', 'a', 'm', 'e', 'N', 'o', 't', 'F', 'o', 'u', 'n', 'd',
+        0,
+        0,
+        0,
+        6,
+        'R',
+        'F',
+        '1',
+        '0',
+        '0',
+        '2',
+        0,
+        0,
+        0,
+        20,
+        'S',
+        'e',
+        'm',
+        'a',
+        'n',
+        't',
+        'i',
+        'c',
+        'N',
+        'a',
+        'm',
+        'e',
+        'N',
+        'o',
+        't',
+        'F',
+        'o',
+        'u',
+        'n',
+        'd',
     };
 
     // nextRow: StatementFailed, failure details captured.
@@ -975,7 +1029,7 @@ test "buildReadPayloadIr emits the canonical evidence payload request" {
     const bytes = try buildReadPayloadIr(gpa, 0x0102030405060708);
     defer gpa.free(bytes);
     const expected = [_]u8{
-        0x00, 0x05, // IR format version 5
+        0x00, 0x06, // IR format version 6
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
         0x03, // read_evidence_payload
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // evidence_id
@@ -988,7 +1042,7 @@ test "buildObserveIr emits the canonical observe request" {
     const bytes = try buildObserveIr(gpa, 7, "cam", .image, "image/png", "2026-01-01", "test");
     defer gpa.free(bytes);
     const expected = [_]u8{
-        0x00, 0x05, // IR format version 5
+        0x00, 0x06, // IR format version 6
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
         0x02, // observe
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, // upload_id 7
@@ -1012,20 +1066,38 @@ test "buildInsertDocumentIr emits canonical fields with every scalar tag" {
     const bytes = try buildInsertDocumentIr(gpa, "books", "1", &fields);
     defer gpa.free(bytes);
     const expected = [_]u8{
-        0x00, 0x05, // IR format version 5
+        0x00, 0x06, // IR format version 6
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
         0x04, // document_insert
         0x00, 0x05, 'b', 'o', 'o', 'k', 's', // collection
         0x00, 0x01, '1', // id
         0x00, 0x04, // field count
         // title = "Dune"
-        0x00, 0x05, 't', 'i', 't', 'l', 'e', 0x02, 0x00, 0x04, 'D', 'u', 'n', 'e',
+        0x00, 0x05,
+        't',  'i',
+        't',  'l',
+        'e',  0x02,
+        0x00, 0x04,
+        'D',  'u',
+        'n',  'e',
         // pages = 412
-        0x00, 0x05, 'p', 'a', 'g', 'e', 's', 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x9c,
+        0x00, 0x05,
+        'p',  'a',
+        'g',  'e',
+        's',  0x01,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x01, 0x9c,
         // ok = true
-        0x00, 0x02, 'o', 'k', 0x03, 0x01,
+        0x00, 0x02,
+        'o',  'k',
+        0x03, 0x01,
         // empty = null
-        0x00, 0x05, 'e', 'm', 'p', 't', 'y', 0x00,
+        0x00, 0x05,
+        'e',  'm',
+        'p',  't',
+        'y',  0x00,
     };
     try std.testing.expectEqualSlices(u8, &expected, bytes);
 }
@@ -1036,14 +1108,19 @@ test "buildGraphAddNodeIr emits the canonical graph node request" {
     const bytes = try buildGraphAddNodeIr(gpa, "social", "1", &fields);
     defer gpa.free(bytes);
     const expected = [_]u8{
-        0x00, 0x05, // IR format version 5
+        0x00, 0x06, // IR format version 6
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
         0x05, // graph_add_node
         0x00, 0x06, 's', 'o', 'c', 'i', 'a', 'l', // graph
         0x00, 0x01, '1', // id
         0x00, 0x01, // field count
         // name = "Ada"
-        0x00, 0x04, 'n', 'a', 'm', 'e', 0x02, 0x00, 0x03, 'A', 'd', 'a',
+        0x00, 0x04,
+        'n',  'a',
+        'm',  'e',
+        0x02, 0x00,
+        0x03, 'A',
+        'd',  'a',
     };
     try std.testing.expectEqualSlices(u8, &expected, bytes);
 }
@@ -1053,7 +1130,7 @@ test "buildGraphAddEdgeIr emits the canonical graph edge request" {
     const bytes = try buildGraphAddEdgeIr(gpa, "social", "1", "mentors", "2");
     defer gpa.free(bytes);
     const expected = [_]u8{
-        0x00, 0x05, // IR format version 5
+        0x00, 0x06, // IR format version 6
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // model revision 0
         0x06, // graph_add_edge
         0x00, 0x06, 's', 'o', 'c', 'i', 'a', 'l', // graph

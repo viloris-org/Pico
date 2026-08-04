@@ -774,6 +774,176 @@ test "navigate on a relation is rejected" {
     try std.testing.expectError(error.UnsupportedNavigate, execute(gpa, &eng, &request));
 }
 
+// ── KV collection slice (roadmap Phase 2) ──
+
+/// Seed a KV collection exactly as the CLI/IR ingest would: a put into a
+/// nonexistent collection creates it (self-contained ingest).
+fn insertTestKv(gpa: Allocator, eng: *engine_mod.Engine) !void {
+    var dark: value.Value = .{ .text = try gpa.dupe(u8, "dark") };
+    defer dark.deinit(gpa);
+    try eng.putKv("settings", "theme", dark);
+    try eng.putKv("settings", "retries", .{ .int = 3 });
+    var beta: value.Value = .{ .text = try gpa.dupe(u8, "enabled") };
+    defer beta.deinit(gpa);
+    try eng.putKv("settings", "beta", beta);
+}
+
+test "kv collections read key and value with predicates and upsert" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-kv";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try insertTestKv(gpa, &eng);
+
+    // A point read by key: `key` is text, `value` is the scalar.
+    var request = try compile(gpa, "from settings\n| where key = 'theme'\n| emit { key, value }\n| limit 5");
+    defer request.deinit(gpa);
+    var result = try execute(gpa, &eng, &request);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.cells.len);
+    try std.testing.expectEqualStrings("key", result.columns[0]);
+    try std.testing.expectEqualStrings("value", result.columns[1]);
+    try std.testing.expectEqualStrings("theme", result.cells[0][0].?);
+    try std.testing.expectEqualStrings("dark", result.cells[0][1].?);
+
+    // A predicate on the value filters typed scalars; an absent key matches
+    // nothing.
+    var numeric = try compile(gpa, "from settings\n| where value = 3\n| emit { key }");
+    defer numeric.deinit(gpa);
+    var numeric_result = try execute(gpa, &eng, &numeric);
+    defer numeric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), numeric_result.cells.len);
+    try std.testing.expectEqualStrings("retries", numeric_result.cells[0][0].?);
+
+    var absent = try compile(gpa, "from settings\n| where key = 'missing'\n| emit { key, value }");
+    defer absent.deinit(gpa);
+    var absent_result = try execute(gpa, &eng, &absent);
+    defer absent_result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), absent_result.cells.len);
+
+    // Upsert replaces the value in place; insertion order is stable.
+    try eng.putKv("settings", "retries", .{ .int = 9 });
+    var all = try compile(gpa, "from settings\n| emit { key, value }");
+    defer all.deinit(gpa);
+    var all_result = try execute(gpa, &eng, &all);
+    defer all_result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), all_result.cells.len);
+    try std.testing.expectEqualStrings("theme", all_result.cells[0][0].?);
+    try std.testing.expectEqualStrings("retries", all_result.cells[1][0].?);
+    try std.testing.expectEqualStrings("9", all_result.cells[1][1].?);
+    try std.testing.expectEqualStrings("beta", all_result.cells[2][0].?);
+}
+
+test "kv source and equivalent IR produce the same result" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-kv-ir";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try insertTestKv(gpa, &eng);
+
+    const source = "from settings\n| where value = 3\n| emit { key, value }";
+    var request_a = try compile(gpa, source);
+    defer request_a.deinit(gpa);
+    var result_a = try execute(gpa, &eng, &request_a);
+    defer result_a.deinit();
+
+    const bytes = try ir.encode(gpa, &request_a);
+    defer gpa.free(bytes);
+    var request_b = try ir.decode(gpa, bytes);
+    defer request_b.deinit(gpa);
+    var result_b = try execute(gpa, &eng, &request_b);
+    defer result_b.deinit();
+
+    try std.testing.expectEqual(result_a.cells.len, result_b.cells.len);
+    try std.testing.expectEqual(@as(usize, 1), result_a.cells.len);
+    for (result_a.cells, 0..) |row, i| {
+        try std.testing.expectEqualStrings(row[0].?, result_b.cells[i][0].?);
+        try std.testing.expectEqualStrings(row[1].?, result_b.cells[i][1].?);
+    }
+}
+
+test "kv collections survive restart recovery" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-kv-restart";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        try insertTestKv(gpa, &eng);
+    }
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        var request = try compile(gpa, "from settings\n| emit { key, value }");
+        defer request.deinit(gpa);
+        var result = try execute(gpa, &eng, &request);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.cells.len);
+        try std.testing.expectEqualStrings("theme", result.cells[0][0].?);
+        try std.testing.expectEqualStrings("dark", result.cells[0][1].?);
+        try std.testing.expectEqualStrings("retries", result.cells[1][0].?);
+        try std.testing.expectEqualStrings("3", result.cells[1][1].?);
+        try std.testing.expectEqualStrings("beta", result.cells[2][0].?);
+    }
+}
+
+test "kv collections survive checkpoint and restart" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-kv-ckpt";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        try insertTestKv(gpa, &eng);
+        // A checkpoint rewrites the WAL to reconstruct current state; the KV
+        // records are re-emitted as create_kv + kv_put.
+        _ = try eng.checkpoint();
+    }
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        var request = try compile(gpa, "from settings\n| where key = 'theme'\n| emit { key, value }");
+        defer request.deinit(gpa);
+        var result = try execute(gpa, &eng, &request);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.cells.len);
+        try std.testing.expectEqualStrings("dark", result.cells[0][1].?);
+    }
+}
+
+test "kv rejects a vector value and keeps the collection unmodified" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-flow-kv-reject";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+    defer eng.deinit();
+    try eng.putKv("settings", "ok", .{ .int = 1 });
+
+    var embedding: value.Value = .{ .vector = try gpa.dupe(f32, &.{ 1, 2 }) };
+    defer embedding.deinit(gpa);
+    try std.testing.expectError(error.UnsupportedValue, eng.putKv("settings", "bad", embedding));
+    try std.testing.expectError(error.MissingKey, eng.putKv("settings", "", .{ .int = 1 }));
+
+    var request = try compile(gpa, "from settings\n| emit { key }");
+    defer request.deinit(gpa);
+    var result = try execute(gpa, &eng, &request);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.cells.len);
+    try std.testing.expectEqualStrings("ok", result.cells[0][0].?);
+}
+
 // ── Cooperative cancellation probe (roadmap Phase 6) ──
 
 /// Test probe that permits `remaining` bounded work units and then reports
@@ -873,4 +1043,3 @@ test "a cancellation probe applies to transaction-scoped reads" {
     var probe = CountingProbe{ .remaining = 2 };
     try std.testing.expectError(error.Canceled, executeTxOpts(gpa, &eng, &request, &tx, probeOpts(&probe)));
 }
-

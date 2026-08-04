@@ -128,12 +128,13 @@ because its source syntax or IR shape exists.
 ### Phase 2: Read-Only Semantic-Model Vertical Slices
 
 **Status:** Complete. The relation, Observation Evidence (ADR-0019), document,
-and graph read-only slices are implemented through the official RunaDB Client
-as protocol v3 development capabilities. Each slice is supported and tested
-only for its published semantics; source and equivalent canonical Runa Query IR
-produce the same result or error, verified end to end over the wire protocol;
-and no slice claims a World Continuum capability beyond what it publishes. The
-delivery bullets below record the definitional work each slice satisfied.
+graph, and key-value read-only slices are implemented through the official
+RunaDB Client as protocol v3 development capabilities. Each slice is supported
+and tested only for its published semantics; source and equivalent canonical
+Runa Query IR produce the same result or error, verified end to end over the
+wire protocol; and no slice claims a World Continuum capability beyond what it
+publishes. The delivery bullets below record the definitional work each slice
+satisfied.
 
 **Goal:** Prove the new public boundary through narrow, end-to-end read paths
 before adding mutations or declaring multiple data models supported.
@@ -157,8 +158,14 @@ collections survive checkpoint and restart. The graph slice is implemented
 through the official RunaDB Client: labeled directed edges between
 document-like nodes, a `navigate <edge> as <alias>` traversal stage, and
 `graph_add_node`/`graph_add_edge` ingestion, with source-vs-IR equivalence,
-checkpoint/restart recovery, and official-client round-trip coverage. The
-remaining World Continuum inspection forms remain outstanding below.
+checkpoint/restart recovery, and official-client round-trip coverage. The KV
+slice is implemented through the official RunaDB Client: text key to scalar
+value mappings read as `key`/`value` rows through the relation grammar, the
+`kv_put` canonical IR operation upserts entries and creates the collection on
+its first put, replaced keys keep their insertion position, vector values and
+empty keys are rejected at validation, and source-vs-IR equivalence plus
+checkpoint/restart recovery are covered at the engine level and over the wire.
+The remaining World Continuum inspection forms remain outstanding below.
 
 - Build relation, document, and graph read-only vertical slices through the
   official RunaDB Client, from Runa Flow source through binding and canonical
@@ -313,7 +320,11 @@ interval, the engine tracks `oldest_active_snapshot_seq` through a bounded
 snapshot registry, reads interpret only versions committed at or before their
 starting watermark, and reclamation frees only versions invisible to every
 active snapshot — with deterministic restart, recovery, point/range, and
-snapshot-safety coverage. The `runa-lsm-bench` harness records a first
+snapshot-safety coverage. Reclamation is driven by the maintenance path: the
+checkpoint's loop frees retained versions past the active-snapshot horizon
+after its flush+compact pass, and `Engine.retentionStats` reports the
+retained/unreclaimable/reclaimed counts and the oldest active watermark. The
+`runa-lsm-bench` harness records a first
 baseline (durable inserts with per-batch flush, compaction, present/absent
 point lookups, and restart recovery) in
 docs/benchmarks/lsm-baseline-2026-08-02.md. The checkpoint's maintenance
@@ -335,11 +346,21 @@ admission queue, backpressure, cancellation, job-failure isolation, and
 tear-down release of queued work), `Engine.compactionCandidates` exposes the
 compaction-trigger boundary, and the scheduler-fed queue-saturation regression
 (`net/runtime_test.zig`) drives real LSM compaction through that path under
-load. The remaining work below is the
-in-memory skiplist MemTable, secondary indexes, scheduler-integrated
-flush/checkpoint triggering (wiring the memtable-flush boundary into the
-maintenance path), and benchmark baselines across more workloads and
-durability levels.
+load. The memtable-flush boundary is wired into the maintenance path as a
+development slice: `Engine.memtable_flush_entries` is the row-count proxy for
+write-buffer size, `Engine.flushCandidates` exposes the tables whose memtable
+crossed it, and the scheduler-fed flush regression (`net/runtime_test.zig`)
+drives real LSM flushes through the maintenance worker under concurrent
+writers, then compacts the L0 files they produced and verifies bounded
+admission, exact commit order, and exact restart recovery. MVCC retention
+reclamation is now driven by the maintenance path too: the checkpoint's
+maintenance loop frees every retained version no active snapshot can still
+see (`deleted_seq < oldest_active_snapshot_seq`) and reports it as
+`checkpoint_stats.retained_reclaimed`, and `Engine.retentionStats` exposes the
+retained-version count, the unreclaimable count, the cumulative reclaimed
+count, and the oldest active snapshot watermark. The remaining work below is
+the in-memory skiplist MemTable, secondary indexes, and benchmark baselines
+across more workloads and durability levels.
 
 **Goal:** Move table and index storage from the in-memory baseline to ordered,
 recoverable LSM structures while preserving snapshot visibility.

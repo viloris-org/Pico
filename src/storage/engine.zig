@@ -8,6 +8,7 @@ const table_mod = @import("table.zig");
 const mvcc_mod = @import("mvcc.zig");
 const document_mod = @import("document.zig");
 const graph_mod = @import("graph.zig");
+const kv_mod = @import("kv.zig");
 const manifest_mod = @import("manifest.zig");
 const checkpoint_mod = @import("checkpoint.zig");
 const evidence_mod = @import("evidence.zig");
@@ -116,6 +117,23 @@ pub const EvidenceStats = struct {
 const modalityCount = std.enums.values(evidence_mod.Modality).len;
 const rejectReasonCount = std.enums.values(RejectReason).len;
 
+/// MVCC retention observability (roadmap Phase 5 required metric "active
+/// snapshot count, oldest snapshot watermark, unreclaimable version count").
+/// Counters never expose row contents.
+pub const RetentionStats = struct {
+    /// Retained (superseded, not-yet-reclaimed) versions across all tables.
+    retained_versions: usize = 0,
+    /// Of those, the versions some active snapshot can still see: versions
+    /// whose deletion interval overlaps an active snapshot watermark, which
+    /// reclamation must keep.
+    unreclaimable_versions: usize = 0,
+    /// Cumulative versions reclaimed so far.
+    reclaimed_versions: u64 = 0,
+    /// Oldest active snapshot watermark, or null when no snapshot is active
+    /// (reclamation then uses `published_commit_seq + 1` as the horizon).
+    oldest_snapshot_seq: ?u64 = null,
+};
+
 /// Single-writer storage engine: in-memory tables (the LSM memtable half) +
 /// WAL + the on-disk LSM store (roadmap Phase 5). Table rows live in
 /// `table.zig`; `lsm/store.zig` materializes durable SSTable snapshots at
@@ -142,11 +160,25 @@ pub const Engine = struct {
     /// Graph collections (roadmap Phase 2). A name is exclusive with tables
     /// and document collections.
     graphs: std.StringHashMap(graph_mod.Graph),
+    /// KV collections (roadmap Phase 2). A name is exclusive with tables,
+    /// document collections, and graphs.
+    kvs: std.StringHashMap(kv_mod.KvMap),
     observations: std.ArrayList(evidence_mod.Record),
     next_evidence_id: u64 = 1,
     evidence_stats: EvidenceStats = .{},
     /// Operator resource bounds for evidence staging and retention.
     evidence_limits: EvidenceLimits = .{},
+    /// Memtable flush boundary (roadmap Phase 5 "scheduler-integrated
+    /// flush/checkpoint triggering"): when a primary-key table's in-memory row
+    /// count crosses this threshold, the maintenance path may flush it into L0.
+    /// A row count is the current proxy for write-buffer size until the
+    /// skiplist MemTable with byte accounting lands; heap tables (no
+    /// single-column primary key) stay WAL-backed and are never flush
+    /// candidates. Tests lower this to exercise the boundary deterministically.
+    memtable_flush_entries: usize = 4096,
+    /// Cumulative retained versions reclaimed by `reclaimRetainedVersions`
+    /// (MVCC retention observability; roadmap Phase 5 required metric).
+    retention_reclaimed_total: u64 = 0,
     /// Instance-wide attachments currently in the begin..finish/abort staging
     /// window. Guarded by `writer_mutex` in a multi-threaded runtime; the
     /// current single-threaded server never overlaps these with a writer.
@@ -219,6 +251,7 @@ pub const Engine = struct {
             .tables = std.StringHashMap(Table).init(gpa),
             .documents = std.StringHashMap(document_mod.Collection).init(gpa),
             .graphs = std.StringHashMap(graph_mod.Graph).init(gpa),
+            .kvs = std.StringHashMap(kv_mod.KvMap).init(gpa),
             .observations = .empty,
             .coordinator = Coordinator.init(gpa, io),
             .snapshot_registry = mvcc_mod.SnapshotRegistry.init(gpa),
@@ -248,6 +281,11 @@ pub const Engine = struct {
             entry.value_ptr.deinit();
         }
         self.graphs.deinit();
+        var kv_it = self.kvs.iterator();
+        while (kv_it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.kvs.deinit();
         for (self.observations.items) |*record| record.deinit(self.gpa);
         self.observations.deinit(self.gpa);
         self.payloads.deinit();
@@ -383,6 +421,7 @@ pub const Engine = struct {
                 .table => self.tables.contains(object.name),
                 .document => self.documents.contains(object.name),
                 .graph => self.graphs.contains(object.name),
+                .kv => self.kvs.contains(object.name),
             };
             if (!exists) return error.CorruptManifest;
         }
@@ -552,6 +591,16 @@ pub const Engine = struct {
                 const graph = self.graphs.getPtr(rec.graph) orelse return error.TableNotFound;
                 try graph.addEdge(rec.from, rec.label, rec.to);
             },
+            .create_kv => |create| {
+                if (self.kvs.contains(create.name) or self.tables.contains(create.name) or self.documents.contains(create.name) or self.graphs.contains(create.name)) return error.TableExists;
+                var map = try kv_mod.KvMap.create(self.gpa, create.name);
+                errdefer map.deinit();
+                try self.kvs.put(map.name, map);
+            },
+            .kv_put => |put| {
+                const map = self.kvs.getPtr(put.collection) orelse return error.TableNotFound;
+                try map.put(put.key, put.item);
+            },
         }
     }
 
@@ -590,8 +639,12 @@ pub const Engine = struct {
     }
 
     /// Reclaim retained versions invisible to every active snapshot across all
-    /// tables. Returns the total number of versions reclaimed. A future
-    /// compactor drives this; the live row set is never touched.
+    /// tables. Returns the total number of versions reclaimed and accumulates
+    /// it into `retention_reclaimed_total` (observability). A future
+    /// compactor drives this; the live row set is never touched. The caller
+    /// must serialize with statements (hold the engine statement lock, or be
+    /// the single-threaded server): readers iterate `table.retained` while a
+    /// scan is in progress, so reclamation must not run concurrently with one.
     pub fn reclaimRetainedVersions(self: *Engine) usize {
         const oldest = self.oldestActiveSnapshotSeq();
         var total: usize = 0;
@@ -599,7 +652,62 @@ pub const Engine = struct {
         while (it.next()) |entry| {
             total += entry.value_ptr.reclaimRetained(self.gpa, oldest);
         }
+        self.retention_reclaimed_total += total;
         return total;
+    }
+
+    /// Snapshot of the MVCC retention state: retained versions, how many no
+    /// active snapshot can release yet, the cumulative reclaimed count, and
+    /// the oldest active watermark (or null). The caller must serialize with
+    /// statements for a consistent read of the per-table retained lists.
+    pub fn retentionStats(self: *Engine) RetentionStats {
+        const oldest = self.snapshot_registry.oldestActive();
+        const horizon = oldest orelse (self.publishedSeq() + 1);
+        var retained: usize = 0;
+        var unreclaimable: usize = 0;
+        var it = self.tables.iterator();
+        while (it.next()) |entry| {
+            retained += entry.value_ptr.retainedVersionCount();
+            unreclaimable += entry.value_ptr.unreclaimableRetainedCount(horizon);
+        }
+        return .{
+            .retained_versions = retained,
+            .unreclaimable_versions = unreclaimable,
+            .reclaimed_versions = self.retention_reclaimed_total,
+            .oldest_snapshot_seq = oldest,
+        };
+    }
+
+    /// Whether `table_name`'s memtable crossed the flush boundary: a
+    /// primary-key table holding at least `memtable_flush_entries` live rows.
+    /// Heap tables (no single-column primary key) cannot be materialized by
+    /// the LSM and are never flush candidates. Pure read of the catalog and
+    /// row count; the maintenance driver serializes it with statements via the
+    /// engine lock.
+    pub fn needsFlush(self: *const Engine, table_name: []const u8) bool {
+        const table = self.tables.get(table_name) orelse return false;
+        if (table.pk_index == null) return false;
+        return table.rows.items.len >= self.memtable_flush_entries;
+    }
+
+    /// Names of PK-addressable tables whose memtable crossed the flush
+    /// boundary. Runs under `writer_mutex` so the catalog iteration is
+    /// consistent with concurrent DDL/checkpoint; the returned names are
+    /// borrowed from the catalog and the caller must copy any it keeps beyond
+    /// the next DDL. The maintenance driver submits flush jobs for these
+    /// through the I/O scheduler's maintenance class (roadmap Phase 5:
+    /// "wiring the memtable-flush boundary into the maintenance path") and
+    /// must hold the engine statement lock while collecting, so the row
+    /// counts are consistent with committed state.
+    pub fn flushCandidates(self: *Engine, gpa: Allocator, out: *std.ArrayList([]const u8)) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        var it = self.tables.iterator();
+        while (it.next()) |entry| {
+            if (self.needsFlush(entry.key_ptr.*)) {
+                try out.append(gpa, entry.key_ptr.*);
+            }
+        }
     }
 
     fn applyTxnOp(self: *Engine, op: *const wal_mod.TxnOp, commit_seq: u64) anyerror!void {
@@ -874,6 +982,55 @@ pub const Engine = struct {
     /// Look up a graph, or null when no graph with that name exists.
     pub fn getGraph(self: *Engine, name: []const u8) ?*graph_mod.Graph {
         return self.graphs.getPtr(name);
+    }
+
+    // ── KV collections (roadmap Phase 2) ──
+
+    /// Create an empty KV collection. The name is exclusive with tables,
+    /// document collections, and graphs.
+    pub fn createKv(self: *Engine, name: []const u8) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+        try self.createKvLocked(name);
+    }
+
+    fn createKvLocked(self: *Engine, name: []const u8) !void {
+        if (self.kvs.contains(name) or self.tables.contains(name) or self.documents.contains(name) or self.graphs.contains(name)) return error.TableExists;
+
+        try self.wal.appendCreateKv(.{ .name = name });
+
+        var map = try kv_mod.KvMap.create(self.gpa, name);
+        errdefer map.deinit();
+        try self.kvs.put(map.name, map);
+    }
+
+    /// Upsert one key/value pair into a named KV collection. The ingest is
+    /// self-contained: putting into a nonexistent collection creates it
+    /// (mirroring the document and graph slices), and a table, document
+    /// collection, or graph with the same name is rejected. The WAL record is
+    /// appended before the in-memory upsert so a durable put is never lost.
+    pub fn putKv(self: *Engine, collection_name: []const u8, key: []const u8, item: value.Value) !void {
+        try self.writer_mutex.lock(self.io);
+        defer self.writer_mutex.unlock(self.io);
+
+        // Validate before touching state or the WAL so a rejected put leaves
+        // no record and creates no collection.
+        if (key.len == 0) return error.MissingKey;
+        if (item == .vector) return error.UnsupportedValue;
+
+        if (self.kvs.getPtr(collection_name) == null) {
+            try self.createKvLocked(collection_name);
+        }
+        const map = self.kvs.getPtr(collection_name) orelse return error.TableNotFound;
+
+        try self.wal.appendKvPut(.{ .collection = collection_name, .key = key, .item = item });
+        try map.put(key, item);
+    }
+
+    /// Look up a KV collection, or null when no collection with that name
+    /// exists. Used by the semantic binding to route Flow requests.
+    pub fn getKvMap(self: *Engine, name: []const u8) ?*kv_mod.KvMap {
+        return self.kvs.getPtr(name);
     }
 
     /// Rank non-null embeddings in one table column. The caller owns the query
@@ -1448,6 +1605,15 @@ pub const Engine = struct {
                 if (try self.compactIfTriggered(entry.key_ptr.*)) compacted_tables += 1;
             }
         }
+        // Roadmap Phase 5 MVCC retention on the maintenance path: free every
+        // retained version no active snapshot can still see
+        // (`deleted_seq < oldest_active_snapshot_seq`). The checkpoint already
+        // collapsed durable history into SSTables and the rewritten WAL, so
+        // in-memory history past the snapshot horizon is pure cost; an active
+        // old snapshot still blocks reclamation through the registry. Runs
+        // under `writer_mutex`; the single-threaded server model guarantees no
+        // reader is mid-scan here.
+        const retained_reclaimed = self.reclaimRetainedVersions();
 
         var doc_refs: std.ArrayList(*const document_mod.Collection) = .empty;
         defer doc_refs.deinit(self.gpa);
@@ -1461,12 +1627,19 @@ pub const Engine = struct {
         var graph_it = self.graphs.iterator();
         while (graph_it.next()) |entry| graph_refs.appendAssumeCapacity(entry.value_ptr);
 
-        var stats = try checkpoint_mod.run(&self.wal, heap_refs.items, doc_refs.items, graph_refs.items, self.observations.items, watermark);
+        var kv_refs: std.ArrayList(*const kv_mod.KvMap) = .empty;
+        defer kv_refs.deinit(self.gpa);
+        try kv_refs.ensureTotalCapacity(self.gpa, self.kvs.count());
+        var kv_it = self.kvs.iterator();
+        while (kv_it.next()) |entry| kv_refs.appendAssumeCapacity(entry.value_ptr);
+
+        var stats = try checkpoint_mod.run(&self.wal, heap_refs.items, doc_refs.items, graph_refs.items, kv_refs.items, self.observations.items, watermark);
         // Reported counts cover the whole checkpoint: tables flushed to SSTables
         // plus heap tables rewritten into the WAL.
         stats.tables += flushed_tables;
         stats.rows += flushed_rows;
         stats.compactions = compacted_tables;
+        stats.retained_reclaimed = retained_reclaimed;
 
         // Publish the durable manifest boundary only after the WAL rewrite has
         // committed, so the manifest always describes state the rewritten WAL
@@ -1474,13 +1647,15 @@ pub const Engine = struct {
         // encode inside publish.
         var objects: std.ArrayList(manifest_mod.CatalogObject) = .empty;
         defer objects.deinit(self.gpa);
-        try objects.ensureTotalCapacity(self.gpa, self.tables.count() + self.documents.count() + self.graphs.count());
+        try objects.ensureTotalCapacity(self.gpa, self.tables.count() + self.documents.count() + self.graphs.count() + self.kvs.count());
         var table_it2 = self.tables.iterator();
         while (table_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .table, .name = entry.key_ptr.* });
         var doc_it2 = self.documents.iterator();
         while (doc_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .document, .name = entry.key_ptr.* });
         var graph_it2 = self.graphs.iterator();
         while (graph_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .graph, .name = entry.key_ptr.* });
+        var kv_it2 = self.kvs.iterator();
+        while (kv_it2.next()) |entry| objects.appendAssumeCapacity(.{ .kind = .kv, .name = entry.key_ptr.* });
         const manifest = manifest_mod.Manifest{ .commit_seq = self.publishedSeq(), .objects = objects.items };
         try manifest_mod.publish(&self.wal.vfs, self.gpa, &manifest);
         return stats;

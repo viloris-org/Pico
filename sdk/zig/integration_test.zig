@@ -60,6 +60,7 @@ test "RunaDB Client v3 protocol lifecycle, evidence, and request errors" {
     try expectEvidenceRoundTrip(gpa, io);
     try expectDocumentRoundTrip(gpa, io);
     try expectGraphRoundTrip(gpa, io);
+    try expectKvRoundTrip(gpa, io);
     try expectVersionRejection(gpa, io);
     try expectMalformedRequestsKeepConnectionUsable(gpa, io);
     try expectCancellationNoOps(gpa, io);
@@ -299,6 +300,72 @@ fn expectGraphRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
     try std.testing.expect((try bad.next(arena.allocator())) == null);
 }
 
+/// KV collections ingest through canonical IR (`putKv`) and read through the
+/// Flow `from`/`emit` stages over the wire (roadmap Phase 2 KV slice).
+fn expectKvRoundTrip(gpa: std.mem.Allocator, io: Io) !void {
+    var conn = try connectWhenReady(gpa, io);
+    defer conn.deinit(io);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // putKv creates the collection on its first put (self-contained ingest).
+    var put_theme = try conn.putKv("session", "theme", .{ .text = "dark" });
+    const theme_row = try put_theme.expectOneRow(arena.allocator());
+    try std.testing.expectEqualStrings("theme", theme_row.raw(0));
+    try std.testing.expectEqualStrings("dark", theme_row.raw(1));
+
+    var put_retries = try conn.putKv("session", "retries", .{ .int = 3 });
+    try put_retries.drain(arena.allocator());
+
+    // Upsert replaces the value of an existing key.
+    var put_again = try conn.putKv("session", "retries", .{ .int = 9 });
+    const retries_row = try put_again.expectOneRow(arena.allocator());
+    try std.testing.expectEqualStrings("9", retries_row.raw(1));
+
+    // Point read by key through Runa Flow.
+    var read = try conn.executeFlow(arena.allocator(), "from session\n| where key = 'theme'\n| emit { key, value }\n| limit 5");
+    try std.testing.expect((try read.next(arena.allocator())).? == .row_description);
+    const read_row = (try read.next(arena.allocator())).?;
+    switch (read_row) {
+        .row_data => |data| {
+            try std.testing.expectEqualStrings("theme", data.values[0]);
+            try std.testing.expectEqualStrings("dark", data.values[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try read.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try read.next(arena.allocator())) == null);
+
+    // A predicate on the value filters typed scalars; an absent key matches
+    // nothing.
+    var filtered = try conn.executeFlow(arena.allocator(), "from session\n| where value = 9\n| emit { key }");
+    try std.testing.expect((try filtered.next(arena.allocator())).? == .row_description);
+    const filtered_row = (try filtered.next(arena.allocator())).?;
+    switch (filtered_row) {
+        .row_data => |data| try std.testing.expectEqualStrings("retries", data.values[0]),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try filtered.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try filtered.next(arena.allocator())) == null);
+
+    var absent = try conn.executeFlow(arena.allocator(), "from session\n| where key = 'missing'\n| emit { key, value }");
+    try std.testing.expect((try absent.next(arena.allocator())).? == .row_description);
+    try std.testing.expect((try absent.next(arena.allocator())).? == .command_complete);
+    try std.testing.expect((try absent.next(arena.allocator())) == null);
+
+    // An empty key is a static shape violation: the canonical IR is rejected
+    // at validation (RF1003) and the Connection stays usable.
+    var bad = try conn.putKv("session", "", .{ .int = 1 });
+    const bad_message = (try bad.next(arena.allocator())).?;
+    switch (bad_message) {
+        .server_error => |server_error| {
+            try std.testing.expectEqualStrings("RF1003", server_error.code);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try bad.next(arena.allocator())) == null);
+}
+
 fn connectWhenReady(gpa: std.mem.Allocator, io: Io) !sdk.Connection {
     var last_error: ?anyerror = null;
     for (0..100) |_| {
@@ -432,8 +499,8 @@ fn expectMalformedRequestsKeepConnectionUsable(allocator: std.mem.Allocator, io:
     // no projection fields. Direct IR input must obey the same static shape
     // constraints as Runa Flow source.
     const empty_projection_ir = [_]u8{
-        0, 5, // wire IR format version
-        0, 5, // canonical IR format version
+        0, 6, // wire IR format version
+        0, 6, // canonical IR format version
         0, 0, 0, 0, 0, 0, 0, 0, // model revision
         1, // emit operation
         0, 8, 'c', 'u', 's', 't', 'o', 'm', 'e', 'r', // relation
@@ -624,11 +691,16 @@ test "QUIC transport: certificate pinning regressions and round-trip" {
     const port_text = "64335";
     const child_args = [_][]const u8{
         server_path,
-        "--quic-port", port_text,
-        "--runa-port", "0",
-        "--data-dir", quic_data_dir,
-        "--cert", "sdk/zig/testdata/quic-test-cert.pem",
-        "--key", "sdk/zig/testdata/quic-test-key.pem",
+        "--quic-port",
+        port_text,
+        "--runa-port",
+        "0",
+        "--data-dir",
+        quic_data_dir,
+        "--cert",
+        "sdk/zig/testdata/quic-test-cert.pem",
+        "--key",
+        "sdk/zig/testdata/quic-test-key.pem",
     };
     var child = try std.process.spawn(io, .{
         .argv = &child_args,
@@ -719,12 +791,18 @@ test "QUIC transport: idle timeout against the SDK client" {
     const port_text = "64336";
     const child_args = [_][]const u8{
         server_path,
-        "--quic-port", port_text,
-        "--runa-port", "0",
-        "--data-dir", quic_idle_data_dir,
-        "--cert", "sdk/zig/testdata/quic-test-cert.pem",
-        "--key", "sdk/zig/testdata/quic-test-key.pem",
-        "--quic-idle-timeout-ms", "1200",
+        "--quic-port",
+        port_text,
+        "--runa-port",
+        "0",
+        "--data-dir",
+        quic_idle_data_dir,
+        "--cert",
+        "sdk/zig/testdata/quic-test-cert.pem",
+        "--key",
+        "sdk/zig/testdata/quic-test-key.pem",
+        "--quic-idle-timeout-ms",
+        "1200",
     };
     var child = try std.process.spawn(io, .{
         .argv = &child_args,

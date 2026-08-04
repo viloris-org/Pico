@@ -111,6 +111,14 @@ graph name, a node id, and node fields, creating the graph on its first node;
 existing nodes. Graph reads use `executeFlow` with the `navigate` stage, for
 example `from social | navigate mentors as mentee | emit { name, mentee.name }`.
 
+`Connection.putKv` upserts one key/value pair into a KV collection through a
+canonical `kv_put` IR request. It takes the collection name, a text key, and a
+scalar value; the Server creates the collection on its first put and replaces
+the value of an existing key. The result's single row carries the stored `key`
+and `value`. KV reads use `executeFlow` with the ordinary `emit` request over
+the collection, for example `from session | where key = 'theme' | emit { key,
+value }`.
+
 Protocol v3.0 defines a fire-and-forget `cancel_request`; in the sequential
 runtime a cancel is delivered only between statements (a no-op by design), and
 a delivered `CANCELED` result arrives with the concurrent runtime. There is

@@ -40,7 +40,10 @@ RunaDB Server is under active development. The current implementation provides:
   `document_insert` ingestion through the official RunaDB Client
 - Read-only graphs with labeled edges, `navigate` traversal, and
   `graph_add_node`/`graph_add_edge` ingestion through the official RunaDB Client
-- Canonical Runa Query IR format version `5`
+- Read-only KV collections: text key to scalar value mappings read as
+  `key`/`value` rows, with `kv_put` upsert ingestion through the official
+  RunaDB Client
+- Canonical Runa Query IR format version `6`
 - Immutable Observation Evidence payload storage and verified recovery
 - WAL-backed persistence and crash recovery
 - WAL frame versioning and CRC32 validation
@@ -62,18 +65,19 @@ the extended query protocol are planned parts of the architecture, not all
 current product capabilities. The transaction coordinator and commit ordering
 exist as an engine-level development slice; they are not yet exposed through the
 wire protocol or MCP. Runa Flow, Runa Query IR, and the semantic model are the
-next public-contract work; relation, document, and graph capabilities become
-support claims only when their complete semantics and evidence are published.
-Multi-model and multimodal data, AI-assisted execution, distributed deployments,
-HTAP, streaming, historical queries, post-quantum cryptography, and autonomous
-operations remain long-horizon target designs. See
+next public-contract work; relation, document, graph, and KV collection
+capabilities become support claims only when their complete semantics and
+evidence are published. Multi-model and multimodal data, AI-assisted execution,
+distributed deployments, HTAP, streaming, historical queries, post-quantum
+cryptography, and autonomous operations remain long-horizon target designs. See
 [ADR-0016](docs/adr/0016-long-horizon-unified-database.md) and
 [ADR-0017](docs/adr/0017-runa-flow-language-and-semantic-model.md).
 
 Relation mutations and transactions, graph traversal beyond one labeled hop,
 semantic-model persistence, authorization, and World Continuum bindings are
-not implemented as public capabilities. Document and graph reads and their
-ingest operations are development slices; mutation beyond insertion is not.
+not implemented as public capabilities. Document, graph, and KV collection
+reads and their ingest operations are development slices; mutation beyond
+insertion (and beyond KV upsert) is not.
 
 ## Build
 

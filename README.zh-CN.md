@@ -21,15 +21,17 @@ PostgreSQL 客户端均不受支持；旧 SQL parser、executor 和协议端点�
   的 `document_insert` 摄取
 - 只读 graph：带标签边、`navigate` 遍历，以及通过官方 RunaDB Client 的
   `graph_add_node`/`graph_add_edge` 摄取
+- 只读 KV collection：text key 到 scalar value 映射，以 `key`/`value` 行读取，
+  并通过官方 RunaDB Client 的 `kv_put` upsert 摄取
 - Observation Evidence 原生 payload 存储与恢复校验
-- Runa Query IR format version `4`
+- Runa Query IR format version `6`
 - 面向 Agent 的 opt-in MCP stdio adapter，只提供只读 Runa Flow
 - WAL 持久化、CRC32 校验、checkpoint 与崩溃恢复
 
 通用 Mutation、transaction、单跳之外的 graph 遍历、持久化 semantic model、
-authorization 与 World Continuum binding 尚未实现。Document 与 graph 读取及其
-摄取操作是开发切片；除插入外的 mutation 未实现。LSM、MVCC、group commit 等
-仍是目标架构，不是当前支持声明。
+authorization 与 World Continuum binding 尚未实现。Document、graph 与 KV
+collection 读取及其摄取操作是开发切片；除插入（以及 KV upsert）之外的
+mutation 未实现。LSM、MVCC、group commit 等仍是目标架构，不是当前支持声明。
 
 ## 构建与运行
 

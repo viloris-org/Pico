@@ -562,6 +562,242 @@ test "scheduler-fed maintenance compacts under load with bounded admission and e
     }
 }
 
+// ── Scheduler-integrated memtable flush (roadmap Phase 5) ──
+//
+// The maintenance worker also owns the memtable -> L0 boundary: when a
+// primary-key table's row count crosses `Engine.memtable_flush_entries`, the
+// driver submits a flush job through the scheduler's `maintenance` class
+// instead of flushing on the statement path. This regression drives real LSM
+// flushes through that path under concurrent writers, then compacts the L0
+// files they produced, and verifies bounded admission, exact commit order,
+// and exact restart recovery.
+
+/// Flush job context: the engine and an owned table name.
+const FlushJobCtx = struct {
+    eng: *engine_mod.Engine,
+    table_name: []u8,
+};
+
+fn runFlush(ctx: ?*anyopaque) anyerror!void {
+    const c: *FlushJobCtx = @ptrCast(@alignCast(ctx.?));
+    // The flush reads live rows, which commits mutate under the statement
+    // lock, so the maintenance worker takes the engine lock around it. No
+    // lock cycle: statements and flush jobs both acquire engine lock before
+    // the writer mutex, and compaction jobs take only the writer mutex.
+    c.eng.lock(c.eng.io) catch |err| return err;
+    defer c.eng.unlock(c.eng.io);
+    try c.eng.flush(c.table_name);
+}
+
+/// Owner-side completion: free the context and the owned name.
+fn flushDone(job: *maintenance_mod.Job, result: maintenance_mod.JobResult) void {
+    _ = result;
+    const ctx: *FlushJobCtx = @ptrCast(@alignCast(job.ctx.?));
+    const gpa = ctx.eng.gpa;
+    gpa.free(ctx.table_name);
+    gpa.destroy(ctx);
+}
+
+/// Submit one memtable-flush job; on `MaintenanceFull` free the not-accepted
+/// job and count the saturation event. On success, bump `submitted`.
+fn submitFlushJob(
+    gpa: Allocator,
+    eng: *engine_mod.Engine,
+    maint: *maintenance_mod.Maintenance,
+    name: []const u8,
+    submitted: *std.atomic.Value(u64),
+) !void {
+    const owned = try gpa.dupe(u8, name);
+    errdefer gpa.free(owned);
+    const ctx = try gpa.create(FlushJobCtx);
+    errdefer gpa.destroy(ctx);
+    ctx.* = .{ .eng = eng, .table_name = owned };
+    const job = try gpa.create(maintenance_mod.Job);
+    errdefer gpa.destroy(job);
+    job.* = .{
+        .run_fn = runFlush,
+        .ctx = ctx,
+        .on_done = flushDone,
+        .owned_gpa = gpa,
+    };
+    maint.submitJob(job, 0, 1) catch |err| switch (err) {
+        error.MaintenanceFull => {
+            gpa.free(owned);
+            gpa.destroy(ctx);
+            gpa.destroy(job);
+            return;
+        },
+        else => return err,
+    };
+    _ = submitted.fetchAdd(1, .monotonic);
+}
+
+/// Feeds the maintenance worker: collects tables whose memtable crossed the
+/// flush boundary (under the statement lock, so the row counts are consistent
+/// with committed state), submits one flush job per candidate through the
+/// scheduler's maintenance class, then submits compaction jobs for tables
+/// whose L0 depth crossed the compaction trigger.
+const FlushMaintenanceDriver = struct {
+    gpa: Allocator,
+    io: Io,
+    eng: *engine_mod.Engine,
+    maint: *maintenance_mod.Maintenance,
+    start: *std.atomic.Value(bool),
+    failed: *std.atomic.Value(bool),
+    rounds: usize,
+    flushes_submitted: *std.atomic.Value(u64),
+    saturation: *std.atomic.Value(u64),
+
+    fn run(self: FlushMaintenanceDriver) void {
+        while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+        for (0..self.rounds) |_| {
+            var flush_candidates: std.ArrayList([]const u8) = .empty;
+            defer flush_candidates.deinit(self.gpa);
+            self.eng.lock(self.io) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            self.eng.flushCandidates(self.gpa, &flush_candidates) catch {
+                self.eng.unlock(self.io);
+                self.failed.store(true, .release);
+                return;
+            };
+            self.eng.unlock(self.io);
+            for (flush_candidates.items) |name| {
+                submitFlushJob(self.gpa, self.eng, self.maint, name, self.flushes_submitted) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+
+            var candidates: std.ArrayList([]const u8) = .empty;
+            defer candidates.deinit(self.gpa);
+            self.eng.compactionCandidates(self.gpa, &candidates) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            for (candidates.items) |name| {
+                submitCompactionJob(self.gpa, self.eng, self.maint, name, self.saturation) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+            }
+            Io.sleep(self.io, .fromMilliseconds(10), .awake) catch {};
+        }
+    }
+};
+
+test "scheduler-fed maintenance flushes crossed memtable boundaries and compacts under load" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "zig-cache/runadb-runtime-scheduler-flush";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const total_writes = 3 * 60;
+
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        var cols = [_]value.Column{.{ .name = try gpa.dupe(u8, "id"), .type_tag = .int, .primary_key = true }};
+        defer cols[0].deinit(gpa);
+        try eng.createTable("t", &cols);
+        // Lower the memtable flush boundary so the writers' inserts cross it
+        // deterministically within the regression's write volume.
+        eng.memtable_flush_entries = 32;
+
+        var maint_cfg = maintenance_mod.Config{ .inbound_capacity = 4 };
+        maint_cfg.scheduler.class_capacity[@intFromEnum(scheduler_mod.Class.maintenance)] = .{ .max_slots = 1, .max_bytes = 0 };
+        maint_cfg.scheduler.backpressure_high[@intFromEnum(scheduler_mod.Class.maintenance)] = 2;
+        maint_cfg.scheduler.backpressure_low[@intFromEnum(scheduler_mod.Class.maintenance)] = 1;
+        var maint: maintenance_mod.Maintenance = undefined;
+        try maint.init(gpa, io, maint_cfg);
+        defer maint.deinit();
+
+        const writers = 3;
+        const writes_per_writer = 60;
+        var next_id = std.atomic.Value(u64).init(0);
+        var start = std.atomic.Value(bool).init(false);
+        var failed = std.atomic.Value(bool).init(false);
+        var flushes_submitted = std.atomic.Value(u64).init(0);
+        var saturation = std.atomic.Value(u64).init(0);
+
+        var writer_threads: [writers]std.Thread = undefined;
+        for (&writer_threads) |*th| {
+            th.* = try std.Thread.spawn(.{}, EngineWriter.run, .{EngineWriter{
+                .eng = &eng,
+                .io = io,
+                .next_id = &next_id,
+                .start = &start,
+                .failed = &failed,
+                .writes = writes_per_writer,
+                .table = "t",
+            }});
+        }
+        const driver_thread = try std.Thread.spawn(.{}, FlushMaintenanceDriver.run, .{FlushMaintenanceDriver{
+            .gpa = gpa,
+            .io = io,
+            .eng = &eng,
+            .maint = &maint,
+            .start = &start,
+            .failed = &failed,
+            .rounds = 10,
+            .flushes_submitted = &flushes_submitted,
+            .saturation = &saturation,
+        }});
+
+        start.store(true, .release);
+        for (&writer_threads) |th| th.join();
+        driver_thread.join();
+        try std.testing.expect(!failed.load(.acquire));
+
+        // Wait for the maintenance worker to drain every submitted job to a
+        // terminal outcome (metrics are atomic; safe to poll).
+        var guard: usize = 0;
+        while (true) : (guard += 1) {
+            std.debug.assert(guard < 100_000);
+            const mm = maint.metricsSnapshot();
+            const submitted = mm.jobs_submitted.load(.acquire);
+            const terminal = mm.jobs_completed.load(.acquire) +
+                mm.jobs_failed.load(.acquire) +
+                mm.jobs_cancelled.load(.acquire);
+            if (submitted != 0 and terminal == submitted) break;
+            try Io.sleep(io, .fromMilliseconds(2), .awake);
+        }
+
+        // The memtable boundary was crossed and flush jobs actually ran on the
+        // maintenance worker, materializing L0 files.
+        try std.testing.expect(flushes_submitted.load(.acquire) >= 1);
+        const stats = eng.lsmStats();
+        try std.testing.expect(stats.flushed_files >= 1);
+        // The repeated flushes pushed L0 past the compaction trigger; the
+        // scheduler-fed compactions merged it into L1 and reclaimed inputs.
+        try std.testing.expect(stats.compaction_runs >= 1);
+        try std.testing.expect(stats.files_reclaimed >= 1);
+
+        // Consistent final state: every id committed exactly once, in order.
+        var final = try eng.selectAll("t", eng.publishedSeq());
+        defer final.deinit();
+        try std.testing.expectEqual(@as(usize, total_writes), final.rows.len);
+        for (final.rows, 0..) |row, index| {
+            try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].int);
+        }
+    }
+
+    // Restart over the same data directory: the LSM manifest and SSTables plus
+    // the WAL tail recover exactly the committed prefix, with no duplication
+    // from the scheduler-fed flushes and compactions that ran under load.
+    {
+        var eng = try engine_mod.Engine.open(gpa, io, dir, false);
+        defer eng.deinit();
+        var recovered = try eng.selectAll("t", eng.publishedSeq());
+        defer recovered.deinit();
+        try std.testing.expectEqual(@as(usize, total_writes), recovered.rows.len);
+        for (recovered.rows, 0..) |row, index| {
+            try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].int);
+        }
+    }
+}
+
 // ── Owned result column metadata ──
 
 test "flow result column metadata is owned and survives a later DDL" {

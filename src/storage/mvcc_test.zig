@@ -212,6 +212,66 @@ test "recovery rebuilds retained version history from the wal" {
     Io.Dir.cwd().deleteTree(io, dir) catch {};
 }
 
+test "checkpoint drives retention reclamation only past the active snapshot horizon" {
+    const dir = "zig-cache/runadb-mvcc-ckpt-reclaim";
+    var eng = try freshEngine(dir);
+    defer {
+        eng.deinit();
+        cleanDir(dir);
+    }
+    try makeTable(&eng, "t", "id", &.{col("v", .int)});
+
+    try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 10 } }); // seq 1
+    const old_snapshot = eng.publishedSeq();
+    // A connection holds a snapshot at the pre-update watermark; the two
+    // retained versions ([1,2) and [2,3)) overlap it and must survive.
+    try eng.registerSnapshot(old_snapshot);
+    try eng.update("t", .{ .int = 1 }, &.{ .{ .int = 1 }, .{ .int = 11 } }); // seq 2
+    try eng.delete("t", .{ .int = 1 }); // seq 3
+    try eng.insert("t", &.{ .{ .int = 1 }, .{ .int = 100 } }); // seq 4
+
+    const table = eng.getTable("t").?;
+    try std.testing.expectEqual(@as(usize, 2), table.retained.items.len);
+
+    // The checkpoint's maintenance loop reclaims nothing while the old
+    // snapshot is active: both retained intervals end at or after watermark 1.
+    var stats = try eng.checkpoint();
+    try std.testing.expectEqual(@as(usize, 0), stats.retained_reclaimed);
+    try std.testing.expectEqual(@as(usize, 2), table.retained.items.len);
+    const retained = eng.retentionStats();
+    try std.testing.expectEqual(@as(usize, 2), retained.retained_versions);
+    try std.testing.expectEqual(@as(usize, 2), retained.unreclaimable_versions);
+    try std.testing.expectEqual(@as(?u64, 1), retained.oldest_snapshot_seq);
+    // The active snapshot still reads the pre-update version through the
+    // retained history even after the checkpoint's WAL rewrite.
+    var at_one = try eng.selectByPk("t", .{ .int = 1 }, 1);
+    defer at_one.deinit();
+    try std.testing.expectEqual(@as(i64, 10), at_one.rows[0].values[1].int);
+
+    // Once the snapshot is released, the next checkpoint reclaims both
+    // versions (their deletion intervals are entirely before the horizon
+    // `published_seq + 1`), and the observability counters follow.
+    eng.unregisterSnapshot(old_snapshot);
+    stats = try eng.checkpoint();
+    try std.testing.expectEqual(@as(usize, 2), stats.retained_reclaimed);
+    try std.testing.expectEqual(@as(usize, 0), table.retained.items.len);
+    const after = eng.retentionStats();
+    try std.testing.expectEqual(@as(usize, 0), after.retained_versions);
+    try std.testing.expectEqual(@as(usize, 0), after.unreclaimable_versions);
+    try std.testing.expectEqual(@as(?u64, null), after.oldest_snapshot_seq);
+    try std.testing.expectEqual(@as(u64, 2), after.reclaimed_versions);
+
+    // Reclaimed history is gone: a read at the old watermark sees no version
+    // (the live row was created at seq 4, after it), and the live row reads
+    // normally at the current watermark.
+    var gone = try eng.selectByPk("t", .{ .int = 1 }, 1);
+    defer gone.deinit();
+    try std.testing.expectEqual(@as(usize, 0), gone.rows.len);
+    var live = try eng.selectByPk("t", .{ .int = 1 }, eng.publishedSeq());
+    defer live.deinit();
+    try std.testing.expectEqual(@as(i64, 100), live.rows[0].values[1].int);
+}
+
 test "read-your-writes holds through the snapshot-aware transaction read path" {
     const dir = "zig-cache/runadb-mvcc-tx-read-your-writes";
     var eng = try freshEngine(dir);

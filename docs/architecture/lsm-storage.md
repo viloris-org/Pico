@@ -266,8 +266,10 @@ During startup recovery:
 | MemTable | In-memory `Table` (rows + PK index + retained versions) remains the write and live-read front | Skiplist with Bloom filter |
 | Persistence | Flush to L0 SST (int/text single-column PK tables) | Full SST levels |
 | SST format | Block-indexed SSTables with per-block CRC and a full-key Bloom filter block (`lsm/sstable.zig`, format v2; v1 still read) | Prefix compression + optional block compression |
-| Compaction | L0 + overlapping L1 -> sorted non-overlapping L1 (`lsm/store.zig`); checkpoint auto-compacts tables whose L0 depth crosses `level0_compaction_trigger` | Size-tiered all-level compaction with scheduler-integrated background scheduling and backpressure |
+| Compaction | L0 + overlapping L1 -> sorted non-overlapping L1 (`lsm/store.zig`); checkpoint auto-compacts tables whose L0 depth crosses `level0_compaction_trigger`; the scheduler-fed maintenance worker runs real compaction jobs through the `maintenance` class | Size-tiered all-level compaction with scheduler-integrated background scheduling and backpressure |
+| Flush scheduling | `Engine.memtable_flush_entries` is the row-count flush boundary; `Engine.flushCandidates` exposes crossed tables to the maintenance path, and the scheduler-fed regression drives real flushes through the maintenance worker | WriteBufferManager / write stall, skiplist MemTable with byte accounting |
 | Manifest | Versioned LSM version-set manifest, atomically rewritten (`lsm/manifest.zig`) | Append-style version_edit records with snapshot tracking |
+| Retention reclamation | `Engine.reclaimRetainedVersions` frees versions invisible to every active snapshot; the checkpoint drives it after flush+compact and reports `retained_reclaimed`; `Engine.retentionStats` exposes retained/unreclaimable/reclaimed counts | Snapshot-aware compaction dropping only versions past the oldest active watermark |
 | Bloom filter | Full-key filter written on flush, checked before data-block reads on point lookups (`lsm/bloom.zig`, `sstable.zig`) | Optional prefix filter, block-level filters, table cache |
 | Memory limit control | None | WriteBufferManager / write stall |
 | Secondary indexes | Not implemented | Independent LSM structures, then covering indexes (Index-Only Scan) |

@@ -21,6 +21,7 @@ const wal_mod = @import("wal.zig");
 const table_mod = @import("table.zig");
 const document_mod = @import("document.zig");
 const graph_mod = @import("graph.zig");
+const kv_mod = @import("kv.zig");
 const value_mod = @import("value.zig");
 const evidence_mod = @import("evidence.zig");
 
@@ -32,6 +33,8 @@ pub const Stats = struct {
     graphs: usize,
     graph_nodes: usize,
     graph_edges: usize,
+    kv_maps: usize,
+    kv_entries: usize,
     /// Live WAL size replaced by this checkpoint, sampled under the WAL append
     /// lock when the rewrite began.
     wal_bytes_before: u64,
@@ -40,6 +43,10 @@ pub const Stats = struct {
     /// depth crossed `lsm_store.level0_compaction_trigger`. Set by the engine;
     /// the WAL rewrite itself never compacts.
     compactions: usize = 0,
+    /// Retained versions the checkpoint's maintenance loop reclaimed because no
+    /// active snapshot could still see them (MVCC retention). Set by the
+    /// engine; the WAL rewrite itself never reclaims.
+    retained_reclaimed: usize = 0,
 };
 
 /// Rewrite `wal` so it describes exactly `tables` and nothing else.
@@ -57,6 +64,7 @@ pub fn run(
     tables: []const *const table_mod.Table,
     collections: []const *const document_mod.Collection,
     graphs: []const *const graph_mod.Graph,
+    kvs: []const *const kv_mod.KvMap,
     observations: []const evidence_mod.Record,
     commit_seq: u64,
 ) !Stats {
@@ -66,6 +74,7 @@ pub fn run(
     var documents: usize = 0;
     var graph_nodes: usize = 0;
     var graph_edges: usize = 0;
+    var kv_entries: usize = 0;
     {
         // `commit` is self-cleaning, so this errdefer must not cover it.
         errdefer rewrite.abort();
@@ -121,6 +130,15 @@ pub fn run(
                 graph_edges += 1;
             }
         }
+        // KV collections reconstruct as one create_kv per map, then every
+        // entry in read order (an upsert's replacement is the live value).
+        for (kvs) |map| {
+            try rewrite.emitCreateKv(.{ .name = map.name });
+            for (map.order.items) |entry| {
+                try rewrite.emitKvPut(.{ .collection = map.name, .key = entry.key, .item = entry.item });
+                kv_entries += 1;
+            }
+        }
         for (observations) |record| try rewrite.emitObserve(record.metadata());
         try rewrite.emitSetCommitSeq(commit_seq);
     }
@@ -137,6 +155,8 @@ pub fn run(
         .graphs = graphs.len,
         .graph_nodes = graph_nodes,
         .graph_edges = graph_edges,
+        .kv_maps = kvs.len,
+        .kv_entries = kv_entries,
         .wal_bytes_before = before,
         .wal_bytes_after = after,
     };
@@ -198,7 +218,7 @@ test "checkpoint emits current schema and rows, with set_serial after the insert
         try table.delete(gpa, .{ .int = 7 }, 3);
         try std.testing.expectEqual(@as(i64, 8), table.next_serial);
 
-        stats = try run(&wal, &.{&table}, &.{}, &.{}, &.{}, 42);
+        stats = try run(&wal, &.{&table}, &.{}, &.{}, &.{}, &.{}, 42);
     }
 
     try std.testing.expectEqual(@as(usize, 1), stats.tables);
@@ -232,7 +252,7 @@ test "checkpoint of an empty instance still yields a replayable wal" {
     {
         var wal = try wal_mod.Wal.open(gpa, io, dir_name, false);
         defer wal.deinit();
-        const stats = try run(&wal, &.{}, &.{}, &.{}, &.{}, 7);
+        const stats = try run(&wal, &.{}, &.{}, &.{}, &.{}, &.{}, 7);
         try std.testing.expectEqual(@as(usize, 0), stats.tables);
         try std.testing.expectEqual(@as(usize, 0), stats.rows);
     }

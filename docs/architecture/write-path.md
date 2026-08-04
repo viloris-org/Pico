@@ -224,7 +224,12 @@ may observe intervening commits. Version retention for reads over older
 snapshots is implemented (roadmap Phase 5): row versions carry a creation
 commit sequence, superseded versions are retained with a deletion interval,
 and a snapshot read interprets only versions committed at or before its
-starting watermark. On-disk LSM storage remains Phase 5 target work.
+starting watermark. Reclamation is driven by the maintenance path: the
+checkpoint frees every retained version no active snapshot can still see and
+reports the count, and `Engine.retentionStats` exposes retained, unreclaimable,
+and cumulative-reclaimed counts. The on-disk LSM storage slice is implemented
+behind the storage boundary (see `docs/architecture/lsm-storage.md`); the
+skiplist MemTable and secondary indexes remain Phase 5 target work.
 
 ## Single Writer and Group Commit
 

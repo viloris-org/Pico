@@ -43,6 +43,12 @@ pub const RecordType = enum(u8) {
     add_node = 16,
     /// Adds one directed labeled edge `from --label--> to` to a named graph.
     add_edge = 17,
+    /// Declares a KV collection (roadmap Phase 2). The KV name is distinct
+    /// from table, document collection, and graph names.
+    create_kv = 18,
+    /// Upserts one key/value pair into a named KV collection. Requires WAL
+    /// format version 6.
+    kv_put = 19,
 };
 
 /// One DML op inside an explicit-transaction commit batch.
@@ -71,7 +77,11 @@ const file_magic = "RUNADB_WAL";
 /// Version 5: `txn_batch` records carry a leading `commit_seq: u64`, and the
 /// checkpoint path emits `set_commit_seq` to restore the published watermark.
 /// Recovery rebuilds the MVCC watermark from these records.
-const format_version: u32 = 5;
+///
+/// Version 6: `create_kv` and `kv_put` records carry the KV collection slice.
+/// The parse gate keeps an older file from being reinterpreted as KV records:
+/// a `create_kv`/`kv_put` tag in a version-5 file is corruption, not data.
+const format_version: u32 = 6;
 /// Oldest version this build still replays. Version 1 files contain no
 /// `set_serial` record, so reading them needs no compatibility shim; only a
 /// checkpoint rewrite upgrades a file in place. An older build meeting a
@@ -140,6 +150,16 @@ pub const AddEdgeRecord = struct {
     from: []const u8,
     label: []const u8,
     to: []const u8,
+};
+
+pub const CreateKvRecord = struct { name: []const u8 };
+
+/// One KV upsert. `item` is borrowed during encoding and cloned into the KV
+/// collection during apply.
+pub const KvPutRecord = struct {
+    collection: []const u8,
+    key: []const u8,
+    item: value.Value,
 };
 
 /// Append-only WAL with a versioned file header and checksummed LE frames.
@@ -289,6 +309,20 @@ pub const Wal = struct {
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.gpa);
         try encodeAddEdge(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendCreateKv(self: *Wal, rec: CreateKvRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeCreateKv(&list, self.gpa, rec);
+        try self.appendPayload(list.items);
+    }
+
+    pub fn appendKvPut(self: *Wal, rec: KvPutRecord) !void {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(self.gpa);
+        try encodeKvPut(&list, self.gpa, rec);
         try self.appendPayload(list.items);
     }
 
@@ -686,6 +720,20 @@ pub const Wal = struct {
             try self.emitPayload(list.items);
         }
 
+        pub fn emitCreateKv(self: *Rewrite, rec: CreateKvRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeCreateKv(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
+        pub fn emitKvPut(self: *Rewrite, rec: KvPutRecord) !void {
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.wal.gpa);
+            try encodeKvPut(&list, self.wal.gpa, rec);
+            try self.emitPayload(list.items);
+        }
+
         /// Emit the published commit watermark last, so recovery restores it
         /// after the reconstruction records collapse per-commit history.
         pub fn emitSetCommitSeq(self: *Rewrite, commit_seq: u64) !void {
@@ -871,6 +919,18 @@ fn encodeAddEdge(list: *std.ArrayList(u8), gpa: Allocator, rec: AddEdgeRecord) !
     try writeStr(list, gpa, rec.to);
 }
 
+fn encodeCreateKv(list: *std.ArrayList(u8), gpa: Allocator, rec: CreateKvRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.create_kv));
+    try writeStr(list, gpa, rec.name);
+}
+
+fn encodeKvPut(list: *std.ArrayList(u8), gpa: Allocator, rec: KvPutRecord) !void {
+    try list.append(gpa, @intFromEnum(RecordType.kv_put));
+    try writeStr(list, gpa, rec.collection);
+    try writeStr(list, gpa, rec.key);
+    try writeValue(list, gpa, rec.item);
+}
+
 fn frameChecksum(payload_len: u32, payload: []const u8) u32 {
     var len_bytes: [4]u8 = undefined;
     bytes.writeU32LE(&len_bytes, payload_len);
@@ -944,6 +1004,12 @@ pub const RecordView = union(RecordType) {
         label: []const u8,
         to: []const u8,
     },
+    create_kv: struct { name: []const u8 },
+    kv_put: struct {
+        collection: []const u8,
+        key: []const u8,
+        item: value.Value,
+    },
 
     /// One parsed document field. `path` is borrowed from the frame buffer;
     /// `item` is owned by the `Owned` value list and is valid for the duration
@@ -976,7 +1042,8 @@ pub const RecordView = union(RecordType) {
         if (payload.len < 1) return error.InvalidWal;
         const tag = std.enums.fromInt(RecordType, payload[0]) orelse return error.InvalidWal;
         var i: usize = 1;
-        switch (tag) {            .create_table => {
+        switch (tag) {
+            .create_table => {
                 const name = try readStr(payload, &i);
                 const ncol = try readU16(payload, &i);
                 try owned.columns.ensureTotalCapacity(gpa, ncol);
@@ -1191,6 +1258,28 @@ pub const RecordView = union(RecordType) {
                 const to = try readStr(payload, &i);
                 if (i != payload.len) return error.InvalidWal;
                 return .{ .view = .{ .add_edge = .{ .graph = graph, .from = from, .label = label, .to = to } }, .owned = owned };
+            },
+            .create_kv => {
+                // KV records exist only from WAL format version 6; a tag in an
+                // older file is corruption, never data.
+                if (file_version < 6) return error.InvalidWal;
+                const name = try readStr(payload, &i);
+                if (i != payload.len) return error.InvalidWal;
+                return .{ .view = .{ .create_kv = .{ .name = name } }, .owned = owned };
+            },
+            .kv_put => {
+                if (file_version < 6) return error.InvalidWal;
+                const collection = try readStr(payload, &i);
+                const key = try readStr(payload, &i);
+                if (key.len == 0) return error.InvalidWal;
+                const item = try readValue(gpa, payload, &i);
+                if (i != payload.len) return error.InvalidWal;
+                try owned.values.append(gpa, item);
+                return .{ .view = .{ .kv_put = .{
+                    .collection = collection,
+                    .key = key,
+                    .item = owned.values.items[owned.values.items.len - 1],
+                } }, .owned = owned };
             },
             .txn_batch => {
                 // Validate shape eagerly; engine expands nested ops during apply.
@@ -2011,6 +2100,63 @@ test "wal replays a set_commit_seq record" {
     }
 }
 
+test "wal replays create_kv and kv_put records" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-kv");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendCreateKv(.{ .name = "cache" });
+        try wal.appendKvPut(.{ .collection = "cache", .key = "a", .item = .{ .int = 1 } });
+        var text: value.Value = .{ .text = try gpa.dupe(u8, "x") };
+        defer text.deinit(gpa);
+        try wal.appendKvPut(.{ .collection = "cache", .key = "b", .item = text });
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: KvSink = .{};
+        defer sink.deinit(gpa);
+        try replayWal(&wal, &sink, KvSink.apply);
+        try std.testing.expectEqual(@as(usize, 1), sink.creates);
+        try std.testing.expectEqual(@as(usize, 2), sink.puts);
+        try std.testing.expectEqualStrings("cache", sink.last_collection.?);
+        try std.testing.expectEqualStrings("b", sink.last_key.?);
+        try std.testing.expectEqualStrings("x", sink.last_item_text.?);
+    }
+}
+
+test "wal rejects a kv record tag in a pre-v6 file as corruption" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir_name = try openCleanDir("zig-cache/runadb-test-wal-kv-v5-gate");
+    defer removeDir(dir_name);
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        try wal.appendCreateKv(.{ .name = "cache" });
+        // Rewrite the header as version 5: the create_kv tag must be
+        // rejected as corruption, never replayed as a v6 record.
+        var ver: [4]u8 = undefined;
+        bytes.writeU32LE(&ver, 5);
+        try wal.file.writeAtAll(&ver, file_magic.len);
+    }
+
+    {
+        var wal = try Wal.open(gpa, io, dir_name, false);
+        defer wal.deinit();
+        var sink: KvSink = .{};
+        defer sink.deinit(gpa);
+        try std.testing.expectError(error.InvalidWal, replayWal(&wal, &sink, KvSink.apply));
+        try std.testing.expectEqual(@as(usize, 0), sink.creates);
+    }
+}
+
 test "wal appends a group of txn_batch frames as one durable round" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -2091,6 +2237,47 @@ const BatchSink = struct {
             .insert => |ins| {
                 _ = ins;
                 self.inserts += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+/// Replay sink for the KV collection records (roadmap Phase 2). The view's
+/// strings are borrowed from the frame buffer and the owned value list, both
+/// freed after `apply` returns, so the sink copies what it needs to compare
+/// after the replay.
+const KvSink = struct {
+    creates: usize = 0,
+    puts: usize = 0,
+    last_collection: ?[]u8 = null,
+    last_key: ?[]u8 = null,
+    last_item_text: ?[]u8 = null,
+
+    fn deinit(self: *KvSink, gpa: Allocator) void {
+        if (self.last_collection) |s| gpa.free(s);
+        if (self.last_key) |s| gpa.free(s);
+        if (self.last_item_text) |s| gpa.free(s);
+        self.* = undefined;
+    }
+
+    fn apply(self: *KvSink, view: RecordView) !void {
+        switch (view) {
+            .create_kv => |create| {
+                _ = create;
+                self.creates += 1;
+            },
+            .kv_put => |put| {
+                self.puts += 1;
+                if (self.last_collection) |s| std.testing.allocator.free(s);
+                if (self.last_key) |s| std.testing.allocator.free(s);
+                if (self.last_item_text) |s| std.testing.allocator.free(s);
+                self.last_collection = try std.testing.allocator.dupe(u8, put.collection);
+                self.last_key = try std.testing.allocator.dupe(u8, put.key);
+                self.last_item_text = switch (put.item) {
+                    .text => |text| try std.testing.allocator.dupe(u8, text),
+                    else => null,
+                };
             },
             else => {},
         }

@@ -7,7 +7,8 @@
 /// peer can never misparse the trailing credential that v3 HELLO_OK appends.
 pub const PROTOCOL_VERSION_MAJOR: u16 = 3;
 pub const PROTOCOL_VERSION_MINOR: u16 = 0;
-pub const IR_FORMAT_VERSION: u16 = 5;
+/// IR format version 6 adds the `kv_put` operation (roadmap Phase 2 KV slice).
+pub const IR_FORMAT_VERSION: u16 = 6;
 
 /// HELLO_OK (server -> client) layout — the shared parsing contract. The body
 /// is a length-prefixed server version string, then exactly
@@ -15,7 +16,6 @@ pub const IR_FORMAT_VERSION: u16 = 5;
 /// with nothing after. The Server writes them in this order (sendHelloOk in
 /// src/net/runadb.zig) and the Client reads them in this order (readMessage in
 /// clint/zig/codec.zig), so both must change together if this layout does.
-
 /// Message type identifiers.
 pub const Type = enum(u8) {
     /// Client → Server: initiates connection, carries protocol version.

@@ -34,6 +34,7 @@ pub const ObjectKind = enum(u8) {
     table = 1,
     document = 2,
     graph = 3,
+    kv = 4,
 };
 
 /// One catalog object named by a checkpoint.
@@ -160,6 +161,7 @@ test "manifest round trips exactly" {
         .{ .kind = .table, .name = "customer" },
         .{ .kind = .document, .name = "books" },
         .{ .kind = .graph, .name = "social" },
+        .{ .kind = .kv, .name = "cache" },
     };
     const manifest = Manifest{ .commit_seq = 42, .objects = objects[0..] };
     const bytes = try encode(gpa, &manifest);
@@ -170,9 +172,11 @@ test "manifest round trips exactly" {
         gpa.free(decoded.objects);
     }
     try std.testing.expectEqual(@as(u64, 42), decoded.commit_seq);
-    try std.testing.expectEqual(@as(usize, 3), decoded.objects.len);
+    try std.testing.expectEqual(@as(usize, 4), decoded.objects.len);
     try std.testing.expectEqual(ObjectKind.document, decoded.objects[1].kind);
     try std.testing.expectEqualStrings("books", decoded.objects[1].name);
+    try std.testing.expectEqual(ObjectKind.kv, decoded.objects[3].kind);
+    try std.testing.expectEqualStrings("cache", decoded.objects[3].name);
 }
 
 test "manifest decode rejects bad magic, version, and trailing bytes" {

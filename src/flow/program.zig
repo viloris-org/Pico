@@ -43,6 +43,7 @@ const ir = @import("ir.zig");
 const engine_mod = @import("../storage/engine.zig");
 const table_mod = @import("../storage/table.zig");
 const document_mod = @import("../storage/document.zig");
+const kv_mod = @import("../storage/kv.zig");
 const value = @import("../storage/value.zig");
 const evidence = @import("../storage/evidence.zig");
 const txn_mod = @import("../txn/transaction.zig");
@@ -542,6 +543,53 @@ const GraphCursor = struct {
     }
 };
 
+/// KV collection scan. Each entry reads as a two-field row: `key` (text) and
+/// `value` (scalar). `order` is a clone of the map's insertion order taken
+/// under the statement lock; entries are immutable after their last upsert,
+/// so reads stay safe after the lock is released. An emit path other than
+/// `key`/`value` reads as null, exactly like an absent document field.
+const KvCursor = struct {
+    gpa: Allocator,
+    bound: BoundDocumentWhere,
+    order: []*kv_mod.Entry,
+    /// Predicate column paths, borrowed from the Request (which outlives the
+    /// program).
+    where: []const ast.Predicate,
+    index: usize = 0,
+
+    fn deinit(self: *KvCursor) void {
+        self.bound.deinit();
+        self.gpa.free(self.order);
+    }
+
+    /// Resolve an emit/where path against a KV entry: `key` is the text key,
+    /// `value` is the scalar value, and any other path reads as null.
+    fn pathValue(entry: *const kv_mod.Entry, path: []const u8) ?value.Value {
+        if (std.mem.eql(u8, path, "key")) return .{ .text = entry.key };
+        if (std.mem.eql(u8, path, "value")) return entry.item;
+        return null;
+    }
+
+    fn nextRow(self: *KvCursor, gpa: Allocator, owned_text: *std.ArrayList([]u8), projection: [][]const u8, pred_values: []value.Value) ProgramError!?[]?[]const u8 {
+        while (self.index < self.order.len) {
+            const entry_index = self.index;
+            self.index += 1;
+            const entry = self.order[entry_index];
+            for (self.bound.preds, 0..) |_, pred_index| {
+                pred_values[pred_index] = pathValue(entry, self.where[pred_index].column) orelse .null;
+            }
+            if (!table_mod.valuesMatch(pred_values, self.bound.preds)) continue;
+            const output = try gpa.alloc(?[]const u8, projection.len);
+            errdefer gpa.free(output);
+            for (projection, 0..) |path, index| {
+                output[index] = try valueToText(gpa, owned_text, pathValue(entry, path) orelse .null);
+            }
+            return output;
+        }
+        return null;
+    }
+};
+
 /// Observation evidence scan over a cloned view of the observation store. The
 /// record structs are copied at open; their strings are stable engine
 /// allocations, so the clone stays valid after the statement lock is released.
@@ -672,6 +720,7 @@ pub const Program = struct {
         document: DocumentCursor,
         graph: GraphCursor,
         evidence: EvidenceCursor,
+        kv: KvCursor,
     };
 
     pub fn deinit(self: *Program) void {
@@ -683,6 +732,7 @@ pub const Program = struct {
             .document => |*cursor| cursor.deinit(),
             .graph => |*cursor| cursor.deinit(),
             .evidence => |*cursor| cursor.deinit(),
+            .kv => |*cursor| cursor.deinit(),
         }
         if (self.pred_scratch) |scratch| self.gpa.free(scratch);
         self.* = undefined;
@@ -743,6 +793,7 @@ pub const Program = struct {
             .document => |*cursor| cursor.nextRow(self.gpa, &batch.owned_text, self.columns, self.pred_scratch.?),
             .graph => |*cursor| cursor.nextRow(self.gpa, &batch.owned_text, self.columns, self.pred_scratch.?),
             .evidence => |*cursor| cursor.nextRow(self.gpa, &batch.owned_text),
+            .kv => |*cursor| cursor.nextRow(self.gpa, &batch.owned_text, self.columns, self.pred_scratch.?),
         };
     }
 };
@@ -774,6 +825,7 @@ fn openAny(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, 
         return openDocument(gpa, eng, request, opts);
     }
     if (eng.getGraph(request.relation) != null) return openGraph(gpa, eng, request, opts);
+    if (eng.getKvMap(request.relation) != null) return openKv(gpa, eng, request, opts);
     return openTable(gpa, eng, request, tx, opts);
 }
 
@@ -818,6 +870,40 @@ fn openTable(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request
         .column_text = column_text,
         .max_rows = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize),
         .cursor = .{ .table = .{ .gpa = gpa, .projection = projection, .bound = bound, .rows = rows } },
+    };
+}
+
+fn openKv(gpa: Allocator, eng: *engine_mod.Engine, request: *const ir.Request, opts: ExecOptions) ProgramError!Program {
+    const map = eng.getKvMap(request.relation) orelse return error.SemanticNameNotFound;
+    if (request.navigate != null) return error.UnsupportedNavigate;
+    var bound = try bindDocumentWhere(gpa, request.where);
+    errdefer bound.deinit();
+    // Clone the insertion order under the lock: an upsert appends or replaces
+    // entries, but a read never follows a replaced entry's old value after the
+    // lock is released because each entry is updated in place under the lock.
+    const order = try gpa.dupe(*kv_mod.Entry, map.order.items);
+    errdefer gpa.free(order);
+    const pred_scratch = try gpa.alloc(value.Value, request.where.len);
+    errdefer gpa.free(pred_scratch);
+
+    var column_text: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (column_text.items) |text| gpa.free(text);
+        column_text.deinit(gpa);
+    }
+    const columns = try gpa.alloc([]const u8, request.fields.len);
+    errdefer gpa.free(columns);
+    for (request.fields, 0..) |path, index| {
+        columns[index] = try ownColumn(gpa, &column_text, path);
+    }
+    return .{
+        .gpa = gpa,
+        .opts = opts,
+        .columns = columns,
+        .column_text = column_text,
+        .max_rows = if (request.limit) |limit| @intCast(limit) else std.math.maxInt(usize),
+        .pred_scratch = pred_scratch,
+        .cursor = .{ .kv = .{ .gpa = gpa, .bound = bound, .order = order, .where = request.where } },
     };
 }
 
@@ -1042,7 +1128,7 @@ test "byte limit bounds a batch and a single oversized row is delivered alone" {
     try eng.createDocument("docs");
     var text: value.Value = .{ .text = try gpa.dupe(u8, "abcdefghij") };
     defer text.deinit(gpa);
-    const fields = [_]document_mod.Field{ .{ .path = @constCast("payload"), .item = text } };
+    const fields = [_]document_mod.Field{.{ .path = @constCast("payload"), .item = text }};
     for (0..6) |i| {
         var id_buf: [8]u8 = undefined;
         const id = std.fmt.bufPrint(&id_buf, "d{d}", .{i}) catch unreachable;
@@ -1080,7 +1166,7 @@ test "the request limit is respected across batches" {
     try eng.createDocument("docs");
     var text: value.Value = .{ .text = try gpa.dupe(u8, "x") };
     defer text.deinit(gpa);
-    const fields = [_]document_mod.Field{ .{ .path = @constCast("id"), .item = text } };
+    const fields = [_]document_mod.Field{.{ .path = @constCast("id"), .item = text }};
     for (0..10) |i| {
         var id_buf: [8]u8 = undefined;
         const id = std.fmt.bufPrint(&id_buf, "d{d}", .{i}) catch unreachable;
@@ -1209,7 +1295,7 @@ test "the graph navigate program pre-resolves pairs and streams them in order" {
     try eng.createGraph("social");
     var name: value.Value = .{ .text = try gpa.dupe(u8, "Ada") };
     defer name.deinit(gpa);
-    const fields = [_]document_mod.Field{ .{ .path = @constCast("name"), .item = name } };
+    const fields = [_]document_mod.Field{.{ .path = @constCast("name"), .item = name }};
     try eng.addNode("social", "1", &fields);
     try eng.addNode("social", "2", &fields);
     try eng.addEdge("social", "1", "mentors", "2");

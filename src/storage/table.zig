@@ -612,6 +612,27 @@ pub const Table = struct {
         return try out.toOwnedSlice(gpa);
     }
 
+    /// Number of retained versions currently held (MVCC retention
+    /// observability; roadmap Phase 5 required metric "unreclaimable version
+    /// count" derives from this and `unreclaimableRetainedCount`).
+    pub fn retainedVersionCount(self: *const Table) usize {
+        return self.retained.items.len;
+    }
+
+    /// Number of retained versions some active snapshot can still see, i.e.
+    /// versions NOT reclaimable at `oldest_active_snapshot_seq`: those with
+    /// `deleted_seq >= oldest_active_snapshot_seq`. A version with
+    /// `deleted_seq < oldest` is invisible to every active snapshot (every
+    /// registered watermark is `>= oldest`, and visibility requires
+    /// `s < deleted_seq`), so reclamation may free it.
+    pub fn unreclaimableRetainedCount(self: *const Table, oldest_active_snapshot_seq: u64) usize {
+        var n: usize = 0;
+        for (self.retained.items) |rv| {
+            if (rv.deleted_seq >= oldest_active_snapshot_seq) n += 1;
+        }
+        return n;
+    }
+
     /// Free and remove every retained version invisible to every active
     /// snapshot: versions with `deleted_seq < oldest_active_snapshot_seq`.
     /// Never touches live rows. Returns the number of versions reclaimed.

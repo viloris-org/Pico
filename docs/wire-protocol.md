@@ -50,7 +50,7 @@ without changing shared state. A framed Request with an invalid payload returns
    unique within the Connection lifetime and must not be logged.
 3. Client sends `FLOW_SOURCE` (`0x10`), one length-prefixed Runa Flow source
    request, or `FLOW_IR` (`0x15`), a big-endian `u16` IR format version plus
-   canonical Runa Query IR bytes. The implemented IR format version is `5`.
+   canonical Runa Query IR bytes. The implemented IR format version is `6`.
 4. Server responds with `ROW_DESCRIPTION` (`0x11`), zero or more `ROW_DATA`
    (`0x12`) messages, and `COMMAND_COMPLETE` (`0x13`), or with `SERVER_ERROR`
    (`0x14`). The initial Flow slice's successful completion tag is `EMIT`.
@@ -158,6 +158,17 @@ endpoints must already exist and the triple must be unique. Reads use the
 `navigate` Flow stage over the graph: `from <graph> | navigate <edge> as
 <alias> | emit { ... }`, where `alias.<path>` projects the destination node.
 
+## KV Collections
+
+A canonical `kv_put` IR request upserts one key/value pair into a named KV
+collection. Its payload is the collection name, a non-empty text key, and a
+scalar value (null, integer, text, boolean); a vector value or empty key is
+rejected as malformed. The Server creates the collection on its first put and
+returns one `key`/`value` row with `COMMAND_COMPLETE(PUT KV, 1)`. A put
+replaces the value of an existing key. Reads use the ordinary `emit` Flow
+request over the collection, where each entry reads as a `key`/`value` row;
+`where` predicates on `key` or `value` filter entries.
+
 ## Result And Errors
 
 `ROW_DESCRIPTION` begins with a `u16` column count and names. `ROW_DATA` begins
@@ -182,6 +193,7 @@ length-prefixed text representation. `COMMAND_COMPLETE` contains a big-endian
 | `DF1001` | Document collection insert failure (unknown collection, duplicate id, or invalid field) |
 | `GF1001` | Graph node add failure (duplicate node id or invalid field) |
 | `GF1002` | Graph edge add failure (unknown endpoint or duplicate edge) |
+| `KV1001` | KV collection put failure (name collision or invalid value) |
 
 These errors and the relation binding are development-only. Protocol v3
 implements durable Observation Evidence writes, metadata reads, and payload

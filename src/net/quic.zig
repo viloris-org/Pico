@@ -33,6 +33,7 @@ const zquic = @import("zquic");
 const io_mod = zquic.transport.io;
 const compat = zquic.compat;
 const engine_mod = @import("../storage/engine.zig");
+const flow_ir = @import("../flow/ir.zig");
 const connection_mod = @import("connection.zig");
 const registry_mod = @import("registry.zig");
 const runadb = @import("runadb.zig");
@@ -943,7 +944,7 @@ fn buildInsertIr(gpa: Allocator, collection: []const u8, id: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var buf: [8]u8 = undefined;
-    std.mem.writeInt(u16, buf[0..2], 5, .big); // FORMAT_VERSION (src/flow/ir.zig)
+    std.mem.writeInt(u16, buf[0..2], flow_ir.FORMAT_VERSION, .big); // src/flow/ir.zig
     try out.appendSlice(gpa, buf[0..2]);
     std.mem.writeInt(u64, &buf, 0, .big); // model_revision
     try out.appendSlice(gpa, &buf);

@@ -190,10 +190,8 @@ pub fn handleConnection(
 
         const keep_going = try handleFrame(gpa, io, w, msg_type, payload, eng, registry, &conn, &attachment);
         if (!keep_going) return;
-
     }
 }
-
 
 /// Handle one request frame against a Connection session: executes the
 /// statement or protocol action and writes any response on the session's
@@ -211,367 +209,394 @@ pub fn handleFrame(
     conn: *connection_mod.State,
     attachment: *?Attachment,
 ) ConnError!bool {
-
-        switch (msg_type) {
-            .flow_source => {
-                // Statement start: a fresh generation clears any stale mark so
-                // a cancel delivered while idle never aborts this statement.
-                // Entry and exit are single atomic transitions on the
-                // connection state, and the cooperative check is the Phase 6
-                // seam; in the sequential listener a cancel is delivered only
-                // between statements, so these never fire here.
-                conn.beginStatement();
-                defer conn.endStatement();
-                conn.checkCancelled() catch |err| {
+    switch (msg_type) {
+        .flow_source => {
+            // Statement start: a fresh generation clears any stale mark so
+            // a cancel delivered while idle never aborts this statement.
+            // Entry and exit are single atomic transitions on the
+            // connection state, and the cooperative check is the Phase 6
+            // seam; in the sequential listener a cancel is delivered only
+            // between statements, so these never fire here.
+            conn.beginStatement();
+            defer conn.endStatement();
+            conn.checkCancelled() catch |err| {
+                try sendError(w, 2, "RF1002", @errorName(err));
+                try w.flush();
+                return true;
+            };
+            var pos: usize = 0;
+            const source = readStringFromPayload(payload, &pos) catch {
+                try sendError(w, 2, "RF1000", "invalid Runa Flow source payload");
+                try w.flush();
+                return true;
+            };
+            if (pos != payload.len) {
+                try sendError(w, 2, "RF1000", "invalid Runa Flow source payload");
+                try w.flush();
+                return true;
+            }
+            var guard = try EngineGuard.acquire(eng, io);
+            defer guard.deinit();
+            var request = flow.compile(gpa, source) catch |err| {
+                try sendError(w, 2, "RF1001", @errorName(err));
+                try w.flush();
+                return true;
+            };
+            defer request.deinit(gpa);
+            // Streaming execution program (roadmap Phase 6): open the
+            // program under the statement lock (binding + snapshot), then
+            // release the lock and stream bounded result batches. A
+            // `CANCEL_REQUEST` routed while this statement scans aborts it
+            // at the next row boundary inside `nextBatch` and at the next
+            // batch boundary in `streamEmit`, with the delivered
+            // `CANCELED` outcome; the Connection stays usable for its
+            // next statement. Because the program iterates only owned
+            // snapshot state, the lock is never held across a send, so a
+            // slow consumer blocks only its own handler thread.
+            var program = flow.openProgram(gpa, eng, &request, .{ .cancel = .{ .ctx = conn, .check = cancelProbe } }) catch |err| switch (err) {
+                error.Canceled => {
+                    try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
+                    try w.flush();
+                    return true;
+                },
+                else => {
                     try sendError(w, 2, "RF1002", @errorName(err));
                     try w.flush();
                     return true;
-                };
-                var pos: usize = 0;
-                const source = readStringFromPayload(payload, &pos) catch {
-                    try sendError(w, 2, "RF1000", "invalid Runa Flow source payload");
+                },
+            };
+            defer program.deinit();
+            guard.release();
+            const streamed_rows = streamEmit(w, gpa, &program, conn) catch |err| switch (err) {
+                error.Canceled => {
+                    try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
                     try w.flush();
                     return true;
-                };
-                if (pos != payload.len) {
-                    try sendError(w, 2, "RF1000", "invalid Runa Flow source payload");
-                    try w.flush();
-                    return true;
-                }
-                var guard = try EngineGuard.acquire(eng, io);
-                defer guard.deinit();
-                var request = flow.compile(gpa, source) catch |err| {
-                    try sendError(w, 2, "RF1001", @errorName(err));
-                    try w.flush();
-                    return true;
-                };
-                defer request.deinit(gpa);
-                // Streaming execution program (roadmap Phase 6): open the
-                // program under the statement lock (binding + snapshot), then
-                // release the lock and stream bounded result batches. A
-                // `CANCEL_REQUEST` routed while this statement scans aborts it
-                // at the next row boundary inside `nextBatch` and at the next
-                // batch boundary in `streamEmit`, with the delivered
-                // `CANCELED` outcome; the Connection stays usable for its
-                // next statement. Because the program iterates only owned
-                // snapshot state, the lock is never held across a send, so a
-                // slow consumer blocks only its own handler thread.
-                var program = flow.openProgram(gpa, eng, &request, .{ .cancel = .{ .ctx = conn, .check = cancelProbe } }) catch |err| switch (err) {
-                    error.Canceled => {
-                        try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
-                        try w.flush();
-                        return true;
-                    },
-                    else => {
-                        try sendError(w, 2, "RF1002", @errorName(err));
-                        try w.flush();
-                        return true;
-                    },
-                };
-                defer program.deinit();
-                guard.release();
-                const streamed_rows = streamEmit(w, gpa, &program, conn) catch |err| switch (err) {
-                    error.Canceled => {
-                        try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
-                        try w.flush();
-                        return true;
-                    },
-                    else => {
-                        try sendError(w, 2, "RF1002", @errorName(err));
-                        try w.flush();
-                        return true;
-                    },
-                };
-                _ = streamed_rows;
-            },
-            .flow_ir => {
-                // Statement start (see .flow_source for the Phase 6 seam note).
-                conn.beginStatement();
-                defer conn.endStatement();
-                conn.checkCancelled() catch |err| {
+                },
+                else => {
                     try sendError(w, 2, "RF1002", @errorName(err));
                     try w.flush();
                     return true;
-                };
-                if (payload.len < 2) {
-                    try sendError(w, 2, "RF1003", "invalid Runa Query IR payload");
-                    try w.flush();
-                    return true;
-                }
-                const format_version = std.mem.readInt(u16, payload[0..2], .big);
-                if (format_version != proto.IR_FORMAT_VERSION) {
-                    try sendError(w, 2, "RF1004", "unsupported Runa Query IR format version");
-                    try w.flush();
-                    return true;
-                }
-                var request = flow_ir.decode(gpa, payload[2..]) catch |err| {
-                    try sendError(w, 2, "RF1003", @errorName(err));
-                    try w.flush();
-                    return true;
-                };
-                defer request.deinit(gpa);
-                switch (request.operation) {
-                    .emit => {
-                        var guard = try EngineGuard.acquire(eng, io);
-                        defer guard.deinit();
-                        // Streaming execution program (see .flow_source).
-                        var program = flow.openProgram(gpa, eng, &request, .{ .cancel = .{ .ctx = conn, .check = cancelProbe } }) catch |err| switch (err) {
-                            error.Canceled => {
-                                try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
-                                try w.flush();
-                                return true;
-                            },
-                            else => {
-                                try sendError(w, 2, "RF1002", @errorName(err));
-                                try w.flush();
-                                return true;
-                            },
-                        };
-                        defer program.deinit();
-                        guard.release();
-                        const streamed_rows = streamEmit(w, gpa, &program, conn) catch |err| switch (err) {
-                            error.Canceled => {
-                                try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
-                                try w.flush();
-                                return true;
-                            },
-                            else => {
-                                try sendError(w, 2, "RF1002", @errorName(err));
-                                try w.flush();
-                                return true;
-                            },
-                        };
-                        _ = streamed_rows;
-                    },
-                    .observe => {
-                        const staged = if (attachment.*) |*item| item else {
-                            try sendError(w, 2, "EV1001", "completed attachment required");
+                },
+            };
+            _ = streamed_rows;
+        },
+        .flow_ir => {
+            // Statement start (see .flow_source for the Phase 6 seam note).
+            conn.beginStatement();
+            defer conn.endStatement();
+            conn.checkCancelled() catch |err| {
+                try sendError(w, 2, "RF1002", @errorName(err));
+                try w.flush();
+                return true;
+            };
+            if (payload.len < 2) {
+                try sendError(w, 2, "RF1003", "invalid Runa Query IR payload");
+                try w.flush();
+                return true;
+            }
+            const format_version = std.mem.readInt(u16, payload[0..2], .big);
+            if (format_version != proto.IR_FORMAT_VERSION) {
+                try sendError(w, 2, "RF1004", "unsupported Runa Query IR format version");
+                try w.flush();
+                return true;
+            }
+            var request = flow_ir.decode(gpa, payload[2..]) catch |err| {
+                try sendError(w, 2, "RF1003", @errorName(err));
+                try w.flush();
+                return true;
+            };
+            defer request.deinit(gpa);
+            switch (request.operation) {
+                .emit => {
+                    var guard = try EngineGuard.acquire(eng, io);
+                    defer guard.deinit();
+                    // Streaming execution program (see .flow_source).
+                    var program = flow.openProgram(gpa, eng, &request, .{ .cancel = .{ .ctx = conn, .check = cancelProbe } }) catch |err| switch (err) {
+                        error.Canceled => {
+                            try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
                             try w.flush();
                             return true;
-                        };
-                        if (!staged.finished or staged.upload_id != request.observe.?.upload_id) {
-                            try sendError(w, 2, "EV1001", "attachment is incomplete or does not match the request");
+                        },
+                        else => {
+                            try sendError(w, 2, "RF1002", @errorName(err));
                             try w.flush();
                             return true;
-                        }
-                        const modality = std.enums.fromInt(evidence_mod.Modality, request.observe.?.modality) orelse {
-                            try sendError(w, 2, "EV1002", "invalid modality");
+                        },
+                    };
+                    defer program.deinit();
+                    guard.release();
+                    const streamed_rows = streamEmit(w, gpa, &program, conn) catch |err| switch (err) {
+                        error.Canceled => {
+                            try sendError(w, 2, "RF1006", "statement canceled by CANCEL_REQUEST");
                             try w.flush();
                             return true;
-                        };
-                        const observation = request.observe.?;
-                        var guard = try EngineGuard.acquire(eng, io);
-                        defer guard.deinit();
-                        const evidence_id = eng.observe(observation.object_id, modality, observation.media_type, observation.observed_at, observation.origin, "development", staged.bytes.items) catch |err| {
-                            try sendError(w, 2, "EV1003", @errorName(err));
+                        },
+                        else => {
+                            try sendError(w, 2, "RF1002", @errorName(err));
                             try w.flush();
                             return true;
-                        };
-                        guard.release();
-                        staged.deinit(gpa);
-                        attachment.* = null;
-                        var id_buf: [32]u8 = undefined;
-                        const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{evidence_id}) catch unreachable;
-                        var columns = [_][]const u8{"evidence_id"};
-                        var cells = [_]?[]const u8{id_text};
-                        try sendRowDescription(w, &columns);
-                        try sendRowData(w, &cells);
-                        try sendCommandComplete(w, "OBSERVE", 1);
+                        },
+                    };
+                    _ = streamed_rows;
+                },
+                .observe => {
+                    const staged = if (attachment.*) |*item| item else {
+                        try sendError(w, 2, "EV1001", "completed attachment required");
                         try w.flush();
-                    },
-                    .read_evidence_payload => {
-                        var guard = try EngineGuard.acquire(eng, io);
-                        defer guard.deinit();
-                        const payload_bytes = eng.readEvidencePayload(request.evidence_id) catch |err| {
-                            try sendError(w, 2, "EV1004", @errorName(err));
-                            try w.flush();
-                            return true;
-                        };
-                        guard.release();
-                        defer gpa.free(payload_bytes);
-                        try sendPayload(w, request.evidence_id, payload_bytes);
-                        try sendCommandComplete(w, "READ EVIDENCE PAYLOAD", 1);
+                        return true;
+                    };
+                    if (!staged.finished or staged.upload_id != request.observe.?.upload_id) {
+                        try sendError(w, 2, "EV1001", "attachment is incomplete or does not match the request");
                         try w.flush();
-                    },
-                    .document_insert => {
-                        const insert = request.document_insert.?;
-                        // Borrow the request's fields; the engine clones them
-                        // into the collection, so nothing is moved or shared.
-                        var fields: std.ArrayList(document_mod.Field) = .empty;
-                        defer fields.deinit(gpa);
-                        try fields.ensureTotalCapacity(gpa, insert.fields.len);
-                        for (insert.fields) |*field| {
-                            fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
-                        }
-                        var guard = try EngineGuard.acquire(eng, io);
-                        defer guard.deinit();
-                        eng.insertDocument(insert.collection, insert.id, fields.items) catch |err| {
-                            try sendError(w, 2, "DF1001", @errorName(err));
-                            try w.flush();
-                            return true;
-                        };
-                        guard.release();
-                        var columns = [_][]const u8{"document_id"};
-                        var cells = [_]?[]const u8{insert.id};
-                        try sendRowDescription(w, &columns);
-                        try sendRowData(w, &cells);
-                        try sendCommandComplete(w, "INSERT DOCUMENT", 1);
-                        try w.flush();
-                    },
-                    .graph_add_node => {
-                        const insert = request.graph_add_node.?;
-                        var fields: std.ArrayList(document_mod.Field) = .empty;
-                        defer fields.deinit(gpa);
-                        try fields.ensureTotalCapacity(gpa, insert.fields.len);
-                        for (insert.fields) |*field| {
-                            fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
-                        }
-                        var guard = try EngineGuard.acquire(eng, io);
-                        defer guard.deinit();
-                        eng.addNode(insert.graph, insert.id, fields.items) catch |err| {
-                            try sendError(w, 2, "GF1001", @errorName(err));
-                            try w.flush();
-                            return true;
-                        };
-                        guard.release();
-                        var node_columns = [_][]const u8{"node_id"};
-                        var node_cells = [_]?[]const u8{insert.id};
-                        try sendRowDescription(w, &node_columns);
-                        try sendRowData(w, &node_cells);
-                        try sendCommandComplete(w, "ADD NODE", 1);
-                        try w.flush();
-                    },
-                    .graph_add_edge => {
-                        const edge = request.graph_add_edge.?;
-                        var guard = try EngineGuard.acquire(eng, io);
-                        defer guard.deinit();
-                        eng.addEdge(edge.graph, edge.from, edge.label, edge.to) catch |err| {
-                            try sendError(w, 2, "GF1002", @errorName(err));
-                            try w.flush();
-                            return true;
-                        };
-                        guard.release();
-                        var edge_columns = [_][]const u8{"from", "label", "to"};
-                        var edge_cells = [_]?[]const u8{ edge.from, edge.label, edge.to };
-                        try sendRowDescription(w, &edge_columns);
-                        try sendRowData(w, &edge_cells);
-                        try sendCommandComplete(w, "ADD EDGE", 1);
-                        try w.flush();
-                    },
-                }
-            },
-            .attachment_begin => {
-                if (payload.len != 8 + 8 + proto.PAYLOAD_DIGEST_LENGTH or attachment.* != null) {
-                    try sendError(w, 2, "EV1001", "invalid attachment begin");
-                    try w.flush();
-                    return true;
-                }
-                const upload_id = std.mem.readInt(u64, payload[0..8], .big);
-                const expected_length = std.mem.readInt(u64, payload[8..16], .big);
-                if (upload_id == 0 or expected_length > proto.MAX_ATTACHMENT_LENGTH) {
-                    try sendError(w, 2, "EV1001", "attachment limit exceeded");
-                    try w.flush();
-                    return true;
-                }
-                var expected_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
-                @memcpy(&expected_digest, payload[16..]);
-                var guard = try EngineGuard.acquire(eng, io);
-                defer guard.deinit();
-                eng.beginStage(expected_length) catch {
-                    try sendError(w, 2, "EV1001", "staging quota exceeded");
-                    try w.flush();
-                    return true;
-                };
-                guard.release();
-                attachment.* = .{ .upload_id = upload_id, .expected_length = expected_length, .expected_digest = expected_digest, .staging_reserved = true };
-            },
-            .attachment_chunk => {
-                if (attachment.* == null or payload.len < 8 or payload.len - 8 > proto.MAX_ATTACHMENT_CHUNK_LENGTH) {
-                    try sendError(w, 2, "EV1001", "invalid attachment chunk");
-                    try w.flush();
-                    return true;
-                }
-                const upload_id = std.mem.readInt(u64, payload[0..8], .big);
-                const staged = &attachment.*.?;
-                if (staged.finished or staged.upload_id != upload_id or staged.bytes.items.len + payload.len - 8 > staged.expected_length) {
-                    try sendError(w, 2, "EV1001", "attachment chunk does not match declared shape");
-                    try w.flush();
-                    return true;
-                }
-                try staged.bytes.appendSlice(gpa, payload[8..]);
-            },
-            .attachment_finish => {
-                if (attachment.* == null or payload.len != 8) {
-                    try sendError(w, 2, "EV1001", "invalid attachment finish");
-                    try w.flush();
-                    return true;
-                }
-                const upload_id = std.mem.readInt(u64, payload[0..8], .big);
-                const staged = &attachment.*.?;
-                if (staged.upload_id != upload_id or staged.bytes.items.len != staged.expected_length or !std.mem.eql(u8, &evidence_mod.digest(staged.bytes.items), &staged.expected_digest)) {
-                    // The reservation is shared engine state: releasing it runs
-                    // under the statement lock so it cannot race another
-                    // connection's staging accounting.
-                    if (staged.staging_reserved) {
-                        var guard = try EngineGuard.acquire(eng, io);
-                        defer guard.deinit();
-                        eng.abortStage(staged.expected_length);
-                        guard.release();
+                        return true;
                     }
+                    const modality = std.enums.fromInt(evidence_mod.Modality, request.observe.?.modality) orelse {
+                        try sendError(w, 2, "EV1002", "invalid modality");
+                        try w.flush();
+                        return true;
+                    };
+                    const observation = request.observe.?;
+                    var guard = try EngineGuard.acquire(eng, io);
+                    defer guard.deinit();
+                    const evidence_id = eng.observe(observation.object_id, modality, observation.media_type, observation.observed_at, observation.origin, "development", staged.bytes.items) catch |err| {
+                        try sendError(w, 2, "EV1003", @errorName(err));
+                        try w.flush();
+                        return true;
+                    };
+                    guard.release();
                     staged.deinit(gpa);
                     attachment.* = null;
-                    try sendError(w, 2, "EV1001", "attachment length or digest mismatch");
+                    var id_buf: [32]u8 = undefined;
+                    const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{evidence_id}) catch unreachable;
+                    var columns = [_][]const u8{"evidence_id"};
+                    var cells = [_]?[]const u8{id_text};
+                    try sendRowDescription(w, &columns);
+                    try sendRowData(w, &cells);
+                    try sendCommandComplete(w, "OBSERVE", 1);
                     try w.flush();
-                    return true;
-                }
-                var guard = try EngineGuard.acquire(eng, io);
-                defer guard.deinit();
-                eng.finishStage(staged.expected_length);
-                guard.release();
-                staged.finished = true;
-                staged.staging_reserved = false;
-            },
-            .attachment_abort => {
-                if (payload.len != 8 or attachment.* == null or std.mem.readInt(u64, payload[0..8], .big) != attachment.*.?.upload_id) {
-                    try sendError(w, 2, "EV1001", "invalid attachment abort");
+                },
+                .read_evidence_payload => {
+                    var guard = try EngineGuard.acquire(eng, io);
+                    defer guard.deinit();
+                    const payload_bytes = eng.readEvidencePayload(request.evidence_id) catch |err| {
+                        try sendError(w, 2, "EV1004", @errorName(err));
+                        try w.flush();
+                        return true;
+                    };
+                    guard.release();
+                    defer gpa.free(payload_bytes);
+                    try sendPayload(w, request.evidence_id, payload_bytes);
+                    try sendCommandComplete(w, "READ EVIDENCE PAYLOAD", 1);
                     try w.flush();
-                    return true;
+                },
+                .document_insert => {
+                    const insert = request.document_insert.?;
+                    // Borrow the request's fields; the engine clones them
+                    // into the collection, so nothing is moved or shared.
+                    var fields: std.ArrayList(document_mod.Field) = .empty;
+                    defer fields.deinit(gpa);
+                    try fields.ensureTotalCapacity(gpa, insert.fields.len);
+                    for (insert.fields) |*field| {
+                        fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
+                    }
+                    var guard = try EngineGuard.acquire(eng, io);
+                    defer guard.deinit();
+                    eng.insertDocument(insert.collection, insert.id, fields.items) catch |err| {
+                        try sendError(w, 2, "DF1001", @errorName(err));
+                        try w.flush();
+                        return true;
+                    };
+                    guard.release();
+                    var columns = [_][]const u8{"document_id"};
+                    var cells = [_]?[]const u8{insert.id};
+                    try sendRowDescription(w, &columns);
+                    try sendRowData(w, &cells);
+                    try sendCommandComplete(w, "INSERT DOCUMENT", 1);
+                    try w.flush();
+                },
+                .graph_add_node => {
+                    const insert = request.graph_add_node.?;
+                    var fields: std.ArrayList(document_mod.Field) = .empty;
+                    defer fields.deinit(gpa);
+                    try fields.ensureTotalCapacity(gpa, insert.fields.len);
+                    for (insert.fields) |*field| {
+                        fields.appendAssumeCapacity(.{ .path = field.path, .item = field.item });
+                    }
+                    var guard = try EngineGuard.acquire(eng, io);
+                    defer guard.deinit();
+                    eng.addNode(insert.graph, insert.id, fields.items) catch |err| {
+                        try sendError(w, 2, "GF1001", @errorName(err));
+                        try w.flush();
+                        return true;
+                    };
+                    guard.release();
+                    var node_columns = [_][]const u8{"node_id"};
+                    var node_cells = [_]?[]const u8{insert.id};
+                    try sendRowDescription(w, &node_columns);
+                    try sendRowData(w, &node_cells);
+                    try sendCommandComplete(w, "ADD NODE", 1);
+                    try w.flush();
+                },
+                .graph_add_edge => {
+                    const edge = request.graph_add_edge.?;
+                    var guard = try EngineGuard.acquire(eng, io);
+                    defer guard.deinit();
+                    eng.addEdge(edge.graph, edge.from, edge.label, edge.to) catch |err| {
+                        try sendError(w, 2, "GF1002", @errorName(err));
+                        try w.flush();
+                        return true;
+                    };
+                    guard.release();
+                    var edge_columns = [_][]const u8{ "from", "label", "to" };
+                    var edge_cells = [_]?[]const u8{ edge.from, edge.label, edge.to };
+                    try sendRowDescription(w, &edge_columns);
+                    try sendRowData(w, &edge_cells);
+                    try sendCommandComplete(w, "ADD EDGE", 1);
+                    try w.flush();
+                },
+                .kv_put => {
+                    const put = request.kv_put.?;
+                    var guard = try EngineGuard.acquire(eng, io);
+                    defer guard.deinit();
+                    eng.putKv(put.collection, put.key, put.item) catch |err| {
+                        try sendError(w, 2, "KV1001", @errorName(err));
+                        try w.flush();
+                        return true;
+                    };
+                    guard.release();
+                    // The request outlives this frame, so the rendered
+                    // value and the key stay valid for the send.
+                    var value_buf: [64]u8 = undefined;
+                    const value_text: ?[]const u8 = switch (put.item) {
+                        .null => null,
+                        .int => |integer| std.fmt.bufPrint(&value_buf, "{d}", .{integer}) catch unreachable,
+                        .text => |text| text,
+                        .bool => |boolean| if (boolean) "true" else "false",
+                        // Rejected by IR validation; never reachable here.
+                        .vector => unreachable,
+                    };
+                    var kv_columns = [_][]const u8{ "key", "value" };
+                    var kv_cells = [_]?[]const u8{ put.key, value_text };
+                    try sendRowDescription(w, &kv_columns);
+                    try sendRowData(w, &kv_cells);
+                    try sendCommandComplete(w, "PUT KV", 1);
+                    try w.flush();
+                },
+            }
+        },
+        .attachment_begin => {
+            if (payload.len != 8 + 8 + proto.PAYLOAD_DIGEST_LENGTH or attachment.* != null) {
+                try sendError(w, 2, "EV1001", "invalid attachment begin");
+                try w.flush();
+                return true;
+            }
+            const upload_id = std.mem.readInt(u64, payload[0..8], .big);
+            const expected_length = std.mem.readInt(u64, payload[8..16], .big);
+            if (upload_id == 0 or expected_length > proto.MAX_ATTACHMENT_LENGTH) {
+                try sendError(w, 2, "EV1001", "attachment limit exceeded");
+                try w.flush();
+                return true;
+            }
+            var expected_digest: [proto.PAYLOAD_DIGEST_LENGTH]u8 = undefined;
+            @memcpy(&expected_digest, payload[16..]);
+            var guard = try EngineGuard.acquire(eng, io);
+            defer guard.deinit();
+            eng.beginStage(expected_length) catch {
+                try sendError(w, 2, "EV1001", "staging quota exceeded");
+                try w.flush();
+                return true;
+            };
+            guard.release();
+            attachment.* = .{ .upload_id = upload_id, .expected_length = expected_length, .expected_digest = expected_digest, .staging_reserved = true };
+        },
+        .attachment_chunk => {
+            if (attachment.* == null or payload.len < 8 or payload.len - 8 > proto.MAX_ATTACHMENT_CHUNK_LENGTH) {
+                try sendError(w, 2, "EV1001", "invalid attachment chunk");
+                try w.flush();
+                return true;
+            }
+            const upload_id = std.mem.readInt(u64, payload[0..8], .big);
+            const staged = &attachment.*.?;
+            if (staged.finished or staged.upload_id != upload_id or staged.bytes.items.len + payload.len - 8 > staged.expected_length) {
+                try sendError(w, 2, "EV1001", "attachment chunk does not match declared shape");
+                try w.flush();
+                return true;
+            }
+            try staged.bytes.appendSlice(gpa, payload[8..]);
+        },
+        .attachment_finish => {
+            if (attachment.* == null or payload.len != 8) {
+                try sendError(w, 2, "EV1001", "invalid attachment finish");
+                try w.flush();
+                return true;
+            }
+            const upload_id = std.mem.readInt(u64, payload[0..8], .big);
+            const staged = &attachment.*.?;
+            if (staged.upload_id != upload_id or staged.bytes.items.len != staged.expected_length or !std.mem.eql(u8, &evidence_mod.digest(staged.bytes.items), &staged.expected_digest)) {
+                // The reservation is shared engine state: releasing it runs
+                // under the statement lock so it cannot race another
+                // connection's staging accounting.
+                if (staged.staging_reserved) {
+                    var guard = try EngineGuard.acquire(eng, io);
+                    defer guard.deinit();
+                    eng.abortStage(staged.expected_length);
+                    guard.release();
                 }
-                const item = &attachment.*.?;
-                var guard = try EngineGuard.acquire(eng, io);
-                defer guard.deinit();
-                if (item.staging_reserved) eng.abortStage(item.expected_length);
-                guard.release();
-                item.deinit(gpa);
+                staged.deinit(gpa);
                 attachment.* = null;
-            },
-            .cancel_request => {
-                // Fire-and-forget: no response frame is defined for a
-                // well-formed request. Missing, mismatched, closed, or expired
-                // credentials finish as a no-op; only the observability
-                // counters change. A malformed payload is a protocol error:
-                // the Server replies CN1001 and closes the Connection, so the
-                // error can never be misattributed to a later pipelined frame.
-                if (payload.len != proto.CANCEL_CREDENTIAL_LENGTH) {
-                    try sendError(w, 2, "CN1001", "malformed cancel request payload");
-                    try w.flush();
-                    return false;
-                }
-                var credential_bytes: [proto.CANCEL_CREDENTIAL_LENGTH]u8 = undefined;
-                @memcpy(&credential_bytes, payload);
-                _ = registry.cancelByCredential(credential_bytes) catch {};
-            },
-            .goodbye => {
-                if (!validGoodbyePayload(payload)) return error.Protocol;
-                try sendGoodbye(w, "ok");
+                try sendError(w, 2, "EV1001", "attachment length or digest mismatch");
+                try w.flush();
+                return true;
+            }
+            var guard = try EngineGuard.acquire(eng, io);
+            defer guard.deinit();
+            eng.finishStage(staged.expected_length);
+            guard.release();
+            staged.finished = true;
+            staged.staging_reserved = false;
+        },
+        .attachment_abort => {
+            if (payload.len != 8 or attachment.* == null or std.mem.readInt(u64, payload[0..8], .big) != attachment.*.?.upload_id) {
+                try sendError(w, 2, "EV1001", "invalid attachment abort");
+                try w.flush();
+                return true;
+            }
+            const item = &attachment.*.?;
+            var guard = try EngineGuard.acquire(eng, io);
+            defer guard.deinit();
+            if (item.staging_reserved) eng.abortStage(item.expected_length);
+            guard.release();
+            item.deinit(gpa);
+            attachment.* = null;
+        },
+        .cancel_request => {
+            // Fire-and-forget: no response frame is defined for a
+            // well-formed request. Missing, mismatched, closed, or expired
+            // credentials finish as a no-op; only the observability
+            // counters change. A malformed payload is a protocol error:
+            // the Server replies CN1001 and closes the Connection, so the
+            // error can never be misattributed to a later pipelined frame.
+            if (payload.len != proto.CANCEL_CREDENTIAL_LENGTH) {
+                try sendError(w, 2, "CN1001", "malformed cancel request payload");
                 try w.flush();
                 return false;
-            },
-            else => {
-                try sendError(w, 2, "RF1005", "unknown message type");
-                try w.flush();
-                return false;
-            },
+            }
+            var credential_bytes: [proto.CANCEL_CREDENTIAL_LENGTH]u8 = undefined;
+            @memcpy(&credential_bytes, payload);
+            _ = registry.cancelByCredential(credential_bytes) catch {};
+        },
+        .goodbye => {
+            if (!validGoodbyePayload(payload)) return error.Protocol;
+            try sendGoodbye(w, "ok");
+            try w.flush();
+            return false;
+        },
+        else => {
+            try sendError(w, 2, "RF1005", "unknown message type");
+            try w.flush();
+            return false;
+        },
     }
     return true;
 }
